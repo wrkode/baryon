@@ -31,7 +31,7 @@ cordoned=()
 cleanup() {
   local n v
   for n in "${cordoned[@]}"; do kubectl "${ctx[@]}" uncordon "$n" >/dev/null 2>&1 || true; done
-  for v in "${vm_on[@]}"; do "${k[@]}" delete virtualmachine "$v" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done
+  for v in "${vm_on[@]+"${vm_on[@]}"}"; do "${k[@]}" delete virtualmachine "$v" --ignore-not-found --wait=false >/dev/null 2>&1 || true; done
   for n in "${nodes[@]}"; do host "$n" "systemctl start baryon-virtd" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
@@ -64,8 +64,9 @@ sha_line=""
 [ -n "${IMAGE_SHA256:-}" ] && sha_line="        sha256: ${IMAGE_SHA256}"
 sc_line=""
 [ -n "${STORAGE_CLASS:-}" ] && sc_line="    storageClassName: $STORAGE_CLASS"
+i=0
 for n in "${nodes[@]}"; do
-  v="e2e-skew-$run-${#vm_on[@]}"
+  v="e2e-skew-$run-$i"; i=$((i + 1))
   vm_on[$n]="$v"
   for o in "${nodes[@]}"; do
     [ "$o" = "$n" ] || { kubectl "${ctx[@]}" cordon "$o" >/dev/null; cordoned+=("$o"); }
