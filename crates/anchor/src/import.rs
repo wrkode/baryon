@@ -8,11 +8,14 @@
 //!   requested virtual disk size. A marker file next to it records the
 //!   import.
 //! - Block volume: the image is written to the start of the device. Runs of
-//!   all-zero blocks, and the rest of the device after the image, are zeroed
-//!   with zero-range requests (written as zeros where the device does not
-//!   support them), because a new volume may hold old data. There is no
-//!   marker on the device; baryon-controller records the completed import on
-//!   the claim.
+//!   all-zero blocks, and the rest of the device after the image, are
+//!   zeroed, because a new volume may hold old data: with write-zeroes that
+//!   may deallocate (`FALLOC_FL_PUNCH_HOLE`), else with `FALLOC_FL_ZERO_RANGE`,
+//!   else with written zeros. The first MiB of the device is zeroed before
+//!   the download and the first MiB of the image is written only after its
+//!   size and SHA-256 are verified, so a failed import leaves no partition
+//!   table or boot loader behind. There is no marker on the device;
+//!   baryon-controller records the completed import on the claim.
 //!
 //! This is a convenience for importing a boot image, not an image management
 //! system.
@@ -33,6 +36,8 @@ use baryon_runtime_api::anchor_spec::DISK_IMAGE_NAME;
 
 const MARKER: &str = ".baryon-import.json";
 const BLOCK: usize = 4096;
+/// Leading part of a device image that is written only after verification.
+const HEAD: u64 = 1 << 20;
 const MAX_REDIRECTS: usize = 10;
 
 /// Where the image goes.
@@ -65,13 +70,18 @@ async fn import_device(
     size_bytes: u64,
     path: &Path,
 ) -> anyhow::Result<()> {
-    // O_EXCL on a block device is an exclusive open: it fails while the
-    // device is mounted or opened exclusively elsewhere.
+    use std::os::unix::fs::FileTypeExt;
+    // O_EXCL on a block device is an exclusive open against other exclusive
+    // openers (mounts, other importers); it does not exclude a VMM, which
+    // opens without it. O_NOFOLLOW: the container runtime creates the node.
     let mut dev = std::fs::OpenOptions::new()
         .write(true)
-        .custom_flags(rustix::fs::OFlags::EXCL.bits() as i32)
+        .custom_flags((rustix::fs::OFlags::EXCL | rustix::fs::OFlags::NOFOLLOW).bits() as i32)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    if !dev.metadata()?.file_type().is_block_device() {
+        bail!("{} is not a block device", path.display());
+    }
     let dev_size = dev
         .seek(SeekFrom::End(0))
         .context("reading the device size")?;
@@ -79,18 +89,15 @@ async fn import_device(
     if size_bytes > dev_size {
         bail!("the requested disk size {size_bytes} is larger than the device ({dev_size} bytes)");
     }
-    let mut sink = DeviceSink::new(dev, dev_size);
+    let mut sink = DeviceSink::new(dev, dev_size).context("clearing the start of the device")?;
     let body = fetch(url).await?;
-    let (written, digest) = stream(body, &mut sink).await?;
+    let (written, digest) = stream(body, &mut sink, size_bytes).await?;
     if let Some(expected) = sha256
         && !expected.eq_ignore_ascii_case(&digest)
     {
         bail!("SHA-256 mismatch: expected {expected}, got {digest}");
     }
-    if written > size_bytes {
-        bail!("image is {written} bytes, larger than the requested disk size {size_bytes}");
-    }
-    sink.finish().context("zeroing the rest of the device")?;
+    sink.finish().context("completing the device")?;
     tracing::info!(device = %path.display(), bytes = written, device_bytes = dev_size, sha256 = %digest, "import complete");
     Ok(())
 }
@@ -127,7 +134,14 @@ async fn import_file(
 
     let body = fetch(url).await?;
     let mut sink = FileSink { file: &mut file };
-    let (written, digest) = stream(body, &mut sink).await?;
+    let streamed = stream(body, &mut sink, size_bytes).await;
+    let (written, digest) = match streamed {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            return Err(e);
+        }
+    };
     if let Some(expected) = sha256
         && !expected.eq_ignore_ascii_case(&digest)
     {
@@ -180,11 +194,12 @@ async fn fetch(url: &str) -> anyhow::Result<hyper::body::Incoming> {
     bail!("too many redirects")
 }
 
-/// Stream `body` into `sink` in 4 KiB blocks. Returns the image length and
-/// its SHA-256.
+/// Stream `body` into `sink` in 4 KiB blocks, refusing to write past
+/// `limit` bytes. Returns the image length and its SHA-256.
 async fn stream(
     mut body: hyper::body::Incoming,
     sink: &mut dyn Sink,
+    limit: u64,
 ) -> anyhow::Result<(u64, String)> {
     let mut hasher = Sha256::new();
     let mut written: u64 = 0;
@@ -198,14 +213,14 @@ async fn stream(
         hasher.update(data);
         carry.extend_from_slice(data);
         let full = carry.len() / BLOCK * BLOCK;
-        write_blocks(sink, &carry[..full], &mut written)?;
+        write_blocks(sink, &carry[..full], &mut written, limit)?;
         carry.drain(..full);
         if written - last_log >= 256 << 20 {
             tracing::info!(bytes = written, "importing");
             last_log = written;
         }
     }
-    write_blocks(sink, &carry, &mut written)?;
+    write_blocks(sink, &carry, &mut written, limit)?;
     Ok((written, to_hex(&hasher.finalize())))
 }
 
@@ -215,8 +230,16 @@ trait Sink {
     fn zeros(&mut self, len: u64) -> std::io::Result<()>;
 }
 
-fn write_blocks(sink: &mut dyn Sink, data: &[u8], written: &mut u64) -> anyhow::Result<()> {
+fn write_blocks(
+    sink: &mut dyn Sink,
+    data: &[u8],
+    written: &mut u64,
+    limit: u64,
+) -> anyhow::Result<()> {
     for chunk in data.chunks(BLOCK) {
+        if written.saturating_add(chunk.len() as u64) > limit {
+            bail!("the image is larger than the requested disk size {limit}");
+        }
         if chunk.iter().all(|b| *b == 0) {
             sink.zeros(chunk.len() as u64)?;
         } else {
@@ -249,22 +272,28 @@ impl Sink for FileSink<'_> {
 }
 
 /// A block device: zero runs are zeroed explicitly, coalesced into one
-/// request per run.
+/// request per run. The first [`HEAD`] bytes of the image are kept in memory
+/// until [`DeviceSink::finish`].
 struct DeviceSink {
     dev: std::fs::File,
     size: u64,
     pos: u64,
     zero_from: Option<u64>,
+    head: Vec<u8>,
 }
 
 impl DeviceSink {
-    fn new(dev: std::fs::File, size: u64) -> Self {
-        Self {
+    /// Zero the first [`HEAD`] bytes of the device, so a failed import
+    /// leaves nothing bootable there.
+    fn new(dev: std::fs::File, size: u64) -> std::io::Result<Self> {
+        zero_range(&dev, 0, size.min(HEAD))?;
+        Ok(Self {
             dev,
             size,
             pos: 0,
             zero_from: None,
-        }
+            head: Vec::new(),
+        })
     }
 
     fn flush_zeros(&mut self) -> std::io::Result<()> {
@@ -274,20 +303,30 @@ impl DeviceSink {
         Ok(())
     }
 
-    /// Zero everything after the image and make the writes durable.
+    /// Write the verified head, zero everything after the image, and make
+    /// the writes durable.
     fn finish(mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
         let end = self.size;
         if self.zero_from.is_none() && self.pos < end {
-            self.zero_from = Some(self.pos);
+            self.zero_from = Some(self.pos.max(self.head.len() as u64));
         }
         self.pos = end;
         self.flush_zeros()?;
+        self.dev.write_all_at(&self.head, 0)?;
         self.dev.sync_all()
     }
 }
 
 impl Sink for DeviceSink {
     fn data(&mut self, chunk: &[u8]) -> std::io::Result<()> {
+        if self.pos < HEAD {
+            // Chunks are BLOCK-aligned and HEAD is a multiple of BLOCK, so a
+            // chunk never straddles the boundary.
+            self.head.extend_from_slice(chunk);
+            self.pos += chunk.len() as u64;
+            return Ok(());
+        }
         self.flush_zeros()?;
         self.dev.seek(SeekFrom::Start(self.pos))?;
         self.dev.write_all(chunk)?;
@@ -295,6 +334,12 @@ impl Sink for DeviceSink {
         Ok(())
     }
     fn zeros(&mut self, len: u64) -> std::io::Result<()> {
+        if self.pos < HEAD {
+            // Already zero on the device; keep the head contiguous.
+            self.head.resize(self.head.len() + len as usize, 0);
+            self.pos += len;
+            return Ok(());
+        }
         if self.zero_from.is_none() {
             self.zero_from = Some(self.pos);
         }
@@ -303,34 +348,50 @@ impl Sink for DeviceSink {
     }
 }
 
-/// Zero `len` bytes at `offset` of a block device: a zero-range request
-/// (`FALLOC_FL_ZERO_RANGE`, which the block layer turns into write-zeroes or
-/// zero writes), or plain zero writes where the request is not supported.
+/// Zero `len` bytes at `offset` of a block device. Parts not aligned to
+/// [`BLOCK`] (a multiple of every logical block size in use) are written as
+/// zeros; the aligned middle is zeroed by [`zero_aligned`].
 fn zero_range(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let end = offset.saturating_add(len);
+    let block = BLOCK as u64;
+    let start_aligned = offset.div_ceil(block) * block;
+    let end_aligned = end / block * block;
+    if start_aligned >= end_aligned {
+        return write_zeros(dev, offset, len);
+    }
+    dev.write_all_at(&vec![0u8; (start_aligned - offset) as usize], offset)?;
+    zero_aligned(dev, start_aligned, end_aligned - start_aligned)?;
+    dev.write_all_at(&vec![0u8; (end - end_aligned) as usize], end_aligned)
+}
+
+/// Zero an aligned range: write-zeroes that may deallocate
+/// (`FALLOC_FL_PUNCH_HOLE`, so thin-provisioned storage is not filled),
+/// else `FALLOC_FL_ZERO_RANGE` (which the block layer completes with zero
+/// writes), else written zeros. Only "not supported" falls through; other
+/// errors are reported.
+fn zero_aligned(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
     use rustix::fs::FallocateFlags;
-    if len == 0 {
-        return Ok(());
-    }
-    match rustix::fs::fallocate(
-        dev,
-        FallocateFlags::ZERO_RANGE | FallocateFlags::KEEP_SIZE,
-        offset,
-        len,
-    ) {
-        Ok(()) => Ok(()),
-        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::INVAL) => {
-            use std::os::unix::fs::FileExt;
-            let zeros = vec![0u8; 1 << 20];
-            let mut done = 0u64;
-            while done < len {
-                let n = (len - done).min(zeros.len() as u64) as usize;
-                dev.write_all_at(&zeros[..n], offset + done)?;
-                done += n as u64;
-            }
-            Ok(())
+    for flags in [FallocateFlags::PUNCH_HOLE, FallocateFlags::ZERO_RANGE] {
+        match rustix::fs::fallocate(dev, flags | FallocateFlags::KEEP_SIZE, offset, len) {
+            Ok(()) => return Ok(()),
+            Err(rustix::io::Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(e.into()),
         }
-        Err(e) => Err(e.into()),
     }
+    write_zeros(dev, offset, len)
+}
+
+fn write_zeros(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let zeros = vec![0u8; 1 << 20];
+    let mut done = 0u64;
+    while done < len {
+        let n = (len - done).min(zeros.len() as u64) as usize;
+        dev.write_all_at(&zeros[..n], offset + done)?;
+        done += n as u64;
+    }
+    Ok(())
 }
 
 /// Resolve a redirect target. A redirect from HTTPS to plain HTTP is
@@ -388,7 +449,13 @@ mod tests {
         data[0] = 1;
         data[(1 << 20) - 1] = 2;
         let mut written = 0;
-        write_blocks(&mut FileSink { file: &mut f }, &data, &mut written).unwrap();
+        write_blocks(
+            &mut FileSink { file: &mut f },
+            &data,
+            &mut written,
+            u64::MAX,
+        )
+        .unwrap();
         drop(f);
         let meta = std::fs::metadata(&path).unwrap();
         assert_eq!(meta.len(), 1 << 20);
@@ -405,7 +472,13 @@ mod tests {
         let path = dir.path().join("img");
         let mut f = std::fs::File::create(&path).unwrap();
         let mut written = 0;
-        write_blocks(&mut FileSink { file: &mut f }, &[0u8; 100], &mut written).unwrap();
+        write_blocks(
+            &mut FileSink { file: &mut f },
+            &[0u8; 100],
+            &mut written,
+            u64::MAX,
+        )
+        .unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), 100);
     }
 
@@ -417,17 +490,76 @@ mod tests {
         let path = dir.path().join("dev");
         std::fs::write(&path, vec![0xee_u8; 8 * BLOCK]).unwrap();
         let dev = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
-        let mut sink = DeviceSink::new(dev, 8 * BLOCK as u64);
+        let mut sink = DeviceSink::new(dev, 8 * BLOCK as u64).unwrap();
         let mut image = vec![0u8; 3 * BLOCK];
         image[0] = 1; // block 0 data, block 1 zero, block 2 data
         image[2 * BLOCK] = 2;
         let mut written = 0;
-        write_blocks(&mut sink, &image, &mut written).unwrap();
+        write_blocks(&mut sink, &image, &mut written, u64::MAX).unwrap();
         sink.finish().unwrap();
         let out = std::fs::read(&path).unwrap();
         assert_eq!(out.len(), 8 * BLOCK, "device size unchanged");
         assert_eq!(&out[..3 * BLOCK], &image[..], "image written, hole zeroed");
         assert!(out[3 * BLOCK..].iter().all(|b| *b == 0), "tail zeroed");
+    }
+
+    /// A used device larger than HEAD, with an image that has data past
+    /// HEAD, a zero run, and an unaligned length.
+    fn used_device(blocks: usize) -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev");
+        // 512 bytes past a BLOCK boundary, like a device whose size is a
+        // multiple of 512 only.
+        std::fs::write(&path, vec![0xee_u8; blocks * BLOCK + 512]).unwrap();
+        let dev = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        (dir, path, dev)
+    }
+
+    #[test]
+    fn device_import_beyond_head_with_unaligned_end() {
+        let blocks = (HEAD as usize) / BLOCK + 16;
+        let (_dir, path, dev) = used_device(blocks);
+        let size = (blocks * BLOCK + 512) as u64;
+        let mut sink = DeviceSink::new(dev, size).unwrap();
+        let mut image = vec![0u8; HEAD as usize + 5 * BLOCK + 100];
+        image[7] = 7;
+        image[HEAD as usize + 1] = 9; // data after HEAD
+        // blocks HEAD+1..HEAD+4 zero, then a partial final block with data
+        image[HEAD as usize + 5 * BLOCK + 50] = 5;
+        let mut written = 0;
+        write_blocks(&mut sink, &image, &mut written, size).unwrap();
+        sink.finish().unwrap();
+        let out = std::fs::read(&path).unwrap();
+        assert_eq!(out.len() as u64, size);
+        assert_eq!(&out[..image.len()], &image[..]);
+        assert!(out[image.len()..].iter().all(|b| *b == 0), "tail zeroed");
+    }
+
+    #[test]
+    fn a_failed_import_leaves_no_head() {
+        let blocks = (HEAD as usize) / BLOCK + 4;
+        let (_dir, path, dev) = used_device(blocks);
+        let mut sink = DeviceSink::new(dev, (blocks * BLOCK + 512) as u64).unwrap();
+        let image = vec![1u8; HEAD as usize + BLOCK];
+        let mut written = 0;
+        write_blocks(&mut sink, &image, &mut written, u64::MAX).unwrap();
+        // Verification fails: finish() is never called.
+        drop(sink);
+        let out = std::fs::read(&path).unwrap();
+        assert!(out[..HEAD as usize].iter().all(|b| *b == 0), "head cleared");
+    }
+
+    #[test]
+    fn the_size_limit_holds_before_writing() {
+        let (_dir, path, dev) = used_device(4);
+        let mut sink = DeviceSink::new(dev, (4 * BLOCK + 512) as u64).unwrap();
+        let mut written = 0;
+        let image = vec![3u8; 3 * BLOCK];
+        assert!(write_blocks(&mut sink, &image, &mut written, 2 * BLOCK as u64).is_err());
+        assert_eq!(written, 2 * BLOCK as u64);
+        drop(sink);
+        let out = std::fs::read(&path).unwrap();
+        assert!(!out.contains(&3u8), "nothing past the head was written");
     }
 
     #[test]
