@@ -35,6 +35,11 @@ pub mod keys {
     /// node with a healthy runtime. Requesting it grants /dev/kvm and the
     /// baryon-virtd anchor socket to the container.
     pub const VM_RESOURCE: &str = "virtualization.baryon.io/vm";
+    /// Annotation baryon-controller sets on a root disk claim it created
+    /// once the image import into it completed (value: the source URL), so
+    /// later Anchor Pods do not import again. Internal state of a
+    /// Baryon-owned object, not an API.
+    pub const IMPORTED_ANNOTATION: &str = "virtualization.baryon.io/imported-from";
     /// Finalizer held by baryon-controller on VirtualMachines.
     pub const VM_FINALIZER: &str = "virtualization.baryon.io/anchor-cleanup";
 }

@@ -41,9 +41,10 @@ its mount succeeds whether or not the VMM still has the file open.
   before network and volume teardown (ADR 0005).
 - Raw disk images only in v1alpha1. Baryon can import a raw image from an
   HTTP(S) URL into a filesystem-mode claim it creates, with an init container
-  (`baryon-anchor import`, streamed, sparse, SHA-256 verified). Block-mode
-  claims must be pre-populated (for example by CSI cloning or a volume
-  populator).
+  (`baryon-anchor import`, streamed, sparse, SHA-256 verified), or onto a
+  block-mode claim it creates (`rootDisk.volumeMode: Block`), zeroing the
+  rest of the device. A completed import is recorded in an annotation on the
+  claim, because a raw device has no room for a marker.
 - Claims created by Baryon use `ReadWriteOnce` and are owned by the VM. The
   OFD lock prevents two VMMs on one node from opening the same disk; ADR 0004
   prevents two Anchor Pods per VM.
@@ -91,3 +92,10 @@ its mount succeeds whether or not the VMM still has the file open.
 - 2026-10-03: accepted for filesystem mode after the guest reset with
   Landlock enforced passed on the kind host and the Hadron node; the ownership
   consequence for re-created VMs was recorded.
+- 2026-10-03: import onto block-mode claims that Baryon creates. The import
+  record moved from a marker file alone to a claim annotation set by
+  baryon-controller after the import init container succeeded. Known window:
+  if the Anchor Pod is lost after a successful import and before
+  baryon-controller records it (for example the controller is down and the
+  node fails), the next Anchor Pod imports again and overwrites the device;
+  filesystem-mode claims are still protected by the marker file.

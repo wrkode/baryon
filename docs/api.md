@@ -43,6 +43,7 @@ by a CEL rule): it is the guest hostname and the value of the
 | `rootDisk.source.persistentVolumeClaim.claimName` | string | Existing claim with a raw disk: `disk.img` at the volume root (filesystem mode) or the whole device (block mode). |
 | `rootDisk.size` | quantity | Virtual disk size. Required for `http`. |
 | `rootDisk.storageClassName` | string | StorageClass of the claim Baryon creates. Default StorageClass when unset. |
+| `rootDisk.volumeMode` | `Filesystem` (default) or `Block` | Volume mode of the claim Baryon creates for an `http` source. Not allowed with `persistentVolumeClaim`: an existing claim is used in its own volume mode. |
 | `networks` | list-map keyed by `name`, at most 8 entries | `name` is a DNS-1123 label (1 to 63 characters). v1alpha1 accepts exactly one entry, with `pod: {}`. Defaults to `[{name: default, pod: {}}]`. |
 
 Exactly one of `http` and `persistentVolumeClaim` must be set; the API server
@@ -66,6 +67,11 @@ keeps it off the nodes in `status.identityConflictNodes` (see
 The root disk claim layout is a stable format of v1alpha1: in filesystem
 mode, `disk.img` at the volume root, plus `.baryon-import.json` (the import
 marker) for imported disks. A claim prepared outside Baryon must follow it.
+In block mode the disk is the whole device. A block device has no room for
+a marker, so baryon-controller records a completed import in the
+`virtualization.baryon.io/imported-from` annotation of the claim it
+created; this annotation is internal state of a Baryon-owned object, not an
+API.
 
 To restart a running VM, set the `virtualization.baryon.io/restartedAt`
 annotation to a new value:

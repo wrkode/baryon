@@ -71,10 +71,23 @@ pub enum RunPolicy {
     Stopped,
 }
 
+/// Volume mode of a claim Baryon creates.
+#[derive(
+    Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, schemars::JsonSchema,
+)]
+pub enum VolumeMode {
+    /// A filesystem volume; the disk is an image file on it.
+    #[default]
+    Filesystem,
+    /// A raw block volume; the disk is the device.
+    Block,
+}
+
 /// The boot disk.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, KubeSchema)]
 #[serde(rename_all = "camelCase")]
 #[x_kube(validation = kube::core::Rule::new("!has(self.source.http) || has(self.size)").message("size is required when the source is http"))]
+#[x_kube(validation = kube::core::Rule::new("!has(self.volumeMode) || has(self.source.http)").message("volumeMode applies to claims Baryon creates; an existing claim is used with its own volumeMode"))]
 pub struct RootDisk {
     pub source: DiskSource,
     /// Virtual disk size. Required for imported disks; the claim requests
@@ -85,6 +98,10 @@ pub struct RootDisk {
     /// default StorageClass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
+    /// Volume mode of the claim Baryon creates for an imported disk.
+    /// Defaults to Filesystem.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_mode: Option<VolumeMode>,
 }
 
 /// Where the disk content comes from. Exactly one field must be set.

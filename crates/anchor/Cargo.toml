@@ -21,6 +21,7 @@ hyper = { workspace = true }
 hyper-rustls = { workspace = true }
 hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 serde_json = { workspace = true }
+rustix = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

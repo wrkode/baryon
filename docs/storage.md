@@ -15,7 +15,7 @@ provisioned and attached by the cluster's CSI driver to the VM's Anchor Pod.
 
 | Source | Claim | Content |
 |---|---|---|
-| `rootDisk.source.http` | created by Baryon, named `<vm>-root`, owned by the VM, `ReadWriteOnce`, filesystem mode | `baryon-anchor import` streams the raw image into `disk.img`, skipping zero blocks, verifies SHA-256 when given (required for plain HTTP), and extends the file to `rootDisk.size`. A redirect from HTTPS to plain HTTP is refused. A marker file prevents a second import. |
+| `rootDisk.source.http` | created by Baryon, named `<vm>-root`, owned by the VM, `ReadWriteOnce`, in `rootDisk.volumeMode` (default `Filesystem`) | `baryon-anchor import` streams the raw image, verifies SHA-256 when given (required for plain HTTP), and refuses a redirect from HTTPS to plain HTTP. Filesystem mode: into `disk.img`, skipping zero blocks, extended to `rootDisk.size`; a marker file prevents a second import. Block mode: onto the device, opened with `O_EXCL`; zero blocks of the image and the rest of the device past the image are zeroed (`FALLOC_FL_ZERO_RANGE`, or written zeros where the device does not support it), so no earlier content of the device stays readable to the guest. |
 | `rootDisk.source.persistentVolumeClaim` | existing, not owned by the VM | filesystem mode: `disk.img` at the volume root; block mode: the whole device |
 
 Images must be raw. qcow2 and other formats are Not supported.

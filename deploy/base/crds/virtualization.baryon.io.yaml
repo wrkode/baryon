@@ -143,12 +143,23 @@ spec:
                       default StorageClass.
                     nullable: true
                     type: string
+                  volumeMode:
+                    description: Volume mode of a claim Baryon creates.
+                    enum:
+                    - Filesystem
+                    - Block
+                    nullable: true
+                    type: string
                 required:
                 - source
                 type: object
                 x-kubernetes-validations:
                 - message: size is required when the source is http
                   rule: "!has(self.source.http) || has(self.size)"
+                - message: >-
+                    volumeMode applies to claims Baryon creates; an existing claim is used with its
+                    own volumeMode
+                  rule: "!has(self.volumeMode) || has(self.source.http)"
               runPolicy:
                 default: Running
                 description: Whether the VM should be running. Changing it starts or stops the VM.

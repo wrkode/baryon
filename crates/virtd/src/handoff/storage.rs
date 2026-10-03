@@ -56,6 +56,59 @@ pub enum StorageError {
     },
     #[error("disk {name}: {path:?} is empty")]
     Empty { name: String, path: String },
+    #[error(
+        "disk {name}: the block device (owner {owner}:{group}, mode {mode:o}) is not {access} for the VM's host identity; the container runtime must give block volume devices the pod's runAsUser and runAsGroup (containerd: device_ownership_from_security_context = true)"
+    )]
+    DeviceAccess {
+        name: String,
+        owner: u32,
+        group: u32,
+        mode: u32,
+        access: &'static str,
+    },
+}
+
+/// Check that the VM's identity can open a block device disk the way the VMM
+/// will (read and write, or read only). Raw block devices are not files:
+/// Baryon does not change their ownership or mode. Access must come from the
+/// container runtime, which can own a block volume's device node by the
+/// pod's runAsUser and runAsGroup; this check makes a missing runtime
+/// setting a clear start failure instead of an EACCES inside the VMM.
+pub fn check_device_access(
+    disk: &ResolvedDisk,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+) -> Result<(), StorageError> {
+    let stat = rustix::fs::fstat(disk.fd.as_fd()).map_err(|e| StorageError::Resolve {
+        name: disk.name.clone(),
+        path: String::new(),
+        source: e.into(),
+    })?;
+    let mode = stat.st_mode & 0o777;
+    let bits = if stat.st_uid == uid {
+        (mode >> 6) & 0o7
+    } else if stat.st_gid == gid || groups.contains(&stat.st_gid) {
+        (mode >> 3) & 0o7
+    } else {
+        mode & 0o7
+    };
+    let need = if disk.read_only { 0o4 } else { 0o6 };
+    if bits & need == need {
+        Ok(())
+    } else {
+        Err(StorageError::DeviceAccess {
+            name: disk.name.clone(),
+            owner: stat.st_uid,
+            group: stat.st_gid,
+            mode,
+            access: if disk.read_only {
+                "readable"
+            } else {
+                "readable and writable"
+            },
+        })
+    }
 }
 
 /// Open the root directory of the process behind `pidfd`.
@@ -169,6 +222,42 @@ mod tests {
         .unwrap();
         let r = root(dir.path());
         (dir, r)
+    }
+
+    #[test]
+    fn device_access_follows_owner_group_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // The check looks only at ownership and mode bits, so a regular file
+        // stands in for the device node.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev");
+        std::fs::write(&path, b"x").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let (me, my_gid) = (meta.uid(), meta.gid());
+        let disk = |ro: bool| ResolvedDisk {
+            name: "root".into(),
+            kind: DiskKind::BlockDevice,
+            fd: rustix::fs::open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap(),
+            size_bytes: 0,
+            read_only: ro,
+        };
+        let chmod =
+            |m: u32| std::fs::set_permissions(&path, std::fs::Permissions::from_mode(m)).unwrap();
+
+        chmod(0o600);
+        assert!(check_device_access(&disk(false), me, my_gid, &[]).is_ok());
+        // Another identity, no group access: refused.
+        assert!(matches!(
+            check_device_access(&disk(false), me + 1, my_gid + 1, &[]),
+            Err(StorageError::DeviceAccess { .. })
+        ));
+        // Group access through a supplementary group.
+        chmod(0o660);
+        assert!(check_device_access(&disk(false), me + 1, my_gid + 1, &[my_gid]).is_ok());
+        // Read-only disks need only read access.
+        chmod(0o640);
+        assert!(check_device_access(&disk(true), me + 1, my_gid, &[]).is_ok());
+        assert!(check_device_access(&disk(false), me + 1, my_gid, &[]).is_err());
     }
 
     #[test]

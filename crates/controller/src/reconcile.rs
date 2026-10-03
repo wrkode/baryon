@@ -28,7 +28,7 @@ use kube::runtime::events::{Event, EventType, Recorder};
 use kube::runtime::finalizer::{self, finalizer};
 use kube::{Resource, ResourceExt};
 
-use baryon_api::vm::RunPolicy;
+use baryon_api::vm::{RunPolicy, VolumeMode};
 use baryon_api::{VirtualMachine, VirtualMachineClass, keys, quantity};
 use baryon_runtime_api::anchor_spec::DiskMode;
 
@@ -254,6 +254,10 @@ async fn ensure_claim(
         Err(e) => return Ok(Err(("InvalidSpec".to_owned(), e.to_string()))),
     };
     let name = resources::root_claim_name(&vm.name_any());
+    let wanted_mode = match vm.spec.root_disk.volume_mode.unwrap_or_default() {
+        VolumeMode::Filesystem => "Filesystem",
+        VolumeMode::Block => "Block",
+    };
     let claim = match pvcs.get_opt(&name).await? {
         Some(c) => {
             let ours = c
@@ -279,7 +283,7 @@ async fn ensure_claim(
                 },
                 spec: Some(PersistentVolumeClaimSpec {
                     access_modes: Some(vec!["ReadWriteOnce".to_owned()]),
-                    volume_mode: Some("Filesystem".to_owned()),
+                    volume_mode: Some(wanted_mode.to_owned()),
                     storage_class_name: vm.spec.root_disk.storage_class_name.clone(),
                     resources: Some(VolumeResourceRequirements {
                         requests: Some(BTreeMap::from([(
@@ -307,11 +311,21 @@ async fn ensure_claim(
             created
         }
     };
+    // The claim's own mode decides (volumeMode is immutable on a claim).
+    let mode = match claim.spec.as_ref().and_then(|s| s.volume_mode.as_deref()) {
+        Some("Block") => DiskMode::Block,
+        _ => DiskMode::Filesystem,
+    };
+    // Import until the claim records a completed import.
+    let imported = claim
+        .annotations()
+        .get(keys::IMPORTED_ANNOTATION)
+        .is_some_and(|u| u == &http.url);
     Ok(Ok(Disk {
         claim_name: name,
         claim: Some(claim),
-        mode: DiskMode::Filesystem,
-        import: Some((http.url.clone(), http.sha256.clone(), size_bytes)),
+        mode,
+        import: (!imported).then(|| (http.url.clone(), http.sha256.clone(), size_bytes)),
     }))
 }
 
@@ -362,6 +376,24 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         claim_name = Some(d.claim_name.clone());
         claim.clone_from(&d.claim);
         has_import = d.import.is_some();
+        // A completed import is recorded on the claim, so later Anchor Pods
+        // start without importing again (a raw block volume has nowhere else
+        // to keep that state).
+        if let (Some((url, _, _)), Some(p)) = (&d.import, pod.as_ref())
+            && import_succeeded(p)
+        {
+            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
+            let patch = serde_json::json!({
+                "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: url}}
+            });
+            pvcs.patch(
+                &d.claim_name,
+                &PatchParams::default(),
+                &Patch::Merge(&patch),
+            )
+            .await?;
+            has_import = false;
+        }
     }
 
     let restarted_at = vm.annotations().get(keys::RESTARTED_AT_ANNOTATION).cloned();
@@ -558,6 +590,22 @@ fn anchor_input(
         restarted_at,
         avoid_nodes: avoid_nodes.to_vec(),
     }
+}
+
+/// Whether the import init container of `pod` finished successfully.
+fn import_succeeded(pod: &Pod) -> bool {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.init_container_statuses.as_ref())
+        .is_some_and(|statuses| {
+            statuses.iter().any(|c| {
+                c.name == "import"
+                    && c.state
+                        .as_ref()
+                        .and_then(|s| s.terminated.as_ref())
+                        .is_some_and(|t| t.exit_code == 0)
+            })
+        })
 }
 
 /// Upper bound of `identityConflictNodes`.

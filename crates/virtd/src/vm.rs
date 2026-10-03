@@ -729,6 +729,10 @@ impl Supervisor {
             let resolved =
                 storage::resolve_disk(root.as_fd(), &d.name, &d.container_path, d.read_only)
                     .map_err(|e| StartFailure::new("StorageFailed", e))?;
+            if resolved.kind == storage::DiskKind::BlockDevice {
+                storage::check_device_access(&resolved, anchor.uid, anchor.gid, &anchor.groups)
+                    .map_err(|e| StartFailure::new("BlockDeviceAccessDenied", e))?;
+            }
             tracing::info!(pod = %self.entry.pod_uid, disk = %d.name, kind = ?resolved.kind, size = resolved.size_bytes, "disk resolved in anchor mount namespace");
             disks.push(resolved);
         }

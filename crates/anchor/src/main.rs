@@ -52,6 +52,9 @@ enum Command {
         size_bytes: u64,
         #[arg(long, default_value = "/var/lib/baryon/disks/root")]
         dir: PathBuf,
+        /// Write to this raw block device instead of an image file in `dir`.
+        #[arg(long)]
+        device: Option<PathBuf>,
     },
 }
 
@@ -86,7 +89,16 @@ fn main() -> ExitCode {
             sha256,
             size_bytes,
             dir,
-        } => match rt.block_on(import::import(&url, sha256.as_deref(), size_bytes, &dir)) {
+            device,
+        } => match rt.block_on(import::import(
+            &url,
+            sha256.as_deref(),
+            size_bytes,
+            match &device {
+                Some(d) => import::Target::Device(d),
+                None => import::Target::File(&dir),
+            },
+        )) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "import failed");

@@ -54,18 +54,14 @@ pub(crate) struct AnchorInput {
 impl AnchorInput {
     /// Hash of what the VM's spec and class determine. The anchor image is
     /// not part of it: a newer runtime is reported separately.
+    /// Whether an import is still pending is not part of it: it changes when
+    /// the import completes, which is not a spec change.
     pub(crate) fn spec_hash(&self) -> String {
-        let import = self
-            .import
-            .as_ref()
-            .map(|(u, s, n)| format!("{u}|{}|{n}", s.as_deref().unwrap_or("")))
-            .unwrap_or_default();
         resources::spec_hash(&[
             &self.vcpus.to_string(),
             &self.guest_memory_bytes.to_string(),
             &self.claim_name,
             &format!("{:?}", self.disk_mode),
-            &import,
             self.restarted_at.as_deref().unwrap_or(""),
         ])
     }
@@ -214,7 +210,7 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
             ..Default::default()
         }),
         volume_mounts: Some(anchor_mounts),
-        volume_devices: disk_devices,
+        volume_devices: disk_devices.clone(),
         security_context: Some(restricted_container_security()),
         termination_message_policy: Some("File".to_owned()),
         ..Default::default()
@@ -228,6 +224,9 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
         ];
         if let Some(s) = sha {
             args.push(format!("--sha256={s}"));
+        }
+        if input.disk_mode == DiskMode::Block {
+            args.push(format!("--device={ROOT_DISK_DEVICE}"));
         }
         vec![Container {
             name: "import".to_owned(),
@@ -249,6 +248,7 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
                 ..Default::default()
             }),
             volume_mounts: Some(disk_mounts.clone()),
+            volume_devices: disk_devices.clone(),
             security_context: Some(restricted_container_security()),
             termination_message_policy: Some("File".to_owned()),
             ..Default::default()
@@ -420,6 +420,31 @@ mod tests {
                 .iter()
                 .all(|m| m.name != "root-disk")
         );
+    }
+
+    #[test]
+    fn block_import_writes_the_device() {
+        let mut i = input(true);
+        i.disk_mode = DiskMode::Block;
+        let pod = build(&i).unwrap();
+        let init = &pod.spec.unwrap().init_containers.unwrap()[0];
+        assert!(
+            init.args
+                .as_ref()
+                .unwrap()
+                .contains(&format!("--device={ROOT_DISK_DEVICE}"))
+        );
+        assert_eq!(
+            init.volume_devices.as_ref().unwrap()[0].device_path,
+            ROOT_DISK_DEVICE
+        );
+        assert!(init.volume_mounts.as_ref().unwrap().is_empty());
+    }
+
+    #[test]
+    fn hash_ignores_a_pending_import() {
+        // The import completing must not look like a spec change.
+        assert_eq!(input(true).spec_hash(), input(false).spec_hash());
     }
 
     #[test]
