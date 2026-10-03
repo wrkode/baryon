@@ -8,6 +8,7 @@ mod resources;
 mod status;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use clap::Parser;
@@ -18,6 +19,7 @@ use kube::ResourceExt;
 use kube::runtime::controller::{Config as ControllerConfig, Controller};
 use kube::runtime::events::{Recorder, Reporter};
 use kube::runtime::reflector::ObjectRef;
+use kube::runtime::utils::Backoff;
 use kube::runtime::watcher;
 
 use baryon_api::{VirtualMachine, VirtualMachineClass, keys};
@@ -92,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
             },
         )
         .with_config(ControllerConfig::default().concurrency(args.concurrency))
+        .trigger_backoff(TriggerBackoff::default())
         .shutdown_on_signal()
         .run(reconcile::reconcile, reconcile::error_policy, ctx)
         .for_each(|result| async move {
@@ -106,4 +109,62 @@ async fn main() -> anyhow::Result<()> {
         .await;
     tracing::info!("stopped");
     Ok(())
+}
+
+/// Backoff of the controller's merged watch streams.
+///
+/// kube-runtime backs off the merged stream of all of a controller's watches
+/// after an error in any one of them, and no watch makes progress while it
+/// waits. After an API server restart every watch fails once with 410
+/// Expired, and with kube-runtime's default (up to 30 s, reset only after
+/// 120 s without errors) those failures add up to minutes in which no VM is
+/// reconciled. Short delays bound the pause per error; each watch still
+/// makes at most one request per delay while the API server is down.
+#[derive(Debug, Clone)]
+struct TriggerBackoff {
+    next: Duration,
+}
+
+impl TriggerBackoff {
+    const MIN: Duration = Duration::from_millis(500);
+    const MAX: Duration = Duration::from_secs(5);
+}
+
+impl Default for TriggerBackoff {
+    fn default() -> Self {
+        Self { next: Self::MIN }
+    }
+}
+
+impl Iterator for TriggerBackoff {
+    type Item = Duration;
+
+    fn next(&mut self) -> Option<Duration> {
+        let d = self.next;
+        self.next = (d * 2).min(Self::MAX);
+        Some(d)
+    }
+}
+
+impl Backoff for TriggerBackoff {
+    fn reset(&mut self) {
+        self.next = Self::MIN;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_backoff_is_short_bounded_and_resets() {
+        let mut b = TriggerBackoff::default();
+        let delays: Vec<Duration> = b.by_ref().take(6).collect();
+        assert_eq!(delays[0], Duration::from_millis(500));
+        assert_eq!(delays[1], Duration::from_secs(1));
+        assert!(delays.iter().all(|d| *d <= TriggerBackoff::MAX));
+        assert_eq!(delays[5], TriggerBackoff::MAX);
+        b.reset();
+        assert_eq!(b.next(), Some(TriggerBackoff::MIN));
+    }
 }
