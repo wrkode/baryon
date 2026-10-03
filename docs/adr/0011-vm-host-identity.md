@@ -1,7 +1,7 @@
 # 0011: Each VM runs as a distinct unprivileged host identity
 
 Status: Accepted
-Date: 2026-10-03
+Date: 2026-10-03, revised 2026-10-03
 
 ## Context
 
@@ -58,6 +58,17 @@ mapping would change the ownership model of every imported image.
   ownership.
 - Changing the allocation is a protocol change: the cluster release and the
   host image must agree on it.
+- Block-mode disks need the container runtime to give device nodes the
+  pod's `runAsUser` and `runAsGroup`; kubelet does not apply `fsGroup` to
+  raw block devices. With containerd this is
+  `device_ownership_from_security_context = true`, which is node-wide: it
+  applies to every device of every pod that sets `runAsUser`, including
+  devices from device plugins. In Anchor containers /dev/kvm is then owned
+  by the VM's host identity, so any process in the container can open it
+  (the VMM, a host process, opens the host's /dev/kvm through the kvm
+  group either way; the device cgroup allows /dev/kvm in both cases). Without the setting a block-mode
+  VM fails with `BlockDeviceAccessDenied`. Verified on three Hadron nodes
+  running k0s with runc.
 
 ## Alternatives considered
 
@@ -76,3 +87,6 @@ mapping would change the ownership model of every imported image.
 - 2026-10-03: written when the identity moved behind `VmIdentity`, the
   algorithm was removed from the documentation, and collisions gained the
   `IdentityConflict` handling.
+- 2026-10-03: the containerd `device_ownership_from_security_context`
+  requirement for block-mode disks and its effect on /dev/kvm in Anchor
+  containers were recorded.

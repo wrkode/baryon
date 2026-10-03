@@ -4,15 +4,16 @@ This document records the experiments that decide the boundary between the
 VM Anchor Pod, baryon-virtd, and Cloud Hypervisor. ADR 0005 (process
 ownership) and ADR 0007 (network) were accepted after the observations below
 were repeated on a Baryon-enabled Hadron node. ADR 0006 (storage) is
-Accepted for filesystem-mode claims; block mode and a CSI driver with
-staging and attach are not tested. The guest reboot reopen under Landlock is
-Tested on the Hadron node and the kind host (Experiment A).
+Accepted for filesystem-mode and block-mode claims; block mode and a CSI
+driver with staging and attach (Ceph RBD) are Tested on the k0s cluster (see
+[k0s cluster results](#k0s-cluster-results)). The guest reboot reopen under
+Landlock is Tested on the Hadron node and the kind host (Experiment A).
 
 Status: this is a historical record. Experiments A, B, and C ran on the kind
 host with real VMs; process ownership and cgroup placement are decided (see
 Experiment C). What the Hadron node confirmed is summarized in
-[Hadron node results](#hadron-node-results). All of it is single-node
-evidence. A summary of the E2E tests and manual procedures is in
+[Hadron node results](#hadron-node-results), and what the three-node k0s
+cluster added in [k0s cluster results](#k0s-cluster-results). A summary of the E2E tests and manual procedures is in
 [testing.md](testing.md#results); this document keeps the experiment
 observations. Open items are listed per experiment.
 
@@ -156,19 +157,27 @@ with the pod user's credentials, so DAC applies as if the pod opened it.
 
 ### Decision
 
-ADR 0006 is Accepted for filesystem-mode claims. The resolution and reopen
-mechanism works for filesystem-mode local-path claims on the kind host and
-the Hadron node. With
-`container` placement (Experiment C), the container runtime stops the VMM
-before volume teardown, independent of baryon-virtd; this ordering has not
-been tested with a CSI driver that stages and attaches.
+ADR 0006 is Accepted (filesystem mode after these experiments, block mode
+after the k0s cluster results). The resolution and reopen mechanism works
+for filesystem-mode local-path claims on the kind host and the Hadron node.
+With `container` placement (Experiment C), the container runtime stops the
+VMM before volume teardown, independent of baryon-virtd and of the CSI
+driver; the stop, move, and delete paths are Tested with Ceph RBD, and the
+failure paths (SIGKILL, forced delete, baryon-virtd down) with a CSI driver
+that stages and attaches are not tested.
 
 ### Remaining questions
 
-- Block-mode PVC: device node ownership under containerd defaults versus
-  `device_ownership_from_security_context`.
-- CSI driver with NodeStage and attach: teardown ordering under SIGKILL,
-  forced delete, and baryon-virtd down.
+- Resolved: block-mode PVC device node ownership. kubelet does not apply
+  `fsGroup` to raw block devices; under containerd defaults the VM's
+  identity cannot open the device (`BlockDeviceAccessDenied`), and with
+  `device_ownership_from_security_context = true` the node belongs to the
+  pod's `runAsUser` and `runAsGroup` (Tested on the k0s cluster).
+- Partly answered: CSI driver with NodeStage and attach. A Ceph RBD volume
+  in both modes was detached, staged, and attached on another node during a
+  stop and start, and deleted cleanly (Tested on the k0s cluster). Teardown
+  ordering under SIGKILL, forced delete, and baryon-virtd down with such a
+  driver is still open.
 - Resolved: guest reboot reopen with Landlock and seccomp enforced (Tested
   on the kind host and the Hadron node).
 
@@ -440,9 +449,12 @@ Model B with `container` placement, on the evidence above:
 systemd-managed slices and escaped per-container CPU and memory managers.
 
 The decision is recorded in ADR 0005 (Accepted) and was confirmed on the
-Hadron node (k3s, systemd driver). The kubelet cgroupfs driver is Not
-supported (see Failure modes). Whether k0s uses the systemd driver by
-default is not verified.
+Hadron node (k3s, systemd driver) and on the k0s cluster. The kubelet
+cgroupfs driver is Not supported (see Failure modes). k0s v1.36.4 does not
+use the systemd driver by default: its generated containerd configuration
+lacks `SystemdCgroup`, and baryon-virtd refused VMs there with
+`CgroupDriverUnsupported` until a containerd drop-in set it (see
+[compatibility.md](compatibility.md#k0s-node-configuration)).
 
 ### Remaining questions
 
@@ -555,11 +567,38 @@ Anchor container cgroup.
 ### Remaining questions
 
 - Forced deletion of a paused guest on a Hadron node.
-- Multi-node: cross-node traffic between Baryon nodes, VM placement on
-  another node after a stop and start, and the `IdentityConflict`
-  replacement path. Testing on three Hadron nodes running k0s is in
-  progress.
-- Whether the reboot performed by a Kairos Operator `NodeOpUpgrade` honors
-  the kubelet shutdown inhibitor.
-- Whether k0s uses the systemd cgroup driver by default (cgroupfs is Not
-  supported).
+- Resolved on the k0s cluster: cross-node traffic between Baryon nodes and
+  VM placement on another node after a stop and start (see
+  [k0s cluster results](#k0s-cluster-results)). The `IdentityConflict`
+  replacement path is still not exercised on a cluster.
+- Resolved: the reboot performed by a Kairos Operator `NodeOpUpgrade`
+  honors the kubelet shutdown inhibitor (k0s cluster).
+- Resolved: k0s does not use the systemd cgroup driver by default; a
+  containerd drop-in sets it.
+
+## k0s cluster results
+
+What three Baryon-enabled Hadron nodes running k0s v1.36.4+k0s.1 (the k0s
+cluster in [testing.md](testing.md#results); kube-router, OpenEBS LVM
+LocalPV, Ceph RBD) added to the evidence above:
+
+- Storage: block-mode and filesystem-mode root disks on LVM LocalPV and
+  Ceph RBD, imported and booted through the same `O_PATH` and
+  `/proc/self/fd/N` handoff. Ceph RBD block devices appeared in the Anchor
+  container mode 0660 and LVM LocalPV devices mode 0600, owned by the VM's
+  identity with containerd `device_ownership_from_security_context`. A VM
+  on Ceph RBD moved to another node through CSI detach, NodeStage, and
+  attach in both modes and booted from its existing disk.
+- baryon-virtd's disk checks refused a block device node that a pod had
+  created as `disk.img` on a filesystem volume (`StorageFailed`, wrong disk
+  kind), and no VMM started.
+- Networking: one probe pod reached VMs on all three nodes, and a Service
+  followed a VM to its replacement Anchor Pod.
+- Process ownership: with the containerd drop-in, Anchor containers ran in
+  systemd scopes and VMs started; before it, every VM was refused with
+  `CgroupDriverUnsupported`.
+- Recovery: baryon-virtd restarts and outages and VMM crashes on one node
+  left the VMs on the other nodes untouched (multi-node E2E). Node reboots,
+  manual Kairos A/B upgrades, and Kairos Operator upgrades of one node at a
+  time stopped guests cleanly; the VMs started again on the same node or,
+  with Ceph RBD, on another node.

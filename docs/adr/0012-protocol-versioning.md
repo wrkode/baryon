@@ -1,6 +1,6 @@
 # 0012: Runtime protocol versions, features, and negotiation
 
-Status: Proposed
+Status: Accepted
 Date: 2026-10-03
 
 ## Context
@@ -22,14 +22,15 @@ express a breaking change except changing the package.
 
 - The runtime protocol has a version `<major>.<minor>`.
   - The major version is the protobuf package. `baryon.runtime.v1alpha1` is
-    major 1. A breaking change is a new package and a new major version.
-    Peers of different major versions refuse each other (reason
-    `ProtocolIncompatible`).
+    major 1. A breaking change is a new package and a new major version;
+    from major 2 on the packages are named `baryon.runtime.v2`,
+    `baryon.runtime.v3`, and so on. Peers of different major versions
+    refuse each other (reason `ProtocolIncompatible`).
   - Minor versions only add fields, messages, RPCs, and features. They never
     change the meaning of an existing field or remove behavior a released
     feature promises. Peers ignore what they do not know.
-  - 1.0 is the protocol of the first public release, which has no version
-    fields. A peer that sends no version speaks 1.0.
+  - 1.0 is the protocol of the first published commit (a73f37f), which has
+    no version fields. A peer that sends no version speaks 1.0.
   - 1.1 adds `ProtocolVersion`, `AnchorService.Negotiate`, the version and
     required features in `AttachRequest`, and the version and features in
     `RuntimeInfo`.
@@ -61,22 +62,60 @@ express a breaking change except changing the package.
   and the anchor belong to the same cluster release.
 - The host report keeps its own `report_version` (ADR 0009).
 - Supported skew: a cluster release and a host image interoperate when they
-  share the protocol major version, in any combination of minor versions. A
-  VM that needs a feature runs only on hosts that implement it.
+  share the protocol major version, in any combination of minor versions.
+  A VM that needs a feature the host lacks is refused before it starts
+  (`UnsupportedFeature`); nothing steers it to a host that has the feature
+  yet.
+- Required features: no feature beyond the 1.0 set may become required by a
+  VM until feature-aware placement exists. The planned mechanism is one
+  placement-only extended resource per feature, served by the node agent
+  only on hosts that implement the feature, like the
+  `virtualization.baryon.io/import` resource that grants nothing (ADR
+  0004).
+- Major transitions: a host of major N+1 keeps serving major N's
+  `AnchorService.Negotiate` and `NodeService.GetHost` and `GetRuntimeInfo`
+  (`RuntimeInfo` only) for at least one release, answering with its own
+  version, so that major N clients report `ProtocolIncompatible` instead of
+  reading UNIMPLEMENTED as 1.0.
+- Cluster objects of the previous release: the controller of release N
+  understands Anchor Pods of release N-1 that are still running: the reason
+  vocabulary in their termination messages (for example
+  `IdentityConflict`), the container names `anchor` and `import`, the
+  annotations `virtualization.baryon.io/spec-hash` and
+  `virtualization.baryon.io/restartedAt`, and the legacy import init
+  container's `--url=` argument. Legacy paths are removed one release
+  later.
+- Support window: a cluster release supports Anchor Pods of the previous
+  release and hosts of the same major version. The minimum host image for
+  each cluster release is recorded in
+  [compatibility.md](../compatibility.md#version-skew). Host-side safety
+  fixes (for example the disk path checks and the block device registry in
+  baryon-virtd) are not protocol features and are not negotiated: until
+  releases are tagged, hosts should run an image built from the same commit
+  as the cluster release or later.
 
 ## Consequences
 
 - Clusters can be upgraded in either order within a major version: the
   cluster release first, or the hosts first, node by node.
-- A release that adds a feature should be rolled out to the hosts first. A VM
-  that needs the feature and lands on a host without it is not ready with
-  reason `UnsupportedFeature`. Placement by feature is Planned; until then
-  the scheduler does not know which hosts implement which features.
-- A future major version needs a transition plan when it is introduced: the
+- Until feature-aware placement exists, no VM requires more than the 1.0
+  features, so `UnsupportedFeature` cannot occur between components that
+  follow this rule; the check stays as the guard for later features.
+- A future major version is introduced with the transition rule above: the
   node agent of the new release marks hosts of the old major version
-  incompatible, so new VMs avoid them while running VMs continue.
+  incompatible, so new VMs avoid them while running VMs continue, and old
+  clients get a clear refusal from new hosts.
 - 1.0 anchors keep working with 1.1 hosts because baryon-virtd treats an
-  attach without a version as 1.0 with the 1.0 features.
+  attach without a version as 1.0 with the 1.0 features. New anchors on 1.0
+  hosts take the UNIMPLEMENTED path of `Negotiate` and attach as before.
+- Evidence (version skew E2E on three Hadron nodes running k0s,
+  2026-10-03): a 1.0 cluster release with mixed 1.0 and 1.1 hosts passed
+  31 of 31 checks; a 1.1 cluster release with mixed hosts passed 31 of 31;
+  a 1.0 anchor reattached to a 1.1 baryon-virtd after a restart; VMs of the
+  old release kept running through the cluster release upgrade with
+  `RestartRequired=True` (`AnchorImageChanged`); the node agent published
+  `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones.
+  See [testing.md](../testing.md#results).
 
 ## Alternatives considered
 
@@ -95,3 +134,12 @@ express a breaking change except changing the package.
   socket's surface.
 
 ## Revisions
+
+- 2026-10-03: added the major transition rule and the package naming from
+  major 2, defined 1.0 as the protocol of the first published commit, the
+  rule that no feature beyond 1.0 becomes required before feature-aware
+  placement (replacing the sentence that a VM needing a feature runs only on
+  hosts that implement it, which nothing enforced), the handling of
+  previous-release Anchor Pods, the support window, and the mixed-version
+  evidence.
+- 2026-10-03: accepted after the architecture gate.

@@ -2,14 +2,15 @@
 
 Baryon runs on Hadron hosts managed by the Kairos lifecycle. This document
 explains which Kairos-family project does what, which ones Baryon depends on,
-and how Baryon will cooperate with Kairos-driven node upgrades.
+and how Baryon cooperates with Kairos-driven node upgrades.
 
 Facts about upstream projects were checked against upstream code and
-releases on 2026-10-02. Observations on a single Baryon-enabled Hadron node
-(a VM with nested KVM; Hadron v0.5.3, k3s v1.36.4+k3s1) are from
-2026-10-03; they are single-node evidence. Testing on a multi-node cluster
-of Hadron nodes running k0s is in progress. Versions are recorded so that drift can be detected; they are not
-requirements unless the compatibility contract in
+releases on 2026-10-02. Observations are from 2026-10-03, on a single
+Baryon-enabled Hadron node running k3s (v1.36.4+k3s1) and on the k0s
+cluster: three Baryon-enabled Hadron nodes (node1 to node3, VMs with nested
+KVM; Hadron v0.5.3, Kairos v4.3.0) running k0s v1.36.4+k0s.1, described in
+[testing.md](testing.md#results). Versions are recorded so that drift can be
+detected; they are not requirements unless the compatibility contract in
 [compatibility.md](compatibility.md) says so.
 
 | Project | Version checked | Source |
@@ -70,6 +71,13 @@ The historical provider-kairos repository was archived on 2026-08-31 and
 absorbed into the monorepo. The community provider-kubeadm repository is
 archived. Baryon does not depend on either.
 
+Upstream observation (k0s provider, Kairos v4.3.0): on the first boot of
+the active system, the k0s controller and worker services started before
+the provider had written their systemd override (arguments, token file), so
+the controller ran without `--enable-worker` and the workers failed for
+lack of a join token. A `systemctl daemon-reload` and a restart of the k0s
+service fixed it; later boots were not affected. Not yet reported upstream.
+
 Baryon does not depend on which path was used. The three differ in kubelet
 root directory, CRI socket path, and cgroup driver; baryon-virtd avoids all
 three by deriving pod identity, mount namespace, network namespace, and
@@ -105,23 +113,16 @@ Two properties of the current drain matter for VMs (kairos-operator
 
 - It deletes pods directly. It does not use the Eviction API and does not
   honor PodDisruptionBudgets. Upstream issues kairos-io/kairos#4949, #4950,
-  #4951 track this.
+  #4951 track eviction and waiting.
 - It does not wait for deleted pods to terminate.
 
-Consequence for Baryon today (not tested with Kairos Operator yet): if a
-`NodeOpUpgrade` targets a node with running VMs, each Anchor Pod is deleted,
-baryon-anchor receives SIGTERM, and the guest gets an ACPI shutdown. Because
-the operator does not wait for pods to terminate, the upgrade Job and the
-reboot can proceed while guests are still shutting down; a guest that has not
-finished when the host reboots is stopped without a clean shutdown. VMs are
-stopped, not migrated, and their availability is lost for the duration of the
-upgrade. Baryon makes no data-safety claim for this path until it has been
-tested.
-
-kubelet graceful node shutdown made a manual reboot wait for the guest
-shutdown on a single k3s node (see [Node reboot](#node-reboot)).
-Whether it has the same effect on the reboot that a `NodeOpUpgrade` performs
-is not tested.
+What this means for Baryon, observed with v0.2.2 on the k0s cluster, is in
+[Cooperation with upgrades](#cooperation-with-upgrades): each deleted Anchor
+Pod gives its guest an ACPI shutdown, and the guests finished before the
+reboot. The operator reboots with `nsenter -i -m -t 1 -- reboot`; on Hadron
+`reboot` is systemctl, which honors kubelet's shutdown inhibitor, so a guest
+still running at the reboot also gets a clean shutdown when kubelet graceful
+node shutdown is configured (Tested).
 
 ### Cluster API and the Kairos providers
 
@@ -147,7 +148,7 @@ Baryon's point of view. Baryon needs no Cluster API integration to run on it.
 | Kairos agent and immucore | yes (boot, layout, upgrades) | yes (kairos-init) | | | |
 | A Kubernetes provider (k3s, k0s, or provider-kubernetes) | yes (one of them) | yes (selected at image build) | | | |
 | AuroraBoot | no | yes (bootable artifacts) | yes (ISO, raw, netboot, fleet) | | |
-| Kairos Operator | no | | | yes (OS upgrades) | VM evacuation before upgrades |
+| Kairos Operator | no | | | yes (OS upgrades; Tested for one node and for all three nodes of the k0s cluster) | eviction-based drain and waiting for pod termination (upstream) |
 | Cluster API Provider Kairos | no | | yes (cluster creation) | yes (machine replacement) | pre-drain hook for VM evacuation |
 | Kairos Fleet provider | no | | yes (claiming enrolled nodes) | | |
 | Cloud Hypervisor | yes (the VMM) | yes (in the image) | | | |
@@ -187,9 +188,11 @@ freshly provisioned node was upgraded the same way (summary in
 
 ## Manual A/B upgrade
 
-Status: Tested on a single k3s node, manual procedure. Run six times in a
-row, each time with a VM on the node (summary in
-[testing.md](testing.md#results)). The commands, run from a machine with
+Status: Tested, manual procedure: six times in a row on a single k3s node,
+each time with a VM on the node, and on each of the three nodes of the k0s
+cluster with VMs running, where a VM also survived the upgrade of the
+control-plane node (summary in [testing.md](testing.md#results)). The
+commands, run from a machine with
 the new image in its local Docker daemon and SSH access to the node
 (`<node>`; the login user may run `sudo`):
 
@@ -222,9 +225,12 @@ was not done. VMs are stopped, not moved, during the upgrade reboot.
 
 ## Node reboot
 
-Status: Tested on a single k3s node, manual procedure. Measured with one VM
-running; details in
-[hadron.md](hadron.md#reboot-behavior):
+Status: Tested, manual procedure, on a single k3s node and on the k0s
+cluster, with one VM running; details for the k3s node in
+[hadron.md](hadron.md#reboot-behavior). On the k0s cluster, with graceful
+node shutdown and the VM on an LVM local volume, the guest shut down
+cleanly, and the VM came back without intervention once the node was Ready
+command, on a replacement Anchor Pod on the same node.
 
 - Without kubelet graceful node shutdown (the k3s default), the guest is
   stopped hard at the reboot. After boot, kubelet re-admits the existing
@@ -255,12 +261,14 @@ cloud-config in [hadron.md](hadron.md#node-configuration) writes the drop-in
 (`shutdownGracePeriod: 150s`, `shutdownGracePeriodCriticalPods: 30s`) from
 the Kairos `initramfs` stage, which runs after the persistent mounts and
 before k3s starts. A freshly provisioned node had the file in place and the
-kubelet's shutdown inhibitor active (150 s) with no manual step. For k0s
-the configuration is part of the multi-node testing in progress. For provider-kubernetes the setting has to be
-baked into the image, because that provider ignores `kubeletConfiguration`
-from cloud-config; not tested.
+kubelet's shutdown inhibitor active (150 s) with no manual step. For k0s,
+graceful node shutdown is set in a k0s worker profile in the k0s
+`ClusterConfig`, delivered by Kairos cloud-config
+([hadron.md](hadron.md#node-configuration)); Tested on the k0s cluster. For
+provider-kubernetes the setting has to be baked into the image, because that
+provider ignores `kubeletConfiguration` from cloud-config; not tested.
 
-## Kubernetes-driven upgrade (Designed)
+## Kubernetes-driven upgrade
 
 The upgrade itself stays with Kairos:
 
@@ -271,7 +279,7 @@ Baryon-enabled image vN+1 pushed to a registry
 NodeOpUpgrade (Kairos Operator) targeting selected nodes
         |
         v
-cordon, drain, kairos-agent upgrade, reboot
+cordon, drain (pod delete), kairos-agent upgrade, reboot
         |
         v
 node boots image vN+1, baryon-virtd validates the host
@@ -280,44 +288,154 @@ node boots image vN+1, baryon-virtd validates the host
 VirtualizationNode Ready=True, device plugin slots healthy again
 ```
 
-## Cooperation with upgrades (Designed, not implemented)
+## Cooperation with upgrades
 
-Baryon will not add an upgrade controller. It will perform VM evacuation
-itself and expose node state that an upgrade workflow can wait on.
+Baryon has no upgrade controller and does not move running VMs: live
+migration is Not supported, so a node upgrade stops the VMs on the node and
+they start again on a node that can reach their storage. Baryon only exposes
+node state that an upgrade workflow can read.
 
-VirtualizationNode Conditions reserved for this:
+VirtualizationNode state with semantics for upgrades:
 
-| Condition | Meaning | Status |
+| State | Meaning | Status |
 |---|---|---|
-| `Ready` | Host runtime healthy and accepting VMs. | Implemented |
-| `RuntimeHealthy` | baryon-virtd reachable, discovery succeeded, and its runtime protocol major version matches the cluster release (reason `ProtocolIncompatible` otherwise, ADR 0012). | Implemented |
-| `Evacuating` | Baryon is stopping or moving VMs off the node. | Designed |
-| `Evacuated` | No Baryon VMs remain on the node. | Designed |
-| `UpgradeSafe` | Evacuated and no new VMs will be placed. | Designed |
+| `Ready` condition | Host runtime healthy and accepting VMs. | Implemented |
+| `RuntimeHealthy` condition | baryon-virtd reachable, discovery succeeded, and its runtime protocol major version matches the cluster release (reason `ProtocolIncompatible` otherwise, ADR 0012). | Implemented |
+| `status.vmCount` | VMs known to baryon-virtd on the node; 0 answers "no VMs here". | Implemented |
 
-Design direction, to be recorded in its own ADR before implementation:
+Earlier drafts reserved `Evacuating`, `Evacuated`, and `UpgradeSafe`
+conditions and an upgrade-safe node label. They were removed: without
+migration there is nothing to evacuate beyond what a drain does, and a node
+label that gates `NodeOpUpgrade` would need its own ADR (single writer,
+removal before the node accepts VMs again).
 
-1. The evacuation request has a single writer and is separate from status:
-   either Node cordon (`spec.unschedulable`) is taken as the signal, or a
-   dedicated request object is introduced. VirtualizationNode has no spec
-   field for it today.
-2. On a request, baryon-node-agent marks its device plugin slots unhealthy so
-   no new VMs are placed, and the VMs on the node are stopped (migrated once
-   migration exists).
-3. When `Evacuated=True`, a label such as
-   `virtualization.baryon.io/upgrade-safe=true` is set so that a
-   `NodeOpUpgrade` whose `nodeSelector` requires it upgrades only evacuated
-   nodes. The label must be removed before the node accepts VMs again, or the
-   next upgrade could select a node with running VMs.
-4. After the reboot, baryon-virtd validates the host, the node agent reports
-   `Ready=True`, and the slots become healthy.
+### Runbook: upgrade one node with Kairos Operator
 
-This relies on upstream behavior that is inferred from Kairos Operator code
-and not documented: `nodeSelector` is re-evaluated on reconcile (on Job and
-Pod events and a periodic requeue). Whether a NodeOp that already reached a
-terminal state picks up nodes labelled later is not verified. If Kairos
-Operator gains an eviction-based drain or a preflight retry verdict, the
-integration should use that instead.
+Status: Tested on the k0s cluster with Kairos Operator v0.2.2, for one
+node and for a rolling upgrade of all three nodes (below). With v0.2.2,
+`concurrency` does not bound how many nodes are down at once, so this
+runbook upgrades one node per `NodeOpUpgrade` and starts the next only
+after the previous node and its VMs are back.
+
+1. Optionally drain the node with kubectl first (this also cordons it).
+   kubectl drain uses the Eviction API and honors PodDisruptionBudgets. Anchor Pods have no
+   emptyDir and are owned by their VirtualMachine, so no extra drain flags
+   are needed for them:
+
+   ```bash
+   kubectl drain <node> --ignore-daemonsets
+   ```
+
+   Without this step, the `NodeOpUpgrade` drain deletes the Anchor Pods
+   directly, which ignores PodDisruptionBudgets.
+2. Wait until no VM runs on the node:
+
+   ```bash
+   kubectl wait virtualizationnode/<node> --for=jsonpath='{.status.vmCount}'=0 --timeout=10m
+   ```
+
+   The node agent omits `vmCount` while baryon-virtd is unreachable, so the
+   wait does not pass on a node whose runtime is down.
+
+3. Upgrade the node with a `NodeOpUpgrade` that selects only this node,
+   with concurrency 1:
+
+   ```yaml
+   apiVersion: operator.kairos.io/v1alpha1
+   kind: NodeOpUpgrade
+   metadata:
+     name: upgrade-<node>
+     namespace: default
+   spec:
+     image: <registry>/baryon/hadron:<tag>
+     nodeSelector:
+       matchLabels:
+         kubernetes.io/hostname: <node>
+     concurrency: 1
+     upgradeActive: true
+     force: true
+   ```
+
+   The tested runs used `force: true` and an upgrade image that was already
+   present in each node's containerd under a fixed tag.
+4. If you drained the node in step 1, uncordon it when it is Ready again:
+   `kubectl uncordon <node>`.
+5. Before the next node, wait until this node's VirtualizationNode is
+   Ready again and its VMs are back (every VirtualMachine `Ready=True`, or
+   `vmCount` back to its value before the upgrade):
+
+   ```bash
+   kubectl wait virtualizationnode/<node> --for=condition=Ready --timeout=15m
+   kubectl wait virtualmachine/<vm> -n <namespace> --for=condition=Ready --timeout=15m
+   ```
+
+   Run the second command for each VM that was running on the node. A VM
+   with `runPolicy: Stopped` never becomes Ready.
+
+   Only then create the `NodeOpUpgrade` for the next node.
+
+Observed on the k0s cluster (v0.2.2, `force`, concurrency 1, two VMs on the
+node):
+
+- The drain deleted both Anchor Pods at once. Both guests shut down
+  cleanly (console `reboot: Power down`) before the reboot.
+- The VM on Ceph RBD restarted on another node.
+- The VM on an LVM local volume stayed Pending (`ClaimPending`, and
+  `Unschedulable` while its node was cordoned) until its node returned, and
+  was then Ready.
+- The operator reported the reboot complete and uncordoned the node while
+  the node was still NotReady (reboot detection of v0.2.2).
+- In a separate test, the operator's reboot with a VM running and no drain:
+  kubelet's logind delay inhibitor held, the guest powered off cleanly, and
+  the VM came back.
+
+Observed on the k0s cluster with one `NodeOpUpgrade` for all three nodes
+(v0.2.2, `nodeSelector` `virtualization.baryon.io/host=true`, concurrency 1,
+`force`, the image preloaded on every node; one VM on Ceph RBD on node1 and
+one on an LVM local volume on each of node2 and node3):
+
+- The upgrade Completed and every node booted the new image (the
+  baryon-virtd hash equal to the image's).
+- Concurrency 1 did not serialize the node outages. The drains of the three
+  nodes started one after another without waiting for the previous node to
+  return: v0.2.2 counts a node's reboot as complete before the node is
+  back, as in the single-node test, which frees the concurrency slot, so
+  the nodes rebooted at overlapping times.
+- Guests shut down cleanly at each drain.
+- The LVM VMs came back on their own nodes once those returned.
+- The Ceph RBD VM was down longest. No node was schedulable while all were
+  cordoned or rebooting. Its restart was then delayed until the Ceph CSI
+  attacher, whose controller had restarted with the control-plane node,
+  regained its leader lease after the in-cluster API path returned; until
+  then the volume stayed attached to the old node. Once the attacher led,
+  detach and attach completed and the VM was Ready.
+- All VMs recovered without intervention.
+- VMs whose claims carried an older import record (no digest) got an
+  import Pod after their drain; on filesystem claims the importer found the
+  marker and left the disk unchanged (see
+  [compatibility.md](compatibility.md#version-skew)).
+
+Limits:
+
+- PodDisruptionBudgets give no protection under the `NodeOpUpgrade` drain of
+  v0.2.2, which deletes pods. Use the kubectl drain in step 1 when a budget
+  must hold.
+- An administrator who cordoned or drained the node before the
+  `NodeOpUpgrade` must uncordon it by hand.
+- With v0.2.2, `concurrency` does not bound simultaneous node outages,
+  because reboot completion is counted before the node is back. To upgrade
+  one node at a time, run one `NodeOpUpgrade` per node as in the runbook.
+  The upstream main branch detects reboot completion by the node's boot ID
+  (not in v0.2.2); not tested.
+- VMs on shared storage can be down longer than VMs on node-local storage
+  when the CSI controller itself restarts with an upgraded node: its
+  attacher must regain its leader lease before the volume can move.
+- Sequential upgrades of several nodes can restart a VM on shared storage
+  several times, once for each node it lands on before that node is
+  upgraded.
+- VMs on node-local storage are unavailable until their node is back.
+- Eviction-based drain and waiting for pod termination in Kairos Operator
+  are tracked upstream (kairos-io/kairos#4949, #4950, #4951).
 
 For the hard reboot case, the compatibility contract requires kubelet
 graceful node shutdown, so that a reboot that does not go through Kubernetes
@@ -336,9 +454,9 @@ a future integration only.
 | VM disks | yes | in PVCs, outside the OS image |
 | Kubernetes objects | yes | in the API server |
 | baryon-virtd runtime records | no, by design | in `/run`, rebuilt after boot |
-| Running VMs | no | the node reboots; baryon-controller replaces the Anchor Pods and the VMs boot again (observed on a single k3s node after node reboots and after each upgrade reboot) |
+| Running VMs | no | the node reboots; baryon-controller replaces the Anchor Pods and the VMs boot again (observed on a single k3s node and on the k0s cluster after node reboots and upgrade reboots) |
 | VM console logs | yes | under `/var/log/baryon`, which Kairos persists |
-| Baryon host binaries and units | replaced | part of the image (checked after each manual upgrade on a single k3s node: the baryon-virtd hash or the `gitCommit` in `components.json`) |
+| Baryon host binaries and units | replaced | part of the image (checked after each manual upgrade: the baryon-virtd hash or the `gitCommit` in `components.json`) |
 
 Nothing Baryon needs must survive in the OS image across an upgrade. That is
 deliberate: it makes upgrades and rollbacks safe with respect to Baryon.

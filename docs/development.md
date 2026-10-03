@@ -104,8 +104,10 @@ and upgrades are described in [hadron.md](hadron.md) and
 
 Prerequisites: every Baryon node runs the Baryon-enabled Hadron image, has
 the label `virtualization.baryon.io/host=true`, uses the kubelet systemd
-cgroup driver, and has graceful node shutdown configured
-([compatibility.md](compatibility.md)).
+cgroup driver, and has graceful node shutdown configured; for block-mode
+root disks, containerd also needs `device_ownership_from_security_context =
+true` ([compatibility.md](compatibility.md); k0s:
+[compatibility.md](compatibility.md#k0s-node-configuration)).
 
 1. Set the image references in `deploy/base/controller/deployment.yaml`
    (the controller image and the `BARYON_ANCHOR_IMAGE` value) and in
@@ -119,18 +121,19 @@ cgroup driver, and has graceful node shutdown configured
    kubectl apply -f examples/classes.yaml
    ```
 
-4. Check that every Baryon node reports a VirtualizationNode and
-   advertises the `virtualization.baryon.io/vm` resource:
+3. Check that every Baryon node reports a VirtualizationNode and
+   advertises the `virtualization.baryon.io/vm` and
+   `virtualization.baryon.io/import` resources:
 
    ```bash
    kubectl get virtualizationnodes
-   kubectl get nodes -o custom-columns='NAME:.metadata.name,VMS:.status.allocatable.virtualization\.baryon\.io/vm'
+   kubectl get nodes -o custom-columns='NAME:.metadata.name,VMS:.status.allocatable.virtualization\.baryon\.io/vm,IMPORTS:.status.allocatable.virtualization\.baryon\.io/import'
    ```
 
 The admission policies in `deploy/base/policy/` are part of the supported
 installation ([security.md](security.md#admission-policies)). With
 `baryon-vm-resource` installed, only baryon-controller can create pods that
-request `virtualization.baryon.io/vm`.
+request `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`.
 
 baryon-virtd ships in the host image and is updated with a Kairos A/B
 upgrade, not by copying binaries onto a node. Running VMs keep running

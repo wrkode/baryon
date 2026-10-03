@@ -1,14 +1,14 @@
 # Design notes: hard questions
 
-Each question is answered with evidence or marked Open. All recorded
-evidence is single-node. "Hadron node" means one Baryon-enabled Hadron node
-running k3s; "kind host" means a historical development cluster in which a
-kind node container acted as the host, no longer used. Both are described
-in [testing.md](testing.md#results), which summarizes the runs behind every
-"Tested" below; the experiments are in
+Each question is answered with evidence or marked Open. "k0s cluster" means
+three Baryon-enabled Hadron nodes running k0s (node1 to node3, nested KVM),
+the integration environment; "Hadron node" means one Baryon-enabled Hadron
+node running k3s; "kind host" means a historical development cluster in
+which a kind node container acted as the host, no longer used. All are
+described in [testing.md](testing.md#results), which summarizes the runs
+behind every "Tested" below; the experiments are in
 [runtime-boundary.md](runtime-boundary.md). An answer whose evidence names
-only the kind host has not been repeated on a Hadron node. Multi-node
-testing on Hadron nodes running k0s is in progress.
+only the kind host has not been repeated on a Hadron node.
 
 ## Runtime
 
@@ -22,17 +22,19 @@ testing on Hadron nodes running k0s is in progress.
 | Can a VMM affect the host through its runtime directory? | Its `vmm/` directory is a size- and inode-limited tmpfs, so it cannot fill `/run`. baryon-virtd reads and connects to files there only directory-relative, without following symlinks, requiring the VM uid as owner and a single link, and with bounded reads (64 KiB for status, 16 MiB per preserved log). | `crates/virtd/src/vmm_files.rs` (Implemented, unit tests) |
 | How are stale processes detected? | A record whose pid is gone, has another start time, or runs another binary is discarded and its directory removed. | `crates/virtd/src/vm.rs`, `Manager::adopt` |
 | What is the source of truth? | Kubernetes for desired state; the kernel for running processes; records are an index. | [architecture.md](architecture.md) |
-| How is a cluster release paired with a host image? | The anchor sends its protocol (`baryon.runtime.v1alpha1`) in each attach; baryon-virtd refuses any other value (`FAILED_PRECONDITION`), and the VM reports `AttachRefused`. A supported skew policy for rolling upgrades is Open. | `crates/virtd/src/services.rs` (Implemented) |
+| How is a cluster release paired with a host image? | Through the runtime protocol version `<major>.<minor>` and named features (ADR 0012). Any minor versions of the same major interoperate; another major is refused (`ProtocolIncompatible`) and the node's VM slots become unhealthy. The anchor negotiates before attaching; a 1.0 host answers UNIMPLEMENTED and is treated as 1.0. No VM requires a feature beyond 1.0 until feature-aware placement exists. | Tested: version skew E2E on the k0s cluster with mixed 1.0 and 1.1 hosts under both cluster releases (31 of 31 each); a 1.0 anchor reattached to a 1.1 baryon-virtd |
 
 ## Storage
 
 | Question | Answer | Evidence |
 |---|---|---|
 | How does a CSI volume become accessible to a host VMM? | baryon-virtd resolves the path inside the Anchor mount namespace as an `O_PATH` fd; the VMM reopens it through `/proc/self/fd/N` as the VM's host identity. | ADR 0006; Experiment A |
-| How do filesystem and block PVCs differ? | Filesystem: `disk.img` on the mounted volume, imported or pre-populated. Block: the device node in the container, pre-populated. Same handoff. | Block mode Open |
-| Who owns locks? | Cloud Hypervisor takes an OFD write lock at boot; it is released when the VMM exits. | Cloud Hypervisor v53 `block/src/io/fcntl.rs` |
+| How do filesystem and block PVCs differ? | Filesystem: `disk.img` on the mounted volume, imported or pre-populated. Block: the device node `/dev/baryon/root` on the container's `/dev`, imported (written from the start of the device, the rest zeroed) or pre-populated. Same handoff. Block mode needs containerd `device_ownership_from_security_context = true`, because kubelet does not apply `fsGroup` to raw block devices. | Tested: storage E2E with OpenEBS LVM LocalPV and Ceph RBD in both modes on the k0s cluster |
+| Who owns locks? | Cloud Hypervisor takes an OFD write lock at boot; it is released when the VMM exits. It excludes a second VMM on the same disk file on a node, but not on a block device: each container has its own device node, so the lock is on a different inode. | Cloud Hypervisor v53 `block/src/io/fcntl.rs`; [storage.md](storage.md#handoff-to-the-vmm) |
+| How many VMs may use one claim? | One running VM. baryon-controller creates no import or Anchor Pod for a VM while a Baryon pod of another VM in the namespace mounts the claim (`ClaimInUse`); concurrent reconciles can race, so baryon-virtd also refuses a second VM on a node with the same block device (`DiskInUse`, kept across its restarts). `ReadWriteMany` block root disks across nodes are Not supported. | `ClaimInUse` Tested by the storage E2E on the k0s cluster; `DiskInUse` Implemented, unit tests |
+| When is an imported disk written? | By a separate import Pod, before the VM's first Anchor Pod exists. The completed import is recorded on the claim (a digest of the URL) and the import Pod is deleted; then the Anchor Pod is created. A claim that already has the filesystem marker but no record gets an import Pod that leaves the disk untouched and records the digest. | Tested: storage and deletion E2E on the k0s cluster; migration of a filesystem claim from the previous release observed on the k0s cluster (the guest did not regenerate its SSH host keys) |
 | What survives pod restart? | The claim and its content. A container restart restarts the VM; a pod replacement may move it. | ADR 0004 |
-| What survives node reboot? | Claims (per CSI driver; local-path keeps the data on the node). Runtime records and VMMs do not. The controller replaces the Anchor Pod and the VM boots again from the same claim. | Tested on the Hadron node (local-path); see Recovery below |
+| What survives node reboot? | Claims (per CSI driver; local-path and LVM LocalPV keep the data on the node). Runtime records and VMMs do not. The controller replaces the Anchor Pod and the VM boots again from the same claim. | Tested on the Hadron node (local-path) and the k0s cluster (LVM LocalPV); see Recovery below |
 | Does a guest reboot reopen the disk inside the same VMM? | Yes, through the same `/proc/self/fd/N` path, with Landlock enforced. Cloud Hypervisor needs write access to its own `vmm` directory to re-create the serial socket, so baryon-virtd adds that one Landlock rule; without it the reset failed with `Address in use`. | Tested on the Hadron node and the kind host (lifecycle E2E guest reset); Experiment A |
 | What does deleting a VM remove? | The VirtualMachine, the Anchor Pod, the claim Baryon created for an `http` source, the runtime directory, the VMM and responder processes, the VMM tmpfs, and the pod volumes. Per-pod logs stay until log retention; user-owned claims stay. | Tested on the Hadron node and the kind host (lifecycle and deletion E2E); [testing.md](testing.md#what-deletion-removes) |
 
@@ -55,7 +57,7 @@ testing on Hadron nodes running k0s is in progress.
 | What does CNI teardown do? | Runs after the container stop, by which time the VMM and its TAP are gone. baryon-virtd removes its qdiscs when the pod still exists. | Experiment C timeline |
 | How does VM identity remain stable on the network? | The MAC is derived from the VirtualMachine UID and set on the pod interface. The IP is the pod IP and changes with the Anchor Pod. | ADR 0007; Tested on the Hadron node (same MAC, new IP after node reboots) |
 | How do peers learn the new MAC? | baryon-virtd broadcasts a gratuitous ARP for the pod IP after the MAC change. Without it the guest stayed unreachable from other pods after Ready until their neighbor entries expired. | Tested on the Hadron node and the kind host |
-| Which guest network paths are tested? | From another pod to the pod IP, and through a ClusterIP Service by DNS name. NetworkPolicy and guest-initiated egress are Inferred, not tested. | [networking.md](networking.md) |
+| Which guest network paths are tested? | From another pod to the pod IP, and through a ClusterIP Service by DNS name, including from one probe pod to VMs on three nodes (kube-router on the k0s cluster). NetworkPolicy and guest-initiated egress are Inferred, not tested. | [networking.md](networking.md) |
 | Must guest DHCP survive a baryon-virtd restart? | Today it does not: the responder exits with baryon-virtd and is restarted only once the anchor reattaches, so a guest that reboots in between gets no address until then. Whether this is acceptable is Open. | [networking.md](networking.md) |
 
 ## Scheduling
@@ -63,7 +65,7 @@ testing on Hadron nodes running k0s is in progress.
 | Question | Answer | Evidence |
 |---|---|---|
 | Does the Anchor Pod completely determine VM placement? | Yes. Placement controls in the VM API (nodeSelector, tolerations, affinity, priority) are Planned. | ADR 0004 |
-| How are virtualization capabilities expressed? | The `virtualization.baryon.io/vm` extended resource marks usable nodes; VirtualizationNode reports details. | ADR 0004, ADR 0009 |
+| How are virtualization capabilities expressed? | The `virtualization.baryon.io/vm` extended resource marks usable nodes; the placement-only `virtualization.baryon.io/import` resource places import Pods on the same nodes; VirtualizationNode reports details. Placement by runtime protocol feature is Planned (one placement-only resource per feature, ADR 0012). | ADR 0004, ADR 0009, ADR 0012 |
 | How will NUMA requirements affect scheduling? | Through the Anchor container's resources: the CPU and memory managers assign cpusets to the container, and the VMM inherits them because it shares the container cgroup. Not tested with the static policy. | Open |
 | How will device allocation integrate with DRA? | Designed direction: ResourceClaims on the Anchor Pod, with baryon-node-agent as the DRA driver and baryon-virtd handing devices to the VMM. | Planned |
 
@@ -83,31 +85,32 @@ testing on Hadron nodes running k0s is in progress.
 
 | Question | Answer | Evidence |
 |---|---|---|
-| What happens after node reboot? | VMMs and records are gone. Without kubelet graceful node shutdown, the guest is stopped hard at the reboot; after boot, kubelet re-admits the existing Anchor Pod before the device plugin has registered, admission fails (`UnexpectedAdmissionError`, no healthy devices for `virtualization.baryon.io/vm`), and the pod fails. With graceful node shutdown, the guest shuts down cleanly and the old pod ends `Succeeded`. In both cases the controller replaces the finished pod with a new Anchor Pod (new pod UID and IP, same MAC), which stays Pending until the device plugin registers. | Tested on the Hadron node (manual procedure) |
+| What happens after node reboot? | VMMs and records are gone. Without kubelet graceful node shutdown, the guest is stopped hard at the reboot; after boot, kubelet re-admits the existing Anchor Pod before the device plugin has registered, admission fails (`UnexpectedAdmissionError`, no healthy devices for `virtualization.baryon.io/vm`), and the pod fails. With graceful node shutdown, the guest shuts down cleanly and the old pod ends `Succeeded`. In both cases the controller replaces the finished pod with a new Anchor Pod (new pod UID and IP, same MAC), which stays Pending until the device plugin registers. | Tested on the Hadron node and the k0s cluster (manual procedure; on the k0s cluster with graceful shutdown the VM came back without intervention once the node was Ready) |
 | What does a guest reset do? | The VMM keeps running and re-creates the VM's devices; the guest boots again and gets a new lease. A hard reset shortly after the first boot can lose first-boot writes: the Debian guest lost its SSH host keys. | Tested on the Hadron node and the kind host |
 | Should VMs automatically restart? | Yes while `runPolicy: Running`: a VMM exit ends the anchor container and kubelet restarts it with back-off. A guest-initiated power-off also restarts the VM. | Experiment C (VMM SIGKILL); Tested on the Hadron node (VMM crash) |
 | How is an orphaned VM process reconciled? | A VMM whose anchor does not return within the reattach or recovery grace, or whose pod has no other process left, is stopped or killed. With the systemd cgroup driver, stopping the container scope also stops it, even while baryon-virtd is down; that is why the cgroupfs driver is refused. | Experiment C; Tested on the Hadron node (deletion with baryon-virtd stopped) |
 | How is an orphaned Anchor Pod reconciled? | The Anchor Pod is owned by the VirtualMachine and garbage collected; the controller deletes it when the VM is stopped or deleted. A pod named `<vm>-anchor` that the VM does not control is left alone and reported as `AnchorPodConflict`. | lifecycle and deletion E2E; `crates/controller/src/reconcile.rs` |
 | Is the systemd cgroup driver requirement permanent? | It is required today (cgroupfs is Not supported). Whether a different stop mechanism could lift it is Open. | Experiment C; [compatibility.md](compatibility.md) |
+| How fast does the controller recover after an API server restart? | kube-runtime backs off all of a controller's watches together after an error in any of them, and an API server restart makes every watch fail once with 410 Expired. With the default backoff (800 ms to 30 s, reset after 120 s) no VM was reconciled for minutes. baryon-controller uses a backoff of 0.5 s doubling to 5 s; after a control-plane node reboot it reconciled shortly after the in-cluster API path returned, which itself lagged behind the API server (cluster networking). | `crates/controller/src/main.rs` (`TriggerBackoff`, unit test); observed on the k0s cluster |
 
 ## Kairos lifecycle
 
 | Question | Answer | Evidence |
 |---|---|---|
 | How is the Baryon-enabled Hadron artifact built? | Hadron base image, plus the Baryon host layer, then kairos-init with the chosen Kubernetes provider; AuroraBoot for bootable media. | [hadron.md](hadron.md) |
-| How does Kairos Operator deploy an updated artifact? | `NodeOpUpgrade` with the new image. Not tested. | [kairos-integration.md](kairos-integration.md) |
-| Does a Kairos A/B upgrade work on a Baryon node? | Yes for a manual `kairos-agent upgrade --source ocifile:...` and reboot with a VM running: the node booted the new image each time, and the VM was Ready again on a replacement Anchor Pod. The recovery system is upgraded separately (`--recovery`); not done. | Tested on the Hadron node, manual procedure in [kairos-integration.md](kairos-integration.md) |
-| Does a `NodeOpUpgrade` reboot wait for the kubelet shutdown inhibitor? | Not verified. | Open |
-| How can Baryon eventually signal upgrade safety? | Designed: evacuation, then a node label that a `NodeOpUpgrade` selects on. | [kairos-integration.md](kairos-integration.md) |
+| How does Kairos Operator deploy an updated artifact? | `NodeOpUpgrade` with the new image. With v0.2.2 on one node: the drain deleted the Anchor Pods, the guests shut down cleanly before the reboot, a VM on Ceph RBD restarted on another node, and a VM on an LVM local volume stayed Pending until its node returned and was then Ready. | Tested on the k0s cluster for one node and for a rolling upgrade of all three nodes; with v0.2.2, concurrency 1 did not serialize the node outages (reboot completion is counted before the node is back). [kairos-integration.md](kairos-integration.md#cooperation-with-upgrades) |
+| Does a Kairos A/B upgrade work on a Baryon node? | Yes for a manual `kairos-agent upgrade --source ocifile:...` and reboot with a VM running: the node booted the new image each time, and the VM was Ready again on a replacement Anchor Pod; on the k0s cluster a VM survived the upgrade of the control-plane node. The recovery system is upgraded separately (`--recovery`); not done. | Tested on the Hadron node (six times) and on all three nodes of the k0s cluster, manual procedure in [kairos-integration.md](kairos-integration.md) |
+| Does a `NodeOpUpgrade` reboot wait for the kubelet shutdown inhibitor? | Yes. The operator reboots with `nsenter -i -m -t 1 -- reboot`; on Hadron `reboot` is systemctl, which honors kubelet's logind delay inhibitor. With a VM running and no drain, the guest powered off cleanly and the VM came back. | Tested on the k0s cluster (Kairos Operator v0.2.2) |
+| How does Baryon signal that a node can be upgraded? | `status.vmCount` on the VirtualizationNode answers "no VMs here"; an upgrade runbook waits for it to be 0. An upgrade-safe label or evacuation conditions are not planned until migration exists; a label would need its own ADR. | [kairos-integration.md](kairos-integration.md#cooperation-with-upgrades) |
 | What Baryon state must survive a Kairos A/B upgrade? | None in the OS image. Disks live in claims; logs in `/var/log`. | ADR 0003 |
-| What host and cluster version skew is supported during rolling upgrades? | Mismatched protocols are refused (`AttachRefused`); a supported skew policy is Open. | Open |
+| What host and cluster version skew is supported during rolling upgrades? | Any minor versions of the same protocol major version, in either upgrade order; Anchor Pods of the previous release keep running under a new cluster release (`RestartRequired=True`, `AnchorImageChanged`). The minimum host image per cluster release is in [compatibility.md](compatibility.md#version-skew). | ADR 0012; Tested by the version skew E2E on the k0s cluster |
 
 ## Cluster API
 
 | Question | Answer | Evidence |
 |---|---|---|
 | What does Baryon assume about how the host cluster was created? | Nothing beyond [compatibility.md](compatibility.md). | |
-| Can a CAPI-created Hadron cluster run Baryon without special integration? | Yes for k3s; it is an ordinary cluster. Its image must be the Baryon-enabled image. For k0s, whether its kubelet uses the systemd cgroup driver by default is not verified, and cgroupfs is Not supported. | research of cluster-api-provider-kairos v0.1.3 |
+| Can a CAPI-created Hadron cluster run Baryon without special integration? | It is an ordinary cluster; its image must be the Baryon-enabled image. For k0s, the nodes need the containerd drop-in and the worker profile in [compatibility.md](compatibility.md#k0s-node-configuration), because k0s v1.36.4 does not use the systemd cgroup driver by default. Not tested through Cluster API. | research of cluster-api-provider-kairos v0.1.3; k0s cluster |
 | What future machine capability metadata would be useful? | A Machine label marking Baryon-enabled images, and pre-drain hooks for evacuation. | Planned |
 
 ## Migration constraints recorded so far
@@ -134,7 +137,6 @@ testing on Hadron nodes running k0s is in progress.
 - A durable VM identity across re-create, restore, and move.
 - Must guest DHCP survive a baryon-virtd restart?
 - Migration against the fixed Anchor Pod name and the at-most-one-VMM rule.
-- The supported host image and cluster release version skew during rolling
-  upgrades.
-- Does the reboot of a Kairos Operator `NodeOpUpgrade` wait for the kubelet
-  shutdown inhibitor?
+- Exclusion between a VM's import Pod and its Anchor Pod with more than one
+  controller replica (it relies on the single replica today).
+- An explicit flow for growing a root disk (`rootDisk` is immutable).

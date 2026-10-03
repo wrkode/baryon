@@ -24,8 +24,11 @@ VirtualMachine spec contains only fields with an implementation:
 `className`, `runPolicy` (`Running` or `Stopped`), `rootDisk` (an HTTP
 source imported into a claim Baryon creates, or an existing claim), and
 `networks` (a list-map keyed by a DNS-1123 label name; exactly one, the pod
-network). CEL rules enforce one disk source, a size for imported disks, an `http` or `https` URL, a SHA-256 digest when
-the URL is plain `http`, and the single pod network. Restart is requested
+network). CEL rules enforce one disk source, a size for imported disks, an
+`http` or `https` URL, a SHA-256 digest when the URL is plain `http`, the
+single pod network, and an immutable `rootDisk` (`self == oldSelf`,
+including `size`): the disk's content and claim are bound to it, so another
+disk means a new VirtualMachine. Restart is requested
 with the `virtualization.baryon.io/restartedAt` annotation, following the
 `kubectl rollout restart` convention.
 
@@ -39,8 +42,13 @@ kubelet:
 - anchor container restarts: VM restarts in this pod
 - anchor container termination message: `Reason: detail` from baryon-virtd,
   for example `VmmKilled: VMM was killed by signal 9`
-- import init container state and termination message
 - pod IPs and node
+
+The import state reaches the controller through the import Pod
+(`<vm>-import`), also written only by kubelet: its importer container state
+and termination message, and its `PodScheduled` condition while it cannot
+be placed. Anchor Pods of the previous release carry the importer as an
+init container, and its state is read from there.
 
 The controller derives VirtualMachine Conditions (`Scheduled`,
 `StorageReady`, `Running`, `Ready`, `RestartRequired`) from these and from the
@@ -77,6 +85,8 @@ Hypervisor configuration.
   VirtualMachines.
 - Runtime detail is limited to what fits a reason and message; detailed
   runtime state stays on the node (baryon-virtd logs, console logs).
+- `rootDisk` cannot be changed in place. Disk growth needs an explicit flow
+  (Planned).
 - New fields require an implementation. Direct kernel boot, additional
   disks, Multus networks, CPU pinning, hugepages, and VFIO are Designed or
   Planned and are not in the schema.
@@ -108,3 +118,6 @@ Hypervisor configuration.
 - 2026-10-03: `status.identityConflictNodes` and the `IdentityConflict`
   handling (ADR 0011); the host identity is specified by ADR 0011 instead
   of here.
+- 2026-10-03: `rootDisk` became immutable, including `size`; the import
+  state is read from the import Pod instead of an Anchor Pod init container
+  (ADR 0004).

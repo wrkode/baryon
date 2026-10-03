@@ -1,13 +1,13 @@
 # The Baryon-enabled Hadron image
 
-Status: image build Implemented (`packaging/hadron/Dockerfile`). With k3s,
-on a single node (a VM with nested KVM), the image boots from an AuroraBoot
-raw EFI disk, including a fresh provision with a Kairos cloud-config, and
-runs VMs (Tested: lifecycle and deletion E2E); node reboots with a running
-VM and manual Kairos A/B upgrades are Tested as manual procedures. Results
-are summarized in [testing.md](testing.md#results). The k0s variant is
-Implemented; testing on a multi-node cluster is in progress. Kairos
-Operator upgrades are not tested. Facts about Hadron were checked against
+Status: image build Implemented (`packaging/hadron/Dockerfile`). The k0s
+variant runs on three nodes (the k0s cluster, VMs with nested KVM) and the
+k3s variant on a single node; each was provisioned from an AuroraBoot raw
+EFI disk with a Kairos cloud-config and runs VMs (Tested: E2E suites). Node
+reboots with running VMs and manual Kairos A/B upgrades are Tested as
+manual procedures on both; Kairos Operator `NodeOpUpgrade` of one node and
+of all three nodes is Tested on the k0s cluster. Results are summarized in
+[testing.md](testing.md#results). Facts about Hadron were checked against
 kairos-io/hadron v0.5.3 and main (58ff499) on 2026-10-02.
 
 ## What Hadron provides
@@ -115,7 +115,8 @@ kairos-init runs last because its install and init stages rebuild the initrd
 from the final file layout.
 
 The images used for the single-node k3s results were built this way with
-k3s v1.36.4+k3s1 (`packaging/versions.env`). The first was turned into a
+k3s v1.36.4+k3s1 (`packaging/versions.env`); the images of the k0s cluster
+with `KUBERNETES_DISTRO=k0s` and k0s v1.36.4+k0s.1. The first was turned into a
 raw EFI disk; later images were installed by Kairos A/B upgrade, and a
 freshly provisioned node was upgraded twice more (summary in
 [testing.md](testing.md#results)).
@@ -134,7 +135,7 @@ docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v "<w
   --set state_dir=/work/aurora --cloud-config /work/cloud-config.yaml
 ```
 
-This is the form used for the single-node k3s results.
+This is the form used for the single-node k3s results and the k0s cluster.
 
 ISO (`auroraboot build-iso`) and trusted boot UKI (`auroraboot build-uki`)
 use the same image. Trusted boot is not tested: it loads the whole root file
@@ -159,11 +160,15 @@ step 2 is set by the unit file):
 
 The node needs, through Kairos cloud-config or the provisioning system:
 
-- a Kubernetes configuration (for k3s, a `k3s:` block)
+- a Kubernetes configuration (for k3s, a `k3s:` block; for k0s, a `k0s:`
+  block and, on the controller, the k0s `ClusterConfig`)
 - the node label `virtualization.baryon.io/host=true`, which selects the
-  node for baryon-node-agent (for k3s: `--node-label` in `k3s.args`)
+  node for baryon-node-agent (for k3s: `--node-label` in `k3s.args`; for
+  k0s: `--labels` in `k0s.args`)
 - kubelet graceful node shutdown, so that a reboot stops Anchor Pods, and
   therefore guests, before the host goes down (see below)
+- on k0s, the kubelet systemd cgroup driver and, for block-mode root disks,
+  containerd device ownership ([compatibility.md](compatibility.md#k0s-node-configuration))
 
 A k3s example, the form used for the single-node k3s results (add users,
 SSH keys, and the rest of your node configuration):
@@ -190,9 +195,66 @@ stages:
             shutdownGracePeriodCriticalPods: 30s
 ```
 
-For k0s no tested example exists yet: how the node label, the systemd
-cgroup driver, and graceful node shutdown are configured on k0s nodes is
-part of the multi-node testing in progress.
+A k0s example for the controller node, which also runs workloads, the form
+used for the k0s cluster (add users, SSH keys, the API address, and the rest
+of your node configuration). Workers use the same containerd stage, a
+join token from the controller written to a file under `/etc/k0s`, and a
+`k0s-worker:` block (`enabled: true`, `args: [--labels=virtualization.baryon.io/host=true]`);
+they take the `default` worker profile from the controller.
+
+```yaml
+#cloud-config
+stages:
+  initramfs:
+    - name: "containerd: systemd cgroups, device ownership"
+      directories:
+        - path: /etc/k0s/containerd.d
+          permissions: 0755
+      files:
+        - path: /etc/k0s/containerd.d/baryon.toml
+          permissions: 0600
+          content: |
+            version = 3
+            [plugins."io.containerd.cri.v1.runtime"]
+              device_ownership_from_security_context = true
+            [plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc.options]
+              SystemdCgroup = true
+    - name: "k0s cluster configuration"
+      directories:
+        - path: /etc/k0s
+          permissions: 0755
+      files:
+        - path: /etc/k0s/k0s.yaml
+          permissions: 0600
+          content: |
+            apiVersion: k0s.k0sproject.io/v1beta1
+            kind: ClusterConfig
+            metadata:
+              name: k0s
+            spec:
+              workerProfiles:
+                - name: default
+                  values:
+                    cgroupDriver: systemd
+                    shutdownGracePeriod: 150s
+                    shutdownGracePeriodCriticalPods: 30s
+k0s:
+  enabled: true
+  args:
+    - --enable-worker
+    - --no-taints
+    - --config=/etc/k0s/k0s.yaml
+    - --labels=virtualization.baryon.io/host=true
+```
+
+The worker profile and the node label were delivered this way on the k0s
+cluster. The containerd drop-in was added to the nodes after provisioning
+and took effect after a reboot; delivering it from the `initramfs` stage as
+shown is not yet tested from first boot. Without it, k0s v1.36.4 runs pods
+under cgroupfs and baryon-virtd refuses every VM
+(`CgroupDriverUnsupported`). On the first boot of the active system the
+Kairos k0s provider may start k0s before writing its configuration
+([kairos-integration.md](kairos-integration.md#kairos-kubernetes-providers)).
 
 ### Graceful node shutdown
 
@@ -224,13 +286,19 @@ node shutdown configured; a VirtualizationNode condition for it is Planned.
 The cloud-config above writes the file from the Kairos `initramfs` stage,
 which runs after the persistent mounts and before k3s starts. A freshly
 provisioned node had the file in place and the kubelet's shutdown inhibitor
-active (150 s) with no manual step. k0s (in progress) and provider-kubernetes
-are not tested.
+active (150 s) with no manual step.
+
+On k0s, `shutdownGracePeriod` and `shutdownGracePeriodCriticalPods` are set
+in the worker profile of the k0s `ClusterConfig` (example above). On the
+k0s cluster a node reboot with a running VM shut the guest down cleanly
+(Tested, manual procedure). provider-kubernetes is not tested.
 
 ## Reboot behavior
 
 Observed on a single k3s node with one VM running (Tested, manual
-procedure; summary in [testing.md](testing.md#results)):
+procedure; summary in [testing.md](testing.md#results)). On the k0s cluster
+a reboot with graceful node shutdown behaved like the second row, and the
+VM came back without intervention once the node was Ready.
 
 | Configuration | Guest at reboot | Old Anchor Pod |
 |---|---|---|
@@ -254,8 +322,11 @@ connections are gone.
 ## Upgrades
 
 A new Baryon release means a new image, applied with Kairos: manually with
-`kairos-agent upgrade` (Tested on a single k3s node, manual procedure), or with a
-Kairos Operator `NodeOpUpgrade` (not tested). The node reboots into the new
+`kairos-agent upgrade` (Tested on a single k3s node and on all three nodes of
+the k0s cluster, manual procedure), or with a Kairos Operator
+`NodeOpUpgrade` (Tested on the k0s cluster for one node and for all three
+nodes; runbook in
+[kairos-integration.md](kairos-integration.md#cooperation-with-upgrades)). The node reboots into the new
 image. VMs on it are stopped, not moved: with graceful node shutdown their
 Anchor Pods shut the guests down first; without it the guests are stopped
 hard. The reboot that completes an upgrade is a node reboot; the measured

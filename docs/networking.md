@@ -1,18 +1,20 @@
 # Networking
 
-Status: Tested by the lifecycle E2E on a single Baryon-enabled Hadron node
-running k3s with flannel (vxlan backend, `cni0` bridge), the "Hadron node",
-and on a historical development cluster in which a kind node container
-acted as the host, with kindnet, the "kind host" (no longer used); summary
-in [testing.md](testing.md#results). Multi-node testing is in progress. Decision: ADR 0007. Experiment B in
+Status: Tested by the multi-node E2E on three Baryon-enabled Hadron nodes
+running k0s with the k0s default CNI, kube-router (the "k0s cluster"), and
+by the lifecycle E2E on a single Baryon-enabled Hadron node running k3s with
+flannel (vxlan backend, `cni0` bridge), the "Hadron node", and on a
+historical development cluster in which a kind node container acted as the
+host, with kindnet, the "kind host" (no longer used); summary in
+[testing.md](testing.md#results). Decision: ADR 0007. Experiment B in
 [runtime-boundary.md](runtime-boundary.md) records how the design was
 reached.
 
 | Guest network path | Status |
 |---|---|
-| From another pod to the pod IP (SSH banner, ping) | Tested on the Hadron node and the kind host |
-| Through a ClusterIP Service, by DNS name, also after the VM moved to a new Anchor Pod | Tested on the Hadron node and the kind host |
-| Cross-node traffic | observed on the kind host (kindnet, from a pod on the control plane node) in Experiment B; not tested on Baryon nodes |
+| From another pod to the pod IP (SSH banner, ping) | Tested on the k0s cluster, the Hadron node, and the kind host |
+| Through a ClusterIP Service, by DNS name, also after the VM moved to a new Anchor Pod | Tested on the k0s cluster, the Hadron node, and the kind host |
+| Cross-node traffic | Tested on the k0s cluster (kube-router): one probe pod reached VMs on all three nodes; observed on the kind host (kindnet) in Experiment B; not tested with flannel |
 | NetworkPolicy applying to the guest as to the pod | Inferred from the design (the guest traffic is the pod's traffic), not tested |
 | Guest-initiated egress (to other pods, Services, outside the cluster) | Inferred, not tested |
 | Other CNIs | not tested |

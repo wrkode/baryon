@@ -12,11 +12,15 @@ far. Other documents state a status label and link to
 | Unit and integration tests | `cargo test --workspace --locked`; integration tests in `crates/host/tests/` | logic of every crate against fixtures, fake sockets, and synthetic sysfs and procfs trees | any Linux host with the pinned toolchain | yes (job `test`) |
 | API server checks | `hack/ci/k0s.sh`, `hack/ci/apiserver-checks.sh` | CRD schema, CEL rules, admission policies | a single-node k0s API server in a container; no KVM, not a Baryon host | yes (job `crds`) |
 | E2E lifecycle | `tests/e2e/lifecycle.sh` | one VM through create, stop, start, restart, guest reset, and delete, with host-side cleanup checks | a cluster of Baryon nodes | no |
-| E2E deletion | `tests/e2e/delete.sh` | deletion in every phase before Ready | a cluster of Baryon nodes | no |
+| E2E deletion | `tests/e2e/delete.sh` | deletion in every phase before Ready, and the import Pod's resources and isolation | a cluster of Baryon nodes | no |
+| E2E multi-node | `tests/e2e/multinode.sh` | one VM per node, controller restart, baryon-virtd restart and outage on one node, VMM crash, Anchor Pod replacement behind a Service, cordon, deleting one VM, each without effect on the VMs of other nodes | at least three Baryon nodes | no |
+| E2E storage | `tests/e2e/storage.sh` | one StorageClass and volume mode: import, boot, one VM per claim (`ClaimInUse`), Anchor Pod replacement and stop and start without a second import, a move to another node, deletion with claim, volume, and host cleanup | a cluster of Baryon nodes with the StorageClass | no |
+| E2E version skew | `tests/e2e/skew.sh` | one VM per node under whatever mix of cluster release and host image versions runs, reattach across versions after a baryon-virtd restart | a cluster of Baryon nodes during a rolling upgrade | no |
+| E2E hostile disk | `tests/e2e/hostile-disk.sh` | a claim whose `disk.img` is a block device node made by a pod is refused (`StorageFailed`) and no VMM starts | a cluster of Baryon nodes and a namespace that admits a root pod with the runtime's default capabilities | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
-| Multi-node suite | Planned | cross-node guest traffic, placement on another node after stop and start, identity conflict handling across nodes | a multi-node cluster of Baryon nodes | no |
-| CSI suite | Planned | block-mode claims, a CSI driver with NodeStage and attach, teardown ordering under real detach | a cluster with such a driver | no |
+| Identity conflict suite | Planned | the `IdentityConflict` replacement path across nodes | a multi-node cluster of Baryon nodes | no |
+| CSI failure-path suite | Planned | teardown ordering under SIGKILL, forced delete, and baryon-virtd down with a CSI driver that stages and attaches | a cluster with such a driver | no |
 
 The E2E tests and the manual procedures need hardware virtualization, which
 hosted CI runners do not provide. Never report E2E results from an
@@ -32,12 +36,12 @@ cargo test --workspace --locked
 |---|---|
 | `baryon-host` | discovery against synthetic sysfs, procfs, and /etc trees (Intel host with IOMMU and VFIO, aarch64 host without KVM, malformed input), CPU list parsing; a real-host smoke test runs only with `BARYON_TEST_REAL_HOST=1` |
 | `baryon-cloud-hypervisor` | command line construction (including `--landlock-rules` for writable directories) and option injection rejection, API client against a fake Unix socket server (status codes, timeouts), event monitor decoding with split writes and truncation, version parsing |
-| `baryon-virtd` | pod cgroup parsing (systemd, cgroupfs, nested roots) and systemd scope detection, peer pidfd, the anchor identity check (`IdentityMismatch`) and the refusal of a second VM with the same identity on a node (`IdentityConflict`), disk resolution confinement (absolute symlink and `..` escapes), `/proc/self/fd` reopen, access to the VMM-owned directory (bounded tail reads; symlinks, hard links, other file types, and a foreign owner refused; socket connection through a checked descriptor), DHCP responses (routed, bridged, and off-link gateway route tables, NAK, other clients), IPv4 and UDP checksums, DHCP responder protocol (lease configuration round trip, only events matching the lease forwarded, overlong lines rejected), gratuitous ARP frame layout, tc filter encoding, cgroup limits, serial prompt detection and capture, record round trip, spec validation |
-| `baryon-runtime-api` | per-VM identity (deterministic, distinct for different VMs, unprivileged and inside the reserved range, verification), guest MAC derivation, anchor spec round trip |
-| `baryon-anchor` | sparse writes, redirect resolution (absolute, root-relative, path-relative; HTTPS to HTTP refused), import against a local HTTP server with checksum and marker handling, termination messages |
+| `baryon-virtd` | pod cgroup parsing (systemd, cgroupfs, nested roots) and systemd scope detection, peer pidfd, the anchor identity check (`IdentityMismatch`) and the refusal of a second VM with the same identity on a node (`IdentityConflict`), disk resolution confinement (absolute symlink and `..` escapes), the accepted disk paths and kinds (`UnknownPath`, `KindMismatch`), device nodes outside the container's `/dev` mount, one VM per block device on a node (`DiskInUse`), `/proc/self/fd` reopen, access to the VMM-owned directory (bounded tail reads; symlinks, hard links, other file types, and a foreign owner refused; socket connection through a checked descriptor), DHCP responses (routed, bridged, and off-link gateway route tables, NAK, other clients), IPv4 and UDP checksums, DHCP responder protocol (lease configuration round trip, only events matching the lease forwarded, overlong lines rejected), gratuitous ARP frame layout, tc filter encoding, cgroup limits, serial prompt detection and capture, record round trip, spec validation |
+| `baryon-runtime-api` | per-VM identity (deterministic, distinct for different VMs, unprivileged and inside the reserved range, verification), guest MAC derivation, anchor spec round trip, protocol versions and features (a peer without a version is 1.0 with the 1.0 features, same major interoperates, another major and missing features refused) |
+| `baryon-anchor` | sparse writes, block device import (zero runs, tail zeroing, data past the first 1 MiB, unaligned device end, a failed import leaves the first 1 MiB zero, the size limit holds before writing), redirect resolution (absolute, root-relative, path-relative; HTTPS to HTTP refused), import against a local HTTP server with checksum and marker handling, protocol negotiation results, termination messages |
 | `baryon-api` | CRD generation with CEL rules and list-map markers, defaults, conditions, quantities |
-| `baryon-node-agent` | device plugin slots and allocation, VirtualizationNode status translation |
-| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access), block mode, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, status derivation for ready, failed, importing, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons |
+| `baryon-node-agent` | device plugin slots and allocation, the import resource granting nothing, VirtualizationNode status translation including `ProtocolIncompatible` |
+| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access, no init container), import Pod shape (VM's CPU and memory, the import slot and no vm slot, no `vm-name` label, URL digest annotation), block mode, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, an import counted only for the URL it imported (import Pod and legacy init container), pods that use a claim, status derivation for ready, failed, importing, pending import, unschedulable import Pod, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons, the watch trigger backoff |
 
 Kubernetes API behavior is covered by the API server checks and by the E2E
 tests. An envtest-based tier (kube-rs `envtest` crate) would need a Go
@@ -62,7 +66,11 @@ confirm that:
 - a VirtualMachine with two disk sources is rejected
 - a plain-HTTP source without `sha256` is rejected
 - a VirtualMachine name with a dot is rejected (DNS-1123 label rule)
-- `baryon-vm-resource` denies a pod that requests `virtualization.baryon.io/vm`
+- a change of `rootDisk` is rejected and a change of `runPolicy` is
+  accepted
+- `baryon-vm-resource` denies a pod that requests `virtualization.baryon.io/vm`,
+  a pod that requests `virtualization.baryon.io/import`, and a pod whose
+  init container requests `virtualization.baryon.io/vm`
 - a plain pod is admitted
 
 The script works against any cluster: set `KUBECTL` to the kubectl command
@@ -82,6 +90,10 @@ virtualization evidence.
 | `tests/e2e/lib.sh` | shared environment and helpers (`apply_vm`, `wait_for`, `host`, `node_of_pod`, `host_wait`, `host_leftovers`, `summary`); sourced by the scripts below |
 | `tests/e2e/lifecycle.sh` | one VM through create, stop, start, restart, guest reset, and delete |
 | `tests/e2e/delete.sh` | deletion in every phase before Ready |
+| `tests/e2e/multinode.sh` | multi-node cases (see the header of the script); needs `NODE_SHELL` and at least three Baryon nodes |
+| `tests/e2e/storage.sh` | root disk storage for one StorageClass (`STORAGE_CLASS`) and volume mode (`VOLUME_MODE`) |
+| `tests/e2e/skew.sh` | one VM per node under the current version mix; needs `NODE_SHELL` |
+| `tests/e2e/hostile-disk.sh` | a hostile `disk.img` is refused |
 | `tests/e2e/repeat.sh <count> <script> [args...]` | runs a script repeatedly, stops at the first failing run, and writes each run's output to `_output/e2e/<script>-<n>.log` in the current directory |
 
 The scripts are multi-node aware: each host check runs on the node that the
@@ -118,23 +130,39 @@ the reset it checks ping, not SSH: a hard reset shortly after the first boot
 left the Debian guest without SSH host keys, because cloud-init's first-boot
 writes were not yet on disk.
 
-`delete.sh` cases, each checking that the VirtualMachine, the Anchor Pod, and
-the root disk claim are gone:
+`delete.sh` cases, each checking that the VirtualMachine, its Anchor Pod and
+import Pod, and the root disk claim are gone:
 
 | Case | How the phase is reached | Host checks |
 |---|---|---|
-| import | delete while the import init container runs | runtime directory, VMM, DHCP responder, mounts |
+| import | delete while the import Pod runs; before that, check that the import Pod requests `virtualization.baryon.io/import` and not `virtualization.baryon.io/vm`, that no Anchor Pod exists yet, and (with `NODE_SHELL`) that the importer process sees neither /dev/kvm nor the anchor socket | runtime directory, VMM, DHCP responder, mounts |
 | booting | delete after the VMM started, while the Ready reason is `Booting` | runtime directory, VMM, DHCP responder, mounts |
 | pending | delete while the Anchor Pod is unschedulable (a VirtualMachineClass with 1Ti memory) | none (no pod on a node) |
 | stopped | delete a VM with `runPolicy: Stopped` | none (no pod) |
 
-That is 16 checks with `NODE_SHELL` set and 8 without it. `delete.sh` needs
-the VirtualMachineClass `general-small` from `examples/classes.yaml`.
+The number of checks depends on `NODE_SHELL` and on the script version; the
+counts of recorded runs are in [Results](#results). `delete.sh` needs the
+VirtualMachineClass `general-small` from `examples/classes.yaml`.
+
+`storage.sh` checks disk persistence on the guest console: the Debian cloud
+image generates its SSH host keys on the first boot only, so a later boot
+that generates them again ran from a fresh disk. It moves the VM to another
+node (cordon, restart) only when the volume is not bound to a node, and
+starts a second VirtualMachine on the same claim to check `ClaimInUse`.
+
+`hostile-disk.sh` creates a filesystem-mode claim, lets a root pod create a
+block device node as `disk.img` on it (`mknod`, which needs `CAP_MKNOD`),
+and starts a VM on that claim. It expects `StorageFailed` with a message
+that names the wrong disk kind, and (with `NODE_SHELL`) no VMM for the
+Anchor Pod.
 
 ### Environment variables
 
 `lib.sh` reads the following; `lifecycle.sh` also reads `PROBE_IMAGE` and
-`SKIP_NETWORK`.
+`SKIP_NETWORK`; `multinode.sh` and `hostile-disk.sh` read `PROBE_IMAGE`;
+`multinode.sh`, `storage.sh`, `skew.sh`, and `hostile-disk.sh` read
+`STORAGE_CLASS`; `storage.sh` reads `VOLUME_MODE`; `skew.sh` reads
+`EXPECT_MIXED`.
 
 | Variable | Meaning |
 |---|---|
@@ -147,6 +175,9 @@ the VirtualMachineClass `general-small` from `examples/classes.yaml`.
 | `TIMEOUT` | seconds to wait for each transition (default: 300) |
 | `PROBE_IMAGE` | image with `sh`, `nc`, and `ping` for the probe pod (default: `busybox:1.36`) |
 | `SKIP_NETWORK` | `1` skips the SSH, Service, and ping checks and the probe pod |
+| `STORAGE_CLASS` | StorageClass of the root disk claims (default: the cluster's default StorageClass) |
+| `VOLUME_MODE` | `storage.sh` only: `Filesystem` (default) or `Block` |
+| `EXPECT_MIXED` | `skew.sh` only: `1` fails unless the nodes run at least two different baryon-virtd builds |
 
 `NODE_SHELL` is supplied by the user; Baryon ships no node access tool.
 Any mechanism that runs a command as root on the named node works. An
@@ -171,6 +202,10 @@ From the repository root, with Baryon deployed (see
 export KUBECONFIG=<path to the cluster kubeconfig>
 NODE_SHELL=<path to your node-shell command> tests/e2e/lifecycle.sh
 NODE_SHELL=<path to your node-shell command> tests/e2e/delete.sh
+NODE_SHELL=<path to your node-shell command> tests/e2e/multinode.sh
+NODE_SHELL=<path to your node-shell command> STORAGE_CLASS=<class> VOLUME_MODE=Block tests/e2e/storage.sh
+NODE_SHELL=<path to your node-shell command> tests/e2e/hostile-disk.sh
+NODE_SHELL=<path to your node-shell command> EXPECT_MIXED=1 tests/e2e/skew.sh
 ```
 
 To import from a server inside your network instead of the public Debian
@@ -229,6 +264,7 @@ Kairos lifecycle procedures:
 | Kairos A/B upgrade | `kairos-agent upgrade` with a VM running, then reboot (procedure in [kairos-integration.md](kairos-integration.md#manual-ab-upgrade)) | the node boots the new image (`/usr/share/baryon/components.json`), and the VM is Ready again |
 | fresh provisioning | boot a node from an AuroraBoot artifact with a cloud-config that sets the node label and the graceful shutdown drop-in ([hadron.md](hadron.md#node-configuration)) | baryon-virtd and Kubernetes active, the drop-in in place, kubelet holding the shutdown inhibitor, VMs run |
 | log retention | a temporary `/etc/tmpfiles.d/baryon.conf` with a short age, then `systemd-tmpfiles --clean` | stale per-pod log directories removed; the running VM's directory kept |
+| Kairos Operator upgrade of one node | the runbook in [kairos-integration.md](kairos-integration.md#cooperation-with-upgrades): `NodeOpUpgrade` with a per-node `nodeSelector` and concurrency 1, with VMs on the node | the guests shut down cleanly before the reboot; VMs on storage that is not bound to the node start on another node, VMs on node-local storage start again when the node is back |
 
 ## Environments
 
@@ -247,7 +283,13 @@ An environment for the E2E tests and the manual procedures needs:
 - kubelet graceful node shutdown with `shutdownGracePeriod` minus
   `shutdownGracePeriodCriticalPods` of at least 90 s.
 - CSI storage that provides filesystem-mode `ReadWriteOnce` claims, as the
-  default StorageClass or named in `rootDisk.storageClassName`.
+  default StorageClass or named in `rootDisk.storageClassName`; block-mode
+  claims for `storage.sh` with `VOLUME_MODE=Block`; a StorageClass usable
+  from every node for `multinode.sh` and `skew.sh`.
+- For block mode, containerd with `device_ownership_from_security_context =
+  true` ([compatibility.md](compatibility.md#csi-requirements)).
+- For `hostile-disk.sh`, a namespace that admits a pod running as root with
+  the container runtime's default capabilities.
 - Network connectivity: a CNI that meets
   [compatibility.md](compatibility.md#cni-requirements); pods can reach
   `IMAGE_URL` and pull `PROBE_IMAGE`; the machine running the tests can
@@ -259,17 +301,28 @@ All requirements are listed in [compatibility.md](compatibility.md).
 
 | Class | Role | Status |
 |---|---|---|
-| Multi-node cluster of Baryon-enabled Hadron nodes running k0s (three nodes; nested KVM when the nodes are VMs) | the authoritative integration environment | testing in progress; no results yet, so nothing is Tested on it |
+| Multi-node cluster of Baryon-enabled Hadron nodes running k0s (three nodes; nested KVM when the nodes are VMs) | the authoritative integration environment | Tested results below ("k0s cluster") |
 | Single Baryon-enabled Hadron node running k3s | single-node integration evidence | Tested results below; one node, so no cross-node traffic |
 | Single-node k0s API server in a container (CI) | API server checks | runs in CI; not a Baryon host |
 | Development cluster in which a kind node container acted as the host | historical evidence for Linux, containerd, kubelet, and Cloud Hypervisor behavior | no longer used; not a Baryon environment |
 
 ## Results
 
-All recorded results are single-node evidence: each environment had one
-Baryon host. Multi-node results are not available yet. Results come from
-two environments:
+Results come from three environments:
 
+- **k0s cluster** (the integration environment): three VMs with nested KVM
+  (node1, node2, node3) running the Baryon-enabled
+  Hadron image (Hadron v0.5.3, kernel 7.2.6-hadron, Kairos v4.3.0) with k0s
+  v1.36.4+k0s.1: node1 is the controller and also runs workloads, node2 and
+  node3 are workers. containerd from k0s with the Baryon drop-in (systemd
+  cgroups, device ownership; [compatibility.md](compatibility.md#k0s-node-configuration)),
+  graceful node shutdown 150 s and 30 s through a k0s worker profile, the
+  k0s default CNI (kube-router; no network provider set in the k0s
+  configuration), Cloud Hypervisor v53.0. Storage: OpenEBS
+  LVM LocalPV v1.10.1 (`WaitForFirstConsumer`, "lvm-local") and Rook v1.20.8
+  with Ceph v19.2.3 RBD ("ceph-rbd") through the
+  ceph-csi-drivers chart 1.0.4 with `kubeletDirPath` set to the k0s kubelet
+  root.
 - **Hadron single node (k3s)**: one VM with nested KVM running the
   Baryon-enabled Hadron image (Hadron v0.5.3, kernel 7.2.6-hadron, Kairos
   through kairos-init v4.3.0), k3s v1.36.4+k3s1 with its embedded
@@ -284,12 +337,43 @@ two environments:
   traffic to the guest was observed in Experiment B.
 
 Results from the kind host are not results for a Baryon host; they are
-listed because some behavior was observed only there.
+listed because some behavior was observed only there. All runs were on
+2026-10-03.
 
-The recorded E2E runs used earlier versions of the scripts that ran on a
-single node (25 checks in `lifecycle.sh`, with the host leftovers checked
-once for all Anchor Pods of the run). No result of the current, multi-node
-aware version is recorded yet. All runs were on 2026-10-03.
+### k0s cluster
+
+Results are counted as passed checks of the total. The commit names the
+code that ran; "working tree" is the change set that introduced the import
+Pod, the immutable `rootDisk`, the importer hardening, the disk checks in
+baryon-virtd, `ClaimInUse`, and the controller watch backoff.
+
+| What was shown | Code | Kind | Result and notes |
+|---|---|---|---|
+| VM lifecycle with host cleanup checks (lvm-local) | 410aa30; working tree | E2E lifecycle | 33 of 33 on each |
+| Deletion in every phase before Ready | 410aa30; working tree | E2E deletion | 410aa30: 16 of 16; working tree: 19 of 19, with the import case checking that no Anchor Pod exists while importing, that the import Pod requests only the placement slot, and that the importer has neither /dev/kvm nor the anchor socket. An earlier working-tree run failed the pending case because an unschedulable import Pod was not reported as `Unschedulable`; fixed before the 19 of 19 run |
+| Multi-node cases (lvm-local) | 410aa30; working tree | E2E multi-node | 69 of 69 on each |
+| Root disk storage, block mode | c8e6c08 | E2E storage | lvm-local 33 of 33; ceph-rbd 44 of 44, including a move to another node with CSI detach and attach and RBD NodeStage |
+| Root disk storage, filesystem mode | c8e6c08 | E2E storage | ceph-rbd 44 of 44 (with the move); lvm-local 33 of 33 |
+| Root disk storage with the import Pod and `ClaimInUse` (a second VM on the running VM's claim reports `ClaimInUse` and gets no Anchor Pod) | working tree | E2E storage | lvm-local Block 36 of 36; ceph-rbd Block 47 of 47; ceph-rbd Filesystem 47 of 47; lvm-local Filesystem 36 of 36 |
+| A block device node made by a pod as `disk.img` is refused | working tree | E2E hostile disk | 4 of 4 |
+| Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
+| Version skew, 1.1 cluster release (597b637) with mixed hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31; new anchors on 1.0 hosts took the UNIMPLEMENTED path of `Negotiate`; the node agent published `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones |
+| A 1.0 anchor reattached to a 1.1 baryon-virtd after a restart | c8e6c08 and 597b637 | E2E skew | passed |
+| VMs of the 1.0 release through the cluster release upgrade | c8e6c08 to 597b637 | observation | kept running, with `RestartRequired=True` (`AnchorImageChanged`) |
+| Version skew with all hosts on 1.1 | 597b637; working tree | E2E skew | the first run failed: the controller stopped reconciling after the API server restart that came with the control-plane node upgrade (see the controller recovery row); with the watch backoff fix, 30 of 30 |
+| Controller recovery after a control-plane node reboot | 597b637; working tree | observation | before the fix, no VM was reconciled for minutes after every watch failed once with 410 Expired; with the fix, the controller reconciled shortly after the in-cluster API path returned, which itself lagged behind the API server accepting direct requests (cluster networking, not Baryon) |
+| Migration of a filesystem claim from the previous release (marker file, no digest annotation) | working tree | observation | the import Pod found the marker, left the disk untouched (the guest did not regenerate its SSH host keys), and the digest was recorded |
+| Node reboot with a running VM (lvm-local) | 410aa30 | manual | guest shut down cleanly (`reboot: Power down`); the VM came back without intervention on a replacement Anchor Pod on the same node once the node was Ready |
+| Kairos A/B upgrade (`kairos-agent upgrade --source ocifile:...`) of all three nodes with VMs running | 410aa30 | manual | each node booted the new image and the VMs were Ready again; a VM survived the upgrade of the control-plane node |
+| Kairos Operator v0.2.2 `NodeOpUpgrade` on one node (`force`, concurrency 1, upgrade image preloaded in containerd with a fixed tag) | working tree | manual | the drain deleted both Anchor Pods at once; both guests shut down cleanly before the reboot; the VM on ceph-rbd restarted on another node; the VM on lvm-local stayed Pending (`ClaimPending`, `Unschedulable` on the cordoned node) until its node returned and was then Ready; the operator reported the reboot complete and uncordoned the node while it was still NotReady |
+| Kairos Operator reboot (`nsenter -i -m -t 1 -- reboot`) with a VM running, no drain | working tree | manual | kubelet's logind delay inhibitor held; the guest powered off cleanly; the VM came back |
+| Kairos Operator v0.2.2 rolling `NodeOpUpgrade` of all three nodes (`nodeSelector` `virtualization.baryon.io/host=true`, concurrency 1, `force`, image preloaded on every node), one VM on ceph-rbd (node1) and one on lvm-local on each of node2 and node3 | working tree | manual | Completed; every node booted the new image (baryon-virtd hash equal to the image's). Concurrency 1 did not serialize the node outages: the drains of the three nodes started one after another without waiting for the previous node to return, because v0.2.2 counts a reboot as complete before the node is back, which frees the concurrency slot, so the node outages overlapped. Guests shut down cleanly at each drain. The lvm-local VMs came back on their own nodes once those returned. The ceph-rbd VM was down longest: no node was schedulable while all were cordoned or rebooting, and its restart was then delayed until the Ceph CSI attacher, whose controller had restarted with the control-plane node, regained its leader lease after the in-cluster API path returned; until then the volume stayed attached to the old node. Once the attacher led, detach and attach completed and the VM was Ready. All VMs recovered without intervention. VMs whose claims carried an older import record (no digest) got an import Pod after their drain; on filesystem claims the importer found the marker and left the disk unchanged |
+
+### Hadron single node and kind host
+
+These E2E runs used earlier versions of the scripts that ran on a single
+node (25 checks in `lifecycle.sh`, with the host leftovers checked once for
+all Anchor Pods of the run).
 
 | What was shown | Environment | Kind | Result and notes |
 |---|---|---|---|
@@ -315,8 +399,8 @@ aware version is recorded yet. All runs were on 2026-10-03.
 | Log retention with a 1 s override age | Hadron single node (k3s) | manual | stale per-pod log directories removed; the running VM's directory, under baryon-virtd's shared `flock`, kept |
 | Runtime-boundary experiments A, B, and C | kind host | experiment | see [runtime-boundary.md](runtime-boundary.md) |
 
-Not yet covered by any recorded result: multi-node behavior (cross-node
-traffic over flannel or another CNI on Baryon nodes, placement on another
-node, the `IdentityConflict` replacement path), k0s nodes, block-mode
-claims, a CSI driver with NodeStage and attach, and a Kairos Operator
-`NodeOpUpgrade`.
+Not yet covered by any recorded result: the `IdentityConflict` replacement
+path, cross-node traffic over flannel, CSI teardown under SIGKILL, forced
+delete, and baryon-virtd down with a staging driver, `DiskInUse` on a
+cluster, and the boot-ID-based reboot detection of the upstream Kairos
+Operator main branch.

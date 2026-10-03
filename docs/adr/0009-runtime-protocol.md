@@ -63,6 +63,13 @@ disks from the caller's process (ADR 0005, ADR 0006).
   additionally requires peer uid 0, which baryon-node-agent has (without
   capabilities).
 - Schema evolution follows protobuf rules.
+- The disk's container path in the VM spec is a free string on the wire,
+  but baryon-virtd accepts only the two Anchor container disk paths
+  (`/var/lib/baryon/disks/root/disk.img` and `/dev/baryon/root`), each with
+  its kind. The path is therefore a de facto enumeration in the protocol.
+  At the next major protocol version it is to be replaced by a disk slot
+  (an enumerated value that names the Anchor container's disk), so that no
+  path crosses the protocol.
 - Kairos rolling upgrades mix host images in one cluster. Within one
   protocol version, components must tolerate each other's additive changes;
   the supported skew between cluster release and host image is defined in
@@ -94,3 +101,6 @@ disks from the caller's process (ADR 0005, ADR 0006).
   0011) instead of a described derivation.
 - 2026-10-03: protocol versions, features, and negotiation moved to ADR
   0012.
+- 2026-10-03: baryon-virtd accepts only the two Anchor container disk paths
+  with their kinds; the note to replace the path with a disk slot at the
+  next major version was recorded.

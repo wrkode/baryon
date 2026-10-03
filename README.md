@@ -13,38 +13,46 @@ Baryon is early, pre-release software. The API is `v1alpha1` and will change.
 
 ## Status
 
-Status labels follow [docs/architecture.md](docs/architecture.md). Every
-Tested entry is single-node evidence: it was observed on one
-Baryon-enabled Hadron node running k3s ("Hadron, k3s"), and some entries
-also on a historical development cluster in which a kind node container
-acted as the host ("kind host", no longer used). The runs are summarized in
-[docs/testing.md](docs/testing.md#results). The authoritative integration
-environment is a multi-node cluster of Baryon-enabled Hadron nodes running
-k0s; testing on it is in progress and no multi-node result is available yet.
+Status labels follow [docs/architecture.md](docs/architecture.md). Tested
+entries name the environment they were observed on, summarized in
+[docs/testing.md](docs/testing.md#results):
+
+- "k0s cluster": the integration environment, three Baryon-enabled Hadron
+  nodes (node1 to node3, VMs with nested KVM) running k0s, with OpenEBS LVM
+  LocalPV and Ceph RBD storage.
+- "Hadron k3s node": one Baryon-enabled Hadron node running k3s.
+- "kind host": a historical development cluster in which a kind node
+  container acted as the host, no longer used.
 
 | Area | Status |
 |---|---|
-| VirtualMachine, VirtualMachineClass, VirtualizationNode API | Implemented; CRD schema and CEL rules checked against a k0s API server in CI |
-| Controller: Anchor Pods, root disk claims, status, finalizer, stop, start, restart | Tested: lifecycle E2E on Hadron, k3s and on the kind host |
-| Deletion in every phase before Ready (importing, booting, unschedulable, stopped) | Tested: deletion E2E on Hadron, k3s and on the kind host |
-| Host runtime (baryon-virtd): Cloud Hypervisor lifecycle | Tested: lifecycle E2E on Hadron, k3s and on the kind host |
-| Host runtime: recovery after a baryon-virtd restart (baryon-virtd exits 2 s after SIGTERM) | Tested: manual procedure on Hadron, k3s and on the kind host |
-| Host cgroup driver | systemd driver required: baryon-virtd refuses other Anchor container cgroups (Implemented). cgroupfs: Not supported |
-| Guest reset inside a running VMM, disks reopened under Landlock | Tested: lifecycle E2E on Hadron, k3s and on the kind host |
-| VMM confinement: a distinct unprivileged host identity per VM, no capabilities, empty network namespace, seccomp, Landlock, private tmpfs runtime directory | Tested: process values and the tmpfs measured on Hadron, k3s; the lifecycle E2E runs the confined VMM |
+| VirtualMachine, VirtualMachineClass, VirtualizationNode API | Implemented; CRD schema and CEL rules, including the immutable `rootDisk`, checked against a k0s API server in CI |
+| Controller: Anchor Pods, import Pods, root disk claims, status, finalizer, stop, start, restart | Tested: lifecycle E2E on the k0s cluster, the Hadron k3s node, and the kind host |
+| Deletion in every phase before Ready (importing, booting, unschedulable, stopped) | Tested: deletion E2E on the k0s cluster, the Hadron k3s node, and the kind host |
+| Multi-node operation: one VM per node, controller restart, baryon-virtd restart and outage on one node, VMM crash, Anchor Pod replacement behind a Service, cordon, deleting one VM | Tested: multi-node E2E on the k0s cluster |
+| Host runtime (baryon-virtd): Cloud Hypervisor lifecycle | Tested: lifecycle E2E on the k0s cluster, the Hadron k3s node, and the kind host |
+| Host runtime: recovery after a baryon-virtd restart (baryon-virtd exits 2 s after SIGTERM) | Tested: multi-node E2E on the k0s cluster; manual procedure on the Hadron k3s node and the kind host |
+| Host cgroup driver | systemd driver required: baryon-virtd refuses other Anchor container cgroups (Implemented; the refusal was observed on k0s nodes whose containerd used cgroupfs). cgroupfs: Not supported |
+| Guest reset inside a running VMM, disks reopened under Landlock | Tested: lifecycle E2E on the k0s cluster, the Hadron k3s node, and the kind host |
+| VMM confinement: a distinct unprivileged host identity per VM, no capabilities, empty network namespace, seccomp, Landlock, private tmpfs runtime directory | Tested: process values and the tmpfs measured on the Hadron k3s node; the lifecycle E2E runs the confined VMM |
 | Identity conflict between two VMs on one node: refused by baryon-virtd, VM placed on another node | Implemented, unit tests; not exercised on a cluster |
-| DHCP responder as a separate process with the VMM's confinement | Tested on Hadron, k3s and on the kind host |
-| Admission policies (`deploy/base/policy/`): vm resource only for baryon-controller, node agent writes only its own node | Tested: CI API server checks (vm resource denial), Hadron, k3s, kind host |
-| Pod network for VMs (TAP in the pod namespace, guest takes the pod IP) | Tested from another pod by pod IP and through a ClusterIP Service by DNS name: lifecycle E2E on Hadron, k3s (flannel, single node) and on the kind host (kindnet). Cross-node traffic on Baryon nodes: not tested. NetworkPolicy and guest-initiated egress: Inferred, not tested |
-| PVC root disks, HTTP raw image import | Tested: filesystem mode with local-path on Hadron, k3s and on the kind host |
-| Block-mode root disks | Implemented, not tested |
-| Host capability discovery and VirtualizationNode | Implemented; unit tests in CI; the device plugin is exercised by every lifecycle E2E run |
-| Baryon-enabled Hadron image | Tested with k3s: a fresh node provisioned from an AuroraBoot raw EFI disk and a cloud-config. With k0s: Implemented, testing in progress |
-| Per-VM log retention (14 days; a running VM's log directory is kept) | Tested: manual procedure on Hadron, k3s |
-| Node reboot with running VMs | Tested: manual procedure on Hadron, k3s; a clean guest shutdown needs kubelet graceful node shutdown |
-| Kairos A/B upgrade with a running VM (`kairos-agent upgrade`) | Tested: manual procedure on Hadron, k3s |
-| Multi-node clusters (k0s, three Hadron nodes) | Testing in progress; not yet Tested |
-| VM evacuation before upgrades (VirtualizationNode `Evacuating`, `Evacuated`, `UpgradeSafe`) | Designed. A Kairos Operator `NodeOpUpgrade` on a Baryon node is not tested. |
+| DHCP responder as a separate process with the VMM's confinement | Tested on the k0s cluster, the Hadron k3s node, and the kind host |
+| Admission policies (`deploy/base/policy/`): vm and import resources only for baryon-controller, node agent writes only its own node | Tested: CI API server checks (vm resource, import resource, and init container denial); enforced on the Hadron k3s node and the kind host |
+| Pod network for VMs (TAP in the pod namespace, guest takes the pod IP) | Tested from a probe pod to VMs on all three nodes and through a ClusterIP Service by DNS name: multi-node E2E on the k0s cluster (k0s default CNI, kube-router); lifecycle E2E on the Hadron k3s node (flannel) and the kind host (kindnet). NetworkPolicy and guest-initiated egress: Inferred, not tested |
+| PVC root disks, HTTP raw image import (filesystem mode) | Tested: storage E2E with OpenEBS LVM LocalPV and Ceph RBD on the k0s cluster; lifecycle E2E with local-path on the Hadron k3s node and the kind host |
+| Block-mode root disks | Tested: storage E2E with OpenEBS LVM LocalPV and Ceph RBD on the k0s cluster, including a move of a Ceph RBD VM to another node. Requires containerd `device_ownership_from_security_context = true` ([compatibility.md](docs/compatibility.md)) |
+| Image import in a separate import Pod, recorded on the claim before the first Anchor Pod exists | Tested: deletion and storage E2E on the k0s cluster |
+| One running VM per claim (`ClaimInUse` in the controller, `DiskInUse` in baryon-virtd) | `ClaimInUse` Tested by the storage E2E on the k0s cluster; `DiskInUse` Implemented, unit tests |
+| baryon-virtd accepts only the Anchor container's disk paths, kinds, and `/dev` device nodes | Tested: hostile-disk E2E on the k0s cluster |
+| Runtime protocol versions and feature negotiation (ADR 0012) | Tested: version skew E2E on the k0s cluster with mixed protocol 1.0 and 1.1 hosts, under both cluster releases |
+| Controller recovery after an API server restart | Implemented (short watch backoff); observed after a control-plane node reboot on the k0s cluster: reconciliation resumed shortly after the in-cluster API path returned |
+| Host capability discovery and VirtualizationNode | Implemented; unit tests in CI; the device plugins are exercised by every E2E run |
+| Baryon-enabled Hadron image | Tested with k0s (three nodes) and k3s (one node), each provisioned from an AuroraBoot raw EFI disk and a cloud-config |
+| Per-VM log retention (14 days; a running VM's log directory is kept) | Tested: manual procedure on the Hadron k3s node |
+| Node reboot with running VMs | Tested: manual procedure on the k0s cluster and the Hadron k3s node; a clean guest shutdown needs kubelet graceful node shutdown |
+| Kairos A/B upgrade with running VMs (`kairos-agent upgrade`) | Tested: manual procedure on all three nodes of the k0s cluster and on the Hadron k3s node |
+| Kairos Operator `NodeOpUpgrade` (v0.2.2) on nodes with running VMs | Tested on the k0s cluster for one node and for all three nodes: guests shut down cleanly at the drain and every VM came back without intervention. With v0.2.2, concurrency 1 does not keep node outages from overlapping; to upgrade one node at a time, use one `NodeOpUpgrade` per node ([kairos-integration.md](docs/kairos-integration.md#cooperation-with-upgrades)) |
+| VM evacuation (moving running VMs off a node) | Not supported: a drain stops VMs; they start again where their storage allows |
 | VM placement controls (nodeSelector, tolerations, affinity, priority) | Planned |
 | Live migration, snapshots, VFIO, GPU passthrough, SR-IOV, hugepages, NUMA placement | Not supported |
 | Windows guests, confidential computing | Not supported |
@@ -52,7 +60,8 @@ k0s; testing on it is in progress and no multi-node result is available yet.
 ## How it works
 
 ```
-VirtualMachine --> baryon-controller --> Anchor Pod (scheduling, PVC, pod network,
+VirtualMachine --> baryon-controller --> import Pod (imported disks only, runs first)
+                                     --> Anchor Pod (scheduling, PVC, pod network,
                                           resources, virtualization.baryon.io/vm)
                                               |
                                         baryon-anchor --Unix socket--> baryon-virtd (host)
@@ -65,6 +74,9 @@ VirtualMachine --> baryon-controller --> Anchor Pod (scheduling, PVC, pod networ
 - Each running VM has one VM Anchor Pod. Kubernetes schedules it, attaches its
   storage through CSI, and connects it through CNI. Baryon does not schedule,
   provide storage, or provide networking.
+- A VM whose disk is imported over HTTP first gets an import Pod that writes
+  the image into the root disk claim and exits; the Anchor Pod is created
+  after the import is recorded and the import Pod is gone.
 - Cloud Hypervisor runs as a host process started by baryon-virtd, but as
   the VM's own unprivileged host identity (the same as the Anchor
   container's), without capabilities, in its own empty network namespace,

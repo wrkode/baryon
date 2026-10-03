@@ -48,8 +48,8 @@ for VMs, no virtiofsd, and no `tc` binary.
   image build time. The Baryon host layer is the same for all three, but that
   does not make all three supported: a node must meet the compatibility
   contract in [compatibility.md](../compatibility.md), including the kubelet
-  systemd cgroup driver (ADR 0005). Only k3s is tested, on a single node;
-  k0s testing on multiple nodes is in progress.
+  systemd cgroup driver (ADR 0005). k0s is tested on three nodes and k3s
+  on a single node; provider-kubernetes is not tested.
 - The `cloud` Hadron kernel variant lacks VFIO, VHOST_NET, NET_SCHED, and
   Landlock and is not a supported Baryon host.
 - Trusted boot images load the full root filesystem into RAM, so the size of
@@ -70,3 +70,4 @@ for VMs, no virtiofsd, and no `tc` binary.
 - 2026-10-03: the kernel option list was corrected (NET_CLS_U32 and
   NET_ACT_GACT, which the implementation uses); a common host layer was
   qualified as not implying support for every provider.
+- 2026-10-03: the tested providers were updated (k0s on three nodes).

@@ -20,11 +20,12 @@ of each part:
 The runtime boundary between the VM Anchor Pod, baryon-virtd, and Cloud
 Hypervisor was decided by experiment; the evidence is in
 [runtime-boundary.md](runtime-boundary.md). Every Tested label below is
-single-node evidence summarized in [testing.md](testing.md#results), from
-one Baryon-enabled Hadron node running k3s with flannel ("Hadron node") and,
-where named, from a historical development cluster in which a kind node
-container acted as the host ("kind host", no longer used). Multi-node
-testing on Hadron nodes running k0s is in progress.
+summarized in [testing.md](testing.md#results). The environments are the
+"k0s cluster" (three Baryon-enabled Hadron nodes running k0s under nested
+KVM, the integration environment), the "Hadron node" (one Baryon-enabled
+Hadron node running k3s with flannel), and, where named, a historical
+development cluster in which a kind node container acted as the host
+("kind host", no longer used).
 
 ## Scope
 
@@ -77,7 +78,7 @@ depend on AuroraBoot, Kairos Operator, or Cluster API. See
 | Responsibility | Owner | Notes |
 |---|---|---|
 | VM scheduling, placement, priority, taints, affinity | Kubernetes scheduler, through the VM Anchor Pod | Baryon never chooses a node. It only excludes nodes where the VM hit a host identity conflict (`status.identityConflictNodes`, ADR 0011). |
-| Which nodes can run VMs | kubelet, through the `virtualization.baryon.io/vm` device plugin resource | Healthy only while baryon-virtd answers and KVM is usable. |
+| Which nodes can run VMs | kubelet, through the `virtualization.baryon.io/vm` device plugin resource | Healthy only while baryon-virtd answers and KVM is usable. The import Pod requests the placement-only `virtualization.baryon.io/import` resource, which has the same health. |
 | Resource reservation and limits | Kubernetes, through the Anchor container's requests and limits | The VMM runs in the Anchor container's cgroup (ADR 0005). |
 | Volume attach, mount, and lifecycle | Kubernetes and CSI, through the Anchor Pod | Baryon resolves the result inside the pod (ADR 0006). |
 | Pod network | Kubernetes and CNI, through the Anchor Pod network namespace | Baryon attaches a TAP inside that namespace (ADR 0007). |
@@ -88,7 +89,7 @@ depend on AuroraBoot, Kairos Operator, or Cluster API. See
 | Guest execution | Cloud Hypervisor | |
 | Host OS content and upgrades | Hadron image, Kairos | Baryon installs nothing on the host after boot. |
 | Bootable artifacts and provisioning | AuroraBoot | |
-| Kubernetes-driven OS upgrades | Kairos Operator | Evacuation integration is Designed. |
+| Kubernetes-driven OS upgrades | Kairos Operator | Baryon exposes node state (`Ready`, `RuntimeHealthy`, `vmCount`); cooperation is a runbook ([kairos-integration.md](kairos-integration.md#cooperation-with-upgrades)). |
 | Kubernetes machine lifecycle | Cluster API, when used | Optional. |
 
 ## Components
@@ -112,7 +113,8 @@ Two ValidatingAdmissionPolicies in `deploy/base/policy/`, part of the supported
 installation (see [security.md](security.md)):
 
 - `vm-resource.yaml` (`baryon-vm-resource`): only the baryon-controller
-  service account may create pods that request `virtualization.baryon.io/vm`.
+  service account may create pods that request `virtualization.baryon.io/vm`
+  or `virtualization.baryon.io/import`, in any container or init container.
 - `node-agent.yaml` (`baryon-node-agent-own-node`): baryon-node-agent may
   write only the VirtualizationNode of the node named in its pod-bound
   service account token.
@@ -121,7 +123,7 @@ They need Kubernetes 1.30 or later, and 1.32 or later for the node name in
 the token. Deployment is described in
 [development.md](development.md#deploying-to-a-cluster-of-hadron-nodes).
 
-### baryon-controller (Implemented; Tested by the lifecycle and deletion E2E on the Hadron node and the kind host)
+### baryon-controller (Implemented; Tested by the lifecycle and deletion E2E on the k0s cluster, the Hadron node, and the kind host, and by the multi-node and storage E2E on the k0s cluster)
 
 A Deployment in `baryon-system`, one replica, non-root, no capabilities, no
 host access. For each VirtualMachine it:
@@ -129,6 +131,18 @@ host access. For each VirtualMachine it:
 - resolves the VirtualMachineClass
 - creates the root disk claim for imported disks (owned by the VM) or
   references an existing claim
+- for an imported disk that is not recorded as imported yet, creates the
+  import Pod (`<vm>-import`, see below), records the completed import on the
+  claim (annotation `virtualization.baryon.io/imported-from`, a digest of
+  the URL), emits `DiskImported`, and deletes the import Pod. The Anchor Pod
+  is created only when no import is pending and no import Pod object exists,
+  so a VMM never runs while an importer may still write. This exclusion
+  relies on a single controller replica (there is no leader election) and
+  must be revisited before the controller runs highly available.
+- before it creates an import Pod or an Anchor Pod, refuses to start the VM
+  while a Baryon pod of another VM in the namespace mounts the same claim
+  (reason `ClaimInUse`). Two concurrent reconciles can both pass this check;
+  baryon-virtd's `DiskInUse` registry is a second layer on one node.
 - creates the Anchor Pod when `runPolicy` is `Running` and deletes it when
   `Stopped`, on deletion, or on a restart request. It acts on an existing pod
   named `<vm>-anchor` only if this VirtualMachine is its controller owner
@@ -146,6 +160,19 @@ host access. For each VirtualMachine it:
   before the VirtualMachine is removed
 
 The controller never talks to baryon-virtd.
+
+Watch recovery: kube-runtime merges all of a controller's watch streams and
+backs the merged stream off after an error in any one of them; no watch
+makes progress while it waits. After an API server restart every watch
+fails once with 410 Expired, and with kube-runtime's default backoff (800 ms
+growing to 30 s, reset only after 120 s without errors) no VM was
+reconciled for minutes on the k0s cluster. baryon-controller sets its own
+backoff (`TriggerBackoff` in `crates/controller/src/main.rs`): 0.5 s,
+doubling to at most 5 s. After a control-plane node reboot on the k0s
+cluster, the controller reconciled shortly after the in-cluster API path
+returned, which itself lagged behind the API server accepting direct
+requests (cluster networking, not Baryon) (Implemented; manual
+observation).
 
 ### VM Anchor Pod (Implemented)
 
@@ -171,9 +198,10 @@ One pod per running VM, named `<vm>-anchor`, in the VM namespace (ADR 0004):
   "restricted" (admission in a namespace with `enforce=restricted` Tested on
   the kind host)
 
-Its container runs `baryon-anchor run`. An init container,
-`baryon-anchor import`, writes the disk image on first start when the VM
-imports its disk over HTTP. Before attaching, the anchor negotiates the
+Its container runs `baryon-anchor run`. It has no init container; Anchor
+Pods created by the previous release had one for the import, and the
+controller still recognizes them (legacy path, removed one release later,
+ADR 0012). Before attaching, the anchor negotiates the
 runtime protocol with baryon-virtd (ADR 0012): it sends its protocol version
 and the features its VM needs, and ends with the termination message
 `ProtocolIncompatible: ...` or `UnsupportedFeature: ...` when the host
@@ -183,15 +211,43 @@ protocol 1.0. After losing
 baryon-virtd the anchor keeps its last readiness for 30 s
 (`DISCONNECTED_GRACE`) before it reports not ready.
 
+### Import Pod (Implemented; Tested by the deletion and storage E2E on the k0s cluster)
+
+One pod per VM while an HTTP import is pending, named `<vm>-import`, in the
+VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
+
+- runs `baryon-anchor import` as the VM's host identity, with the same
+  restricted pod and container security context, claim volume, and node
+  affinity as the Anchor Pod; `restartPolicy: OnFailure`
+- requests the VM's CPU and memory (requests equal to limits) and one
+  `virtualization.baryon.io/import` slot, so a claim that binds on first
+  use (WaitForFirstConsumer) binds on a node that can run the VM. That
+  resource grants nothing: the importer gets neither /dev/kvm nor the
+  anchor socket
+- labels `virtualization.baryon.io/import-for=<vm uid>` and
+  `app.kubernetes.io/managed-by=baryon`, and no `vm-name` label, so a
+  Service that selects a VM does not select its import Pod
+- annotation `virtualization.baryon.io/import-source`: `sha256:` and the hex
+  SHA-256 of the source URL. Only an import Pod whose digest equals the
+  current URL's counts as a completed import.
+
+If the import Pod cannot be scheduled, the VM reports the pod's
+`PodScheduled` reason (for example `Unschedulable`). The import Pod does
+not hold a `virtualization.baryon.io/vm` slot, so an Anchor Pod for a claim
+bound to one node can stay Pending if that node's capacity was taken
+between the import and the Anchor Pod.
+
 ### baryon-node-agent (Implemented)
 
 A DaemonSet on nodes labelled `virtualization.baryon.io/host=true`, running
 as uid 0 without capabilities. It reads from baryon-virtd's node socket
 (NodeService requires peer uid 0) and:
 
-- serves the kubelet device plugin for `virtualization.baryon.io/vm`
-  (64 slots by default; healthy only when baryon-virtd answers and KVM is
-  usable)
+- serves two kubelet device plugins: `virtualization.baryon.io/vm` (socket
+  `baryon-vm.sock`; 64 slots by default; healthy only when baryon-virtd
+  answers, speaks a compatible protocol, and KVM is usable; grants /dev/kvm
+  and the anchor socket) and `virtualization.baryon.io/import` (socket
+  `baryon-import.sock`; the same slot count and health; grants nothing)
 - writes the VirtualizationNode for its node with a heartbeat
 
 ### baryon-virtd (Implemented; Tested by the lifecycle E2E on the Hadron node and the kind host)
@@ -221,7 +277,11 @@ Hadron image, running as root, not a Kubernetes client (ADR 0005). It:
   process (`baryon-virtd dhcp-responder`, shown as `baryon-dhcp`) with the
   VMM's confinement; baryon-virtd does not parse guest frames itself
   (Tested on the Hadron node and the kind host)
-- resolves the disk inside the pod mount namespace
+- resolves the disk inside the pod mount namespace, accepting only the two
+  Anchor container disk paths with their kind (`/var/lib/baryon/disks/root/disk.img`
+  as a regular file, `/dev/baryon/root` as a block device on the
+  container's `/dev`), and refuses a block device that another VM on the
+  node uses (`DiskInUse`, kept in the runtime record across restarts)
 - starts Cloud Hypervisor as the VM's host identity, without capabilities and with
   an empty bounding set, in a new, empty network namespace, in the Anchor
   container's cgroup, with seccomp and Landlock; the only extra Landlock
@@ -257,15 +317,22 @@ VMM abstraction.
 kubectl apply VirtualMachine
         |
         v
-baryon-controller --> root disk claim (import) + Anchor Pod
+baryon-controller --> root disk claim
+        |
+        v  (http source, import not recorded yet)
+import Pod: scheduled on a node with a free virtualization.baryon.io/import
+            slot, writes the image into the claim, exits
+        |
+        v
+baryon-controller: records the import on the claim, deletes the import Pod,
+                   creates the Anchor Pod once the import Pod is gone
         |
         v
 kube-scheduler: node with a free virtualization.baryon.io/vm slot
         |
         v
 kubelet: CSI mounts the claim, CNI sets up the pod netns,
-         device plugin adds /dev/kvm and the anchor socket mount,
-         init container imports the disk image
+         device plugin adds /dev/kvm and the anchor socket mount
         |
         v
 baryon-anchor --gRPC over Unix socket--> baryon-virtd
@@ -318,7 +385,7 @@ that no longer match.
 
 | From | To | Transport | Purpose |
 |---|---|---|---|
-| baryon-controller | Kubernetes API | HTTPS | VMs, Pods, claims, Events |
+| baryon-controller | Kubernetes API | HTTPS | VMs, Pods (Anchor and import Pods), claims, Events |
 | baryon-node-agent | Kubernetes API | HTTPS | VirtualizationNode |
 | kubelet | baryon-node-agent | gRPC, kubelet device plugin socket | slots, allocation |
 | baryon-anchor | baryon-virtd | gRPC over `/run/baryon/anchor/virtd.sock` (0666; peer checks per connection and per attach) | attach, stop, VM status |
@@ -350,7 +417,7 @@ baryon-virtd -------> baryon-runtime-api, baryon-host, baryon-cloud-hypervisor
 | `baryon-runtime-api` | gRPC protocol, the controller-to-anchor spec, the per-VM host identity (`VmIdentity`), and the guest MAC derivation | no |
 | `baryon-virtd` | host runtime daemon | no |
 | `baryon-anchor` | Anchor Pod process and disk importer | no |
-| `baryon-node-agent` | device plugin and VirtualizationNode publisher | yes |
+| `baryon-node-agent` | device plugins and VirtualizationNode publisher | yes |
 | `baryon-controller` | cluster controller | yes |
 | `baryon-version` | build information | no |
 
@@ -364,6 +431,10 @@ baryon-virtd -------> baryon-runtime-api, baryon-host, baryon-cloud-hypervisor
 - No live migration, snapshots, VFIO, hugepages, NUMA placement, or virtiofs
   (Not supported). Constraints on these are listed in
   [design-notes.md](design-notes.md).
-- No leader election: the controller runs as a single replica.
+- No leader election: the controller runs as a single replica. The
+  exclusion between a VM's import Pod and its Anchor Pod depends on it.
+- The root disk is fixed for the life of a VirtualMachine (`rootDisk` is
+  immutable, including `size`); disk growth needs an explicit flow
+  (Planned).
 - No VM placement controls (nodeSelector, tolerations, affinity, priority)
   in the API; Planned.
