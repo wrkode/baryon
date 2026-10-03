@@ -320,10 +320,19 @@ async fn ensure_claim(
         _ => DiskMode::Filesystem,
     };
     // Import until the claim records a completed import.
-    let imported = claim
-        .annotations()
-        .get(keys::IMPORTED_ANNOTATION)
-        .is_some_and(|u| *u == anchor::source_digest(&http.url));
+    let digest = anchor::source_digest(&http.url);
+    let record = claim.annotations().get(keys::IMPORTED_ANNOTATION).cloned();
+    let imported =
+        record.as_deref() == Some(digest.as_str()) || record.as_deref() == Some(http.url.as_str());
+    // Earlier commits recorded the URL itself; replace it with the digest.
+    // Without this a block device imported by them would be imported again.
+    if record.as_deref() == Some(http.url.as_str()) {
+        let patch = serde_json::json!({
+            "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: digest}}
+        });
+        pvcs.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
+            .await?;
+    }
     Ok(Ok(Disk {
         claim_name: name,
         claim: Some(claim),
