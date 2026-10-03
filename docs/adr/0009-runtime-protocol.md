@@ -29,8 +29,9 @@ disks from the caller's process (ADR 0005, ADR 0006).
     `GetHost`, `WatchVms`). Read-only.
 - Both report `RuntimeInfo` (baryon-virtd version, protocol, Cloud Hypervisor
   version) so clients can detect skew. `AttachRequest` carries the protocol
-  the anchor speaks; baryon-virtd refuses any other than its own with
-  `FAILED_PRECONDITION`, and the anchor ends with `AttachRefused`.
+  package the anchor speaks; baryon-virtd refuses any other than its own
+  with `FAILED_PRECONDITION`. Versions within the package, features, and
+  negotiation are defined in ADR 0012.
 - The per-VM host identity (`VmIdentity` in `crates/runtime-api`, ADR 0011)
   and the guest MAC derivation are part of the protocol: the controller and
   baryon-virtd must compute the same values, so changing either is a
@@ -64,8 +65,8 @@ disks from the caller's process (ADR 0005, ADR 0006).
 - Schema evolution follows protobuf rules.
 - Kairos rolling upgrades mix host images in one cluster. Within one
   protocol version, components must tolerate each other's additive changes;
-  the supported skew between cluster release and host image is not yet
-  written down (Planned in [compatibility.md](../compatibility.md)).
+  the supported skew between cluster release and host image is defined in
+  ADR 0012.
 - `grpcurl` can be used against the sockets for debugging.
 
 ## Alternatives considered
@@ -91,3 +92,5 @@ disks from the caller's process (ADR 0005, ADR 0006).
   derivation as part of the protocol, and the host report versioning rule.
 - 2026-10-03: the host identity is referred to through `VmIdentity` (ADR
   0011) instead of a described derivation.
+- 2026-10-03: protocol versions, features, and negotiation moved to ADR
+  0012.

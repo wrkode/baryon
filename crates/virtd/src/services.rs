@@ -8,11 +8,13 @@ use futures::Stream;
 use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
+use baryon_runtime_api::protocol::{self, Version};
 use baryon_runtime_api::v1alpha1::anchor_service_server::AnchorService;
 use baryon_runtime_api::v1alpha1::node_service_server::NodeService;
 use baryon_runtime_api::v1alpha1::{
-    AttachRequest, GetHostRequest, GetRuntimeInfoRequest, HostInfo, RuntimeInfo, StopRequest,
-    StopResponse, VmList, VmPhase, VmStatus, WatchVmsRequest,
+    AttachRequest, GetHostRequest, GetRuntimeInfoRequest, HostInfo, NegotiateRequest,
+    NegotiateResponse, RuntimeInfo, StopRequest, StopResponse, VmList, VmPhase, VmStatus,
+    WatchVmsRequest,
 };
 
 use crate::peer::{AnchorPeer, PeerInfo};
@@ -64,6 +66,20 @@ pub struct Anchor {
 impl AnchorService for Anchor {
     type AttachStream = StatusStream;
 
+    async fn negotiate(
+        &self,
+        req: Request<NegotiateRequest>,
+    ) -> Result<Response<NegotiateResponse>, Status> {
+        anchor_peer(&req)?;
+        let req = req.into_inner();
+        let theirs = Version::of_peer(req.version.as_ref());
+        tracing::debug!(anchor = %theirs, required = ?req.required_features, "negotiate");
+        Ok(Response::new(NegotiateResponse {
+            version: Some(Version::CURRENT.to_proto()),
+            features: features(),
+        }))
+    }
+
     async fn attach(&self, req: Request<AttachRequest>) -> Result<Response<StatusStream>, Status> {
         let peer = anchor_peer(&req)?;
         let Ok(peer) = peer.as_ref() else {
@@ -77,6 +93,7 @@ impl AnchorService for Anchor {
                 baryon_runtime_api::PROTOCOL
             )));
         }
+        check_attach_protocol(&req)?;
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
@@ -116,6 +133,23 @@ impl AnchorService for Anchor {
             status: Some(status),
         }))
     }
+}
+
+/// Features this baryon-virtd implements, as sent on the wire.
+pub fn features() -> Vec<String> {
+    protocol::FEATURES.iter().map(|&f| f.to_owned()).collect()
+}
+
+/// Refuse an attach from an anchor of another major version or one whose VM
+/// needs a feature this baryon-virtd lacks. A 1.0 anchor sends neither a
+/// version nor features and needs only 1.0 features.
+fn check_attach_protocol(req: &AttachRequest) -> Result<(), Status> {
+    let theirs = Version::of_peer(req.version.as_ref());
+    protocol::check_major(theirs)
+        .and_then(|()| {
+            protocol::check_server(Version::CURRENT, &features(), &req.required_features)
+        })
+        .map_err(|e| Status::failed_precondition(e.to_string()))
 }
 
 /// Stream status updates until the VM has stopped. Dropping the stream (the
@@ -216,5 +250,48 @@ impl NodeService for Node {
             }
         });
         Ok(Response::new(Box::pin(stream)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use baryon_runtime_api::v1alpha1::ProtocolVersion;
+
+    fn attach(version: Option<(u32, u32)>, features: &[&str]) -> AttachRequest {
+        AttachRequest {
+            spec: None,
+            protocol: baryon_runtime_api::PROTOCOL.to_owned(),
+            version: version.map(|(major, minor)| ProtocolVersion { major, minor }),
+            required_features: features.iter().map(|&f| f.to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_1_0_anchor_is_accepted() {
+        assert!(check_attach_protocol(&attach(None, &[])).is_ok());
+    }
+
+    #[test]
+    fn a_newer_minor_anchor_needing_known_features_is_accepted() {
+        let req = attach(Some((1, protocol::MINOR + 3)), protocol::BASE_FEATURES);
+        assert!(check_attach_protocol(&req).is_ok());
+    }
+
+    #[test]
+    fn an_unknown_feature_is_refused_by_name() {
+        let err = check_attach_protocol(&attach(Some((1, 9)), &["disk.block", "disk.future"]))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().starts_with("UnsupportedFeature: "));
+        assert!(err.message().contains("disk.future"));
+        assert!(!err.message().contains("disk.block,"));
+    }
+
+    #[test]
+    fn another_major_is_refused() {
+        let err = check_attach_protocol(&attach(Some((2, 0)), &[])).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().starts_with("ProtocolIncompatible: "));
     }
 }

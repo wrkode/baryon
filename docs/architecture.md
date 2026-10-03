@@ -173,11 +173,13 @@ One pod per running VM, named `<vm>-anchor`, in the VM namespace (ADR 0004):
 
 Its container runs `baryon-anchor run`. An init container,
 `baryon-anchor import`, writes the disk image on first start when the VM
-imports its disk over HTTP. The anchor sends its protocol version
-(`baryon.runtime.v1alpha1`) in the attach request; baryon-virtd refuses any
-other value with `FAILED_PRECONDITION`, and the anchor ends with the
-termination message `AttachRefused: ...`, so a cluster release and a host
-image with different protocols are reported, not misread. After losing
+imports its disk over HTTP. Before attaching, the anchor negotiates the
+runtime protocol with baryon-virtd (ADR 0012): it sends its protocol version
+and the features its VM needs, and ends with the termination message
+`ProtocolIncompatible: ...` or `UnsupportedFeature: ...` when the host
+cannot run the VM, so a cluster release and a host image that do not fit
+are reported, not misread. A baryon-virtd without negotiation is treated as
+protocol 1.0. After losing
 baryon-virtd the anchor keeps its last readiness for 30 s
 (`DISCONNECTED_GRACE`) before it reports not ready.
 

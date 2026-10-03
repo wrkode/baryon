@@ -6,12 +6,20 @@ syntax = "proto3";
 // listens on TCP. Callers of AnchorService are identified by kernel peer
 // credentials of the connection, never by fields in these messages.
 //
-// Compatibility: fields are only added, never renumbered or reused. Clients
-// compare RuntimeInfo.protocol with the package name they were built with.
+// Compatibility (ADR 0012): fields are only added, never renumbered or
+// reused. This package is protocol major version 1; a major version change
+// is a new package. Minor versions add messages, fields, RPCs, and features
+// that peers of the same major version can ignore. A peer that sends no
+// ProtocolVersion speaks 1.0 and supports exactly the 1.0 features.
 package baryon.runtime.v1alpha1;
 
 // Served on /run/baryon/anchor/virtd.sock to baryon-anchor processes.
 service AnchorService {
+  // Negotiate reports the protocol version and features of baryon-virtd so
+  // the anchor can refuse a VM the host cannot run before attaching. Added in
+  // 1.1; a 1.0 baryon-virtd answers UNIMPLEMENTED.
+  rpc Negotiate(NegotiateRequest) returns (NegotiateResponse);
+
   // Attach asks baryon-virtd to run the VM described by spec for the
   // caller's pod and streams its status. If a VM for this pod already exists
   // (for example after the anchor container restarted), the call reattaches
@@ -34,13 +42,36 @@ service NodeService {
   rpc WatchVms(WatchVmsRequest) returns (stream VmList);
 }
 
+// Protocol version within this package's major version.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+message NegotiateRequest {
+  ProtocolVersion version = 1;
+  // Features the anchor's VM needs.
+  repeated string required_features = 2;
+}
+
+message NegotiateResponse {
+  ProtocolVersion version = 1;
+  // Features this baryon-virtd implements.
+  repeated string features = 2;
+}
+
 message AttachRequest {
   VmSpec spec = 1;
-  // Protocol the anchor speaks, "baryon.runtime.v1alpha1". baryon-virtd
-  // refuses any other value with FAILED_PRECONDITION, so a version skew
-  // between the cluster release and the host image is reported instead of
-  // misread.
+  // Protocol package the anchor speaks, "baryon.runtime.v1alpha1".
+  // baryon-virtd refuses any other value with FAILED_PRECONDITION, so a
+  // major version skew between the cluster release and the host image is
+  // reported instead of misread. Every 1.x anchor sends this value.
   string protocol = 2;
+  // Version the anchor speaks; absent from a 1.0 anchor. Added in 1.1.
+  ProtocolVersion version = 3;
+  // Features the VM needs. baryon-virtd refuses the attach with
+  // FAILED_PRECONDITION when it lacks one. Added in 1.1.
+  repeated string required_features = 4;
 }
 
 message VmSpec {
@@ -146,6 +177,10 @@ message RuntimeInfo {
   string hypervisor_version = 5;
   // Component manifest of the host image as JSON, empty if absent.
   string components_json = 6;
+  // Protocol version; absent from a 1.0 baryon-virtd. Added in 1.1.
+  ProtocolVersion version = 7;
+  // Features this baryon-virtd implements. Added in 1.1.
+  repeated string features = 8;
 }
 
 message GetHostRequest {}

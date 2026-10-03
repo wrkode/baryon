@@ -3,7 +3,8 @@
 //!
 //! The node agent is the only writer of VirtualizationNode objects. It also
 //! drives the device plugin's health: the node accepts VMs only while
-//! baryon-virtd answers and KVM is usable.
+//! baryon-virtd answers, speaks a compatible runtime protocol, and KVM is
+//! usable.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,6 +25,7 @@ use baryon_api::node::{
 };
 use baryon_api::{VirtualizationNode, VirtualizationNodeSpec, VirtualizationNodeStatus};
 use baryon_host::HostReport;
+use baryon_runtime_api::protocol;
 use baryon_runtime_api::v1alpha1::node_service_client::NodeServiceClient;
 use baryon_runtime_api::v1alpha1::{GetHostRequest, RuntimeInfo, WatchVmsRequest};
 
@@ -63,11 +65,33 @@ pub(crate) async fn run(
         let obs = observe(&cfg.virtd_socket).await;
         let status_ok = obs.error.is_none();
         let kvm_ok = obs.host.as_ref().is_some_and(|h| h.kvm.usable);
-        health.send_replace(status_ok && kvm_ok);
+        let protocol_ok = obs
+            .runtime
+            .as_ref()
+            .is_some_and(|r| runtime_compatible(r).is_ok());
+        health.send_replace(status_ok && kvm_ok && protocol_ok);
         if let Err(e) = publish(&api, &nodes, &cfg.node_name, &obs).await {
             tracing::warn!(error = %e, "publishing VirtualizationNode failed");
         }
     }
+}
+
+/// Whether this node agent's cluster release can run VMs with the
+/// baryon-virtd that reported `r` (same protocol package and major version).
+/// Features are checked per VM by the anchor.
+fn runtime_compatible(r: &RuntimeInfo) -> Result<(), String> {
+    if r.protocol != baryon_runtime_api::PROTOCOL {
+        return Err(format!(
+            "baryon-virtd speaks runtime protocol {:?}, the cluster release {:?}",
+            r.protocol,
+            baryon_runtime_api::PROTOCOL
+        ));
+    }
+    protocol::check_major(protocol::Version::of_peer(r.version.as_ref())).map_err(|e| {
+        e.to_string()
+            .split_once(": ")
+            .map_or_else(|| e.to_string(), |(_, m)| m.to_owned())
+    })
 }
 
 /// Ask baryon-virtd for the host report, runtime information, and VM count.
@@ -264,18 +288,34 @@ pub(crate) fn build_status(
             s.runtime = obs.runtime.as_ref().map(|r| RuntimeStatus {
                 virtd_version: r.virtd_version.clone(),
                 protocol: r.protocol.clone(),
+                protocol_version: Some(protocol::Version::of_peer(r.version.as_ref()).to_string()),
+                features: protocol::features_of_peer(r.version.as_ref(), &r.features),
                 hypervisor: r.hypervisor.clone(),
                 hypervisor_version: r.hypervisor_version.clone(),
             });
             s.vm_count = obs.vm_count;
 
-            updates.push(ConditionUpdate::new(
-                conditions::node::RUNTIME_HEALTHY,
-                true,
-                "RuntimeReachable",
-                "baryon-virtd answered and host discovery succeeded",
-            ));
-            let (ready, reason, message) = if h.kvm.usable {
+            let compatible = obs.runtime.as_ref().map_or(
+                Err("baryon-virtd sent no runtime information".to_owned()),
+                runtime_compatible,
+            );
+            match &compatible {
+                Ok(()) => updates.push(ConditionUpdate::new(
+                    conditions::node::RUNTIME_HEALTHY,
+                    true,
+                    "RuntimeReachable",
+                    "baryon-virtd answered and host discovery succeeded",
+                )),
+                Err(m) => updates.push(ConditionUpdate::new(
+                    conditions::node::RUNTIME_HEALTHY,
+                    false,
+                    "ProtocolIncompatible",
+                    m.clone(),
+                )),
+            }
+            let (ready, reason, message) = if let Err(m) = compatible {
+                (false, "ProtocolIncompatible", m)
+            } else if h.kvm.usable {
                 (true, "KvmAvailable", "the node can run VMs".to_owned())
             } else {
                 (
@@ -349,6 +389,7 @@ mod tests {
         let obs = Observation {
             host: Some(host),
             runtime: Some(RuntimeInfo {
+                protocol: baryon_runtime_api::PROTOCOL.into(),
                 hypervisor_version: "v53.0".into(),
                 ..Default::default()
             }),
@@ -364,5 +405,78 @@ mod tests {
                 .is_some_and(|c| c.status == "True")
         );
         assert!(s.pci_devices.iter().all(|d| !d.class.starts_with("06")));
+    }
+
+    fn runtime(protocol: &str, version: Option<(u32, u32)>) -> RuntimeInfo {
+        RuntimeInfo {
+            protocol: protocol.into(),
+            version: version.map(
+                |(major, minor)| baryon_runtime_api::v1alpha1::ProtocolVersion { major, minor },
+            ),
+            features: vec!["disk.file".into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn runtime_protocol_compatibility() {
+        let p = baryon_runtime_api::PROTOCOL;
+        // A 1.0 baryon-virtd reports no version.
+        assert!(runtime_compatible(&runtime(p, None)).is_ok());
+        assert!(runtime_compatible(&runtime(p, Some((1, 0)))).is_ok());
+        assert!(runtime_compatible(&runtime(p, Some((1, 42)))).is_ok());
+        assert!(runtime_compatible(&runtime(p, Some((2, 0)))).is_err());
+        assert!(runtime_compatible(&runtime("baryon.runtime.v2", Some((2, 0)))).is_err());
+    }
+
+    #[test]
+    fn an_incompatible_runtime_is_not_ready() {
+        let host = baryon_host::discover(
+            &baryon_host::HostRoot::system(),
+            baryon_host::DiscoveryOptions {
+                kvm_probe: baryon_host::KvmProbe::NodeOnly,
+            },
+        );
+        let obs = Observation {
+            host: Some(host),
+            runtime: Some(runtime(baryon_runtime_api::PROTOCOL, Some((2, 0)))),
+            vm_count: Some(0),
+            error: None,
+        };
+        let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
+        for t in [conditions::node::RUNTIME_HEALTHY, conditions::node::READY] {
+            let c = conditions::find(&s.conditions, t).unwrap();
+            assert_eq!(
+                (c.status.as_str(), c.reason.as_str()),
+                ("False", "ProtocolIncompatible")
+            );
+        }
+        let r = s.runtime.unwrap();
+        assert_eq!(r.protocol_version.as_deref(), Some("2.0"));
+        assert_eq!(r.features, ["disk.file"]);
+    }
+
+    #[test]
+    fn a_1_0_runtime_is_reported_with_base_features() {
+        let host = baryon_host::discover(
+            &baryon_host::HostRoot::system(),
+            baryon_host::DiscoveryOptions {
+                kvm_probe: baryon_host::KvmProbe::NodeOnly,
+            },
+        );
+        let obs = Observation {
+            host: Some(host),
+            runtime: Some(runtime(baryon_runtime_api::PROTOCOL, None)),
+            vm_count: Some(0),
+            error: None,
+        };
+        let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
+        let r = s.runtime.unwrap();
+        assert_eq!(r.protocol_version.as_deref(), Some("1.0"));
+        assert_eq!(r.features, protocol::BASE_FEATURES);
+        assert!(
+            conditions::find(&s.conditions, conditions::node::RUNTIME_HEALTHY)
+                .is_some_and(|c| c.status == "True")
+        );
     }
 }

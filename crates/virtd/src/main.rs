@@ -187,6 +187,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         hypervisor: "cloud-hypervisor".into(),
         hypervisor_version,
         components_json: components.unwrap_or_default(),
+        version: Some(baryon_runtime_api::protocol::Version::CURRENT.to_proto()),
+        features: services::features(),
     };
 
     let shutdown = CancellationToken::new();

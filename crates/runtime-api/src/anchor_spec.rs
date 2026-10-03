@@ -114,6 +114,19 @@ impl AnchorSpec {
             }],
         }
     }
+
+    /// Runtime protocol features the VM needs from baryon-virtd.
+    pub fn required_features(&self) -> Vec<String> {
+        use crate::protocol::feature;
+        let disk = match self.root_disk.mode {
+            DiskMode::Filesystem => feature::FILE_DISK,
+            DiskMode::Block => feature::BLOCK_DISK,
+        };
+        [feature::FIRMWARE_BOOT, disk, feature::POD_NETWORK]
+            .iter()
+            .map(|&f| f.to_owned())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +165,24 @@ mod tests {
             read_only: true,
         };
         assert_eq!(block.container_path(), "/dev/baryon/root");
+
+        assert_eq!(
+            spec.required_features(),
+            ["boot.firmware", "disk.file", "network.pod"]
+        );
+        let block_spec = AnchorSpec {
+            root_disk: block,
+            ..spec
+        };
+        assert!(
+            block_spec
+                .required_features()
+                .contains(&"disk.block".to_owned())
+        );
+        // Every feature an anchor of this build can ask for is one a 1.0
+        // baryon-virtd has, so this build runs on 1.0 hosts.
+        for f in block_spec.required_features() {
+            assert!(crate::protocol::BASE_FEATURES.contains(&f.as_str()));
+        }
     }
 }

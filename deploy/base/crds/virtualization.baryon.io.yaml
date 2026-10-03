@@ -587,11 +587,22 @@ spec:
               runtime:
                 nullable: true
                 properties:
+                  features:
+                    description: Runtime protocol features baryon-virtd implements.
+                    items:
+                      type: string
+                    type: array
                   hypervisor:
                     type: string
                   hypervisorVersion:
                     type: string
                   protocol:
+                    type: string
+                  protocolVersion:
+                    description: |-
+                      Runtime protocol version of baryon-virtd, `<major>.<minor>`; 1.0 for
+                      a baryon-virtd that does not report one.
+                    nullable: true
                     type: string
                   virtdVersion:
                     type: string

@@ -31,3 +31,4 @@ pub const NODE_SOCKET: &str = "/run/baryon/node/virtd.sock";
 
 pub mod anchor_spec;
 pub mod identity;
+pub mod protocol;

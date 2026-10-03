@@ -77,6 +77,13 @@ pub struct VirtualizationNodeStatus {
 pub struct RuntimeStatus {
     pub virtd_version: String,
     pub protocol: String,
+    /// Runtime protocol version of baryon-virtd, `<major>.<minor>`; 1.0 for
+    /// a baryon-virtd that does not report one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    /// Runtime protocol features baryon-virtd implements.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
     pub hypervisor: String,
     pub hypervisor_version: String,
 }

@@ -194,10 +194,10 @@ only by the baryon-node-agent on that node (enforced by the
 
 | Status field | Description |
 |---|---|
-| `conditions` | `Ready` (runtime healthy and KVM usable), `RuntimeHealthy` (baryon-virtd answered). |
+| `conditions` | `Ready` (runtime healthy and KVM usable), `RuntimeHealthy` (baryon-virtd answered and speaks a compatible runtime protocol). Reasons include `RuntimeUnreachable`, `ProtocolIncompatible`, `KvmUnavailable`. |
 | `heartbeatTime` | Last refresh by the node agent (every 30 s by default). |
 | `architecture`, `kernelRelease`, `osImage`, `kairosVersion` | Host identity. |
-| `runtime` | baryon-virtd version, protocol, hypervisor and its version. |
+| `runtime` | baryon-virtd version, protocol package, `protocolVersion` (`<major>.<minor>`, `1.0` for a baryon-virtd that does not report one), `features` (runtime protocol features, ADR 0012), hypervisor and its version. |
 | `cpu` | Model, online CPUs, virtualization extension, nested virtualization. |
 | `memoryBytes`, `hugepages`, `numaNodes` | Memory topology. |
 | `kvm` | Usable, API version, reason when not usable. |

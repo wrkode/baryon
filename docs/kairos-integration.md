@@ -290,7 +290,7 @@ VirtualizationNode Conditions reserved for this:
 | Condition | Meaning | Status |
 |---|---|---|
 | `Ready` | Host runtime healthy and accepting VMs. | Implemented |
-| `RuntimeHealthy` | baryon-virtd reachable and discovery succeeded. | Implemented |
+| `RuntimeHealthy` | baryon-virtd reachable, discovery succeeded, and its runtime protocol major version matches the cluster release (reason `ProtocolIncompatible` otherwise, ADR 0012). | Implemented |
 | `Evacuating` | Baryon is stopping or moving VMs off the node. | Designed |
 | `Evacuated` | No Baryon VMs remain on the node. | Designed |
 | `UpgradeSafe` | Evacuated and no new VMs will be placed. | Designed |
