@@ -274,6 +274,19 @@ spec:
                 description: Claim holding the root disk.
                 nullable: true
                 type: string
+              rootDiskImport:
+                description: |-
+                  Set when the root disk claim held an imported or used disk. It only
+                  prevents another import into the same claim; the record on the
+                  claim's PersistentVolume is the authority (ADR 0006).
+                nullable: true
+                properties:
+                  claimUID:
+                    description: UID of the claim the image was imported into.
+                    type: string
+                required:
+                - claimUID
+                type: object
             type: object
         required:
         - spec

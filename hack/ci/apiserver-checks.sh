@@ -67,7 +67,8 @@ echo "rejected as expected: rootDisk change"
 k patch virtualmachine immutable-disk -n default --type merge -p '{"spec":{"runPolicy":"Running"}}' >/dev/null
 echo "accepted as expected: runPolicy change"
 k delete virtualmachine immutable-disk -n default --wait=false >/dev/null
-cat deploy/base/namespace.yaml deploy/base/policy/*.yaml | k apply -f -
+k apply -f - < deploy/base/namespace.yaml
+for f in deploy/base/policy/*.yaml; do k apply -f - < "$f"; done
 vmpod='apiVersion: v1
 kind: Pod
 metadata: {name: vm-pod, namespace: default}
@@ -104,4 +105,90 @@ out="$(printf '%s\n' "$initpod" | k apply --dry-run=server -f - 2>&1 || true)"
 echo "$out" | grep -q baryon-vm-resource || { echo "init container requesting the vm resource was not denied: $out" >&2; exit 1; }
 echo "init container vm resource pod denied as expected"
 k run plain --image=busybox:1.36 --dry-run=server -o name
+
+# baryon-controller may only add the import record to a PersistentVolume and
+# the import approval to a Baryon pod (policy/controller-writes.yaml).
+k apply -f - < deploy/base/controller/rbac.yaml >/dev/null
+k apply -f - < deploy/base/policy/controller-writes.yaml >/dev/null
+as_ctl=(--as=system:serviceaccount:baryon-system:baryon-controller)
+k apply -f - >/dev/null <<'YAML'
+apiVersion: v1
+kind: PersistentVolume
+metadata: {name: ci-import-pv}
+spec:
+  capacity: {storage: 1Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ci-none
+  hostPath: {path: /tmp/ci-import-pv}
+  claimRef: {namespace: default, name: ci-claim}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: ci-claim, namespace: default}
+spec:
+  storageClassName: ci-none
+  accessModes: [ReadWriteOnce]
+  volumeName: ci-import-pv
+  resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ci-managed
+  namespace: default
+  labels: {app.kubernetes.io/managed-by: baryon}
+spec:
+  containers: [{name: c, image: busybox:1.36}]
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: ci-unmanaged, namespace: default}
+spec:
+  containers: [{name: c, image: busybox:1.36}]
+YAML
+denied() {
+  local what="$1"; shift
+  if out="$(k "$@" 2>&1)"; then echo "allowed but must be denied: $what" >&2; exit 1; fi
+  echo "$out" | grep -q baryon-controller-writes || { echo "denied for another reason: $what: $out" >&2; exit 1; }
+  echo "denied as expected: $what"
+}
+# The policy takes effect after a short delay.
+for i in $(seq 1 30); do
+  out="$(k patch pv ci-import-pv "${as_ctl[@]}" --type merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}' 2>&1 || true)"
+  echo "$out" | grep -q baryon-controller-writes && break
+  sleep 2
+done
+denied "controller changes a PV spec" patch pv ci-import-pv "${as_ctl[@]}" --type merge -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+denied "controller adds another PV annotation" annotate pv ci-import-pv "${as_ctl[@]}" other.example/x=1
+bound() { [ "$(k get pv ci-import-pv -o jsonpath='{.status.phase}')" = Bound ]; }
+for i in $(seq 1 30); do bound && break; sleep 2; done
+bound || { echo "the CI claim did not bind" >&2; exit 1; }
+claimuid="$(k get pvc ci-claim -n default -o jsonpath='{.metadata.uid}')"
+vmuid=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee
+digest="sha256:$(printf '%064d' 0)"
+denied "controller records an import for another claim" annotate pv ci-import-pv "${as_ctl[@]}" "virtualization.baryon.io/disk-import={\"vmUID\":\"$vmuid\",\"claimUID\":\"99999999-2222-4333-8444-555555555555\",\"source\":\"$digest\"}"
+k annotate pv ci-import-pv "${as_ctl[@]}" "virtualization.baryon.io/disk-import={\"vmUID\":\"$vmuid\",\"claimUID\":\"$claimuid\",\"source\":\"$digest\"}" >/dev/null
+echo "allowed as expected: controller adds the import record for the bound claim"
+denied "controller rewrites the import record" annotate pv ci-import-pv "${as_ctl[@]}" --overwrite "virtualization.baryon.io/disk-import={\"vmUID\":\"$vmuid\",\"claimUID\":\"$claimuid\",\"source\":\"sha256:$(printf '%064d' 1)\"}"
+denied "controller removes the import record" annotate pv ci-import-pv "${as_ctl[@]}" virtualization.baryon.io/disk-import-
+k annotate pod ci-managed -n default "${as_ctl[@]}" virtualization.baryon.io/import-approved=claim-uid >/dev/null
+echo "allowed as expected: controller approves an import on a Baryon pod"
+denied "controller relabels a Baryon pod" label pod ci-managed -n default "${as_ctl[@]}" app=x
+denied "controller annotates a pod it does not manage" annotate pod ci-unmanaged -n default "${as_ctl[@]}" virtualization.baryon.io/import-approved=x
+# Nobody but baryon-controller may set or change the import approval.
+denied_by() {
+  local policy="$1" what="$2"; shift 2
+  if out="$(k "$@" 2>&1)"; then echo "allowed but must be denied: $what" >&2; exit 1; fi
+  echo "$out" | grep -q "$policy" || { echo "denied for another reason: $what: $out" >&2; exit 1; }
+  echo "denied as expected: $what"
+}
+denied_by baryon-import-approval "another user changes the import approval" annotate pod ci-managed -n default --overwrite virtualization.baryon.io/import-approved=forged
+denied_by baryon-import-approval "another user removes the import approval" annotate pod ci-managed -n default virtualization.baryon.io/import-approved-
+denied_by baryon-import-approval "another user approves an import" annotate pod ci-unmanaged -n default virtualization.baryon.io/import-approved=forged
+k annotate pod ci-managed -n default --overwrite other.example/x=1 >/dev/null
+echo "allowed as expected: another user changes other annotations of a pod with an approval"
+k delete pod ci-managed ci-unmanaged -n default --wait=false >/dev/null
+k delete pvc ci-claim -n default --wait=false >/dev/null
+k delete pv ci-import-pv --wait=false >/dev/null
 echo "all API server checks passed"

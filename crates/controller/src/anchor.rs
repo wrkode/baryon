@@ -14,10 +14,11 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
-    Affinity, Capabilities, Container, EnvVar, ExecAction, NodeAffinity, NodeSelector,
-    NodeSelectorRequirement, NodeSelectorTerm, PersistentVolumeClaimVolumeSource, Pod,
-    PodSecurityContext, PodSpec, Probe, ResourceRequirements, SeccompProfile, SecurityContext,
-    Volume, VolumeDevice, VolumeMount,
+    Affinity, Capabilities, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvVar,
+    ExecAction, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
+    ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec,
+    Probe, ResourceRequirements, SeccompProfile, SecurityContext, Volume, VolumeDevice,
+    VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -49,6 +50,13 @@ pub(crate) fn source_digest(url: &str) -> String {
     let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
     format!("sha256:{hex}")
 }
+/// Annotation on the import Pod, set by baryon-controller to the claim UID
+/// once the claim is bound to a volume provisioned for it. The importer
+/// reads it through a downward API file and writes nothing before it is
+/// set.
+pub(crate) const IMPORT_APPROVED_ANNOTATION: &str = "virtualization.baryon.io/import-approved";
+/// Where the importer reads the approval.
+const APPROVAL_DIR: &str = "/etc/baryon/import";
 /// Label on the import Pod with the VM's UID.
 pub(crate) const IMPORT_FOR_LABEL: &str = "virtualization.baryon.io/import-for";
 
@@ -66,6 +74,13 @@ pub(crate) struct AnchorInput {
     /// Image import into a new claim: URL, optional SHA-256, disk size.
     /// Used by the import Pod only.
     pub import: Option<(String, Option<String>, u64)>,
+    /// UID of the root disk claim. The import Pod carries it in the
+    /// importer's arguments, so completion is tied to this claim.
+    pub claim_uid: String,
+    /// The claim UID, when the claim is bound to a volume provisioned for
+    /// it, so the import Pod is created already approved. Used by the
+    /// import Pod only.
+    pub import_approval: Option<String>,
     pub anchor_image: String,
     pub restarted_at: Option<String>,
     /// Nodes the Anchor Pod must not be scheduled to (host identity
@@ -152,7 +167,7 @@ pub(crate) enum BuildError {
     Encode(#[from] serde_json::Error),
     #[error("VM identity: {0}")]
     Identity(#[from] baryon_runtime_api::identity::IdentityError),
-    #[error("the VM has no image to import")]
+    #[error("the VM has no image to import, or its claim has no UID")]
     NoImport,
 }
 
@@ -243,10 +258,14 @@ fn vm_pod_spec(
 /// first use (WaitForFirstConsumer) binds on a node that can run the VM.
 pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
     let (url, sha, size) = input.import.as_ref().ok_or(BuildError::NoImport)?;
+    if input.claim_uid.is_empty() {
+        return Err(BuildError::NoImport);
+    }
     let mut args = vec![
         "import".to_owned(),
         format!("--url={url}"),
         format!("--size-bytes={size}"),
+        format!("--claim-uid={}", input.claim_uid),
     ];
     if let Some(s) = sha {
         args.push(format!("--sha256={s}"));
@@ -254,7 +273,14 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
     if input.disk_mode == DiskMode::Block {
         args.push(format!("--device={ROOT_DISK_DEVICE}"));
     }
-    let (mounts, devices) = disk_access(input.disk_mode);
+    args.push(format!("--approval-file={APPROVAL_DIR}/approved"));
+    let (mut mounts, devices) = disk_access(input.disk_mode);
+    mounts.push(VolumeMount {
+        name: "import-approval".to_owned(),
+        mount_path: APPROVAL_DIR.to_owned(),
+        read_only: Some(true),
+        ..Default::default()
+    });
     let importer = Container {
         name: IMPORT_CONTAINER.to_owned(),
         image: Some(input.anchor_image.clone()),
@@ -273,7 +299,29 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
             keys::MANAGED_BY.to_owned(),
         ),
     ]);
-    let annotations = BTreeMap::from([(IMPORT_SOURCE_ANNOTATION.to_owned(), source_digest(url))]);
+    let mut annotations =
+        BTreeMap::from([(IMPORT_SOURCE_ANNOTATION.to_owned(), source_digest(url))]);
+    if let Some(uid) = &input.import_approval {
+        annotations.insert(IMPORT_APPROVED_ANNOTATION.to_owned(), uid.clone());
+    }
+    let mut spec = vm_pod_spec(input, vec![importer], "OnFailure")?;
+    // The approval reaches the importer as a file that kubelet updates when
+    // the annotation changes.
+    spec.volumes.get_or_insert_default().push(Volume {
+        name: "import-approval".to_owned(),
+        downward_api: Some(DownwardAPIVolumeSource {
+            items: Some(vec![DownwardAPIVolumeFile {
+                path: "approved".to_owned(),
+                field_ref: Some(ObjectFieldSelector {
+                    field_path: format!("metadata.annotations['{IMPORT_APPROVED_ANNOTATION}']"),
+                    api_version: None,
+                }),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
     Ok(Pod {
         metadata: ObjectMeta {
             name: Some(resources::import_pod_name(&input.vm_name)),
@@ -283,7 +331,7 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
             owner_references: Some(vec![input.owner.clone()]),
             ..Default::default()
         },
-        spec: Some(vm_pod_spec(input, vec![importer], "OnFailure")?),
+        spec: Some(spec),
         status: None,
     })
 }
@@ -369,6 +417,8 @@ mod tests {
             claim_name: "web-root".into(),
             disk_mode: DiskMode::Filesystem,
             import: import.then(|| ("https://example.org/d.raw".into(), None, 10 << 30)),
+            claim_uid: "claim-1".into(),
+            import_approval: None,
             anchor_image: "baryon/anchor:dev".into(),
             restarted_at: None,
             avoid_nodes: Vec::new(),
@@ -485,7 +535,29 @@ mod tests {
         assert_eq!(spec.restart_policy.as_deref(), Some("OnFailure"));
         assert_eq!(spec.security_context, anchor.security_context);
         assert_eq!(spec.affinity, anchor.affinity);
-        assert_eq!(spec.volumes, anchor.volumes);
+        // The claim volume of the Anchor Pod, plus the approval file.
+        let vols = spec.volumes.as_ref().unwrap();
+        assert_eq!(vols[0], anchor.volumes.as_ref().unwrap()[0]);
+        let approval = vols.iter().find(|v| v.name == "import-approval").unwrap();
+        let file = &approval
+            .downward_api
+            .as_ref()
+            .unwrap()
+            .items
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(
+            file.field_ref.as_ref().unwrap().field_path,
+            format!("metadata.annotations['{IMPORT_APPROVED_ANNOTATION}']")
+        );
+        // Not approved until the controller has checked the bound volume.
+        assert!(
+            !pod.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .contains_key(IMPORT_APPROVED_ANNOTATION)
+        );
         assert_eq!(spec.automount_service_account_token, Some(false));
         let c = &spec.containers[0];
         // The VM's CPU and memory, but the placement-only slot: no /dev/kvm,
@@ -528,7 +600,30 @@ mod tests {
             c.volume_devices.as_ref().unwrap()[0].device_path,
             ROOT_DISK_DEVICE
         );
-        assert!(c.volume_mounts.as_ref().unwrap().is_empty());
+        // Only the approval file is mounted; the disk is a device.
+        let mounts = c.volume_mounts.as_ref().unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "import-approval");
+        assert_eq!(mounts[0].read_only, Some(true));
+        assert!(
+            c.args
+                .as_ref()
+                .unwrap()
+                .contains(&format!("--approval-file={APPROVAL_DIR}/approved"))
+        );
+    }
+
+    #[test]
+    fn an_approved_import_pod_carries_its_approval() {
+        let mut i = input(true);
+        i.import_approval = Some("claim-1".into());
+        let pod = build_import(&i).unwrap();
+        assert_eq!(
+            pod.metadata.annotations.as_ref().unwrap()[IMPORT_APPROVED_ANNOTATION],
+            "claim-1"
+        );
+        // The approval does not change the Anchor Pod.
+        assert_eq!(i.spec_hash(), input(true).spec_hash());
     }
 
     #[test]

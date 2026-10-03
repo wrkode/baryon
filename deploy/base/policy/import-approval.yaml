@@ -1,0 +1,60 @@
+# Only baryon-controller may set or change the import approval annotation
+# virtualization.baryon.io/import-approved on a pod (ADR 0006).
+#
+# The importer in an import Pod writes to the disk only once this annotation
+# equals the claim UID; baryon-controller sets it after it has checked that
+# the claim is bound to a volume provisioned for it. Namespace users can
+# patch pods, so without this policy they could approve an import into a
+# volume the controller would refuse.
+#
+# policy/controller-writes.yaml limits what baryon-controller itself may
+# change on pods and PersistentVolumes.
+#
+# The service account name must match deploy/base/controller/rbac.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-import-approval
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: not-controller
+      expression: "request.userInfo.username != 'system:serviceaccount:baryon-system:baryon-controller'"
+    - name: carries-approval
+      expression: >-
+        (has(object.metadata.annotations) && 'virtualization.baryon.io/import-approved' in object.metadata.annotations) ||
+        (request.operation == 'UPDATE' && has(oldObject.metadata.annotations) &&
+         'virtualization.baryon.io/import-approved' in oldObject.metadata.annotations)
+  variables:
+    - name: key
+      expression: "'virtualization.baryon.io/import-approved'"
+    - name: newValue
+      expression: >-
+        has(object.metadata.annotations) && variables.key in object.metadata.annotations
+          ? object.metadata.annotations[variables.key] : ''
+    - name: oldValue
+      expression: >-
+        request.operation == 'UPDATE' && has(oldObject.metadata.annotations) && variables.key in oldObject.metadata.annotations
+          ? oldObject.metadata.annotations[variables.key] : ''
+  validations:
+    - expression: "request.operation == 'UPDATE' && variables.newValue == variables.oldValue"
+      message: "only baryon-controller may set virtualization.baryon.io/import-approved"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-import-approval
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-import-approval
+  validationActions: [Deny]

@@ -38,11 +38,11 @@ pub mod keys {
     /// Extended resource that only places a pod on a node with a healthy
     /// runtime, without granting anything. The import Pod requests it.
     pub const IMPORT_RESOURCE: &str = "virtualization.baryon.io/import";
-    /// Annotation baryon-controller sets on a root disk claim it created
-    /// once the image import into it completed (value: `sha256:` and the
-    /// hex SHA-256 of the source URL, so the URL is not copied), so later
-    /// Anchor Pods do not import again. Internal state of a Baryon-owned
-    /// object, not an API.
+    /// Annotation on a root disk claim with which earlier releases recorded
+    /// a completed import (`sha256:` digest of the source URL, or the URL).
+    /// Read only to migrate their VMs; the record now lives on the claim's
+    /// PersistentVolume (ADR 0006). Not trusted on its own: namespace users
+    /// can edit claims.
     pub const IMPORTED_ANNOTATION: &str = "virtualization.baryon.io/imported-from";
     /// Finalizer held by baryon-controller on VirtualMachines.
     pub const VM_FINALIZER: &str = "virtualization.baryon.io/anchor-cleanup";

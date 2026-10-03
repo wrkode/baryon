@@ -47,8 +47,15 @@ kubelet:
 The import state reaches the controller through the import Pod
 (`<vm>-import`), also written only by kubelet: its importer container state
 and termination message, and its `PodScheduled` condition while it cannot
-be placed. Anchor Pods of the previous release carry the importer as an
-init container, and its state is read from there.
+be placed. A completed import is recorded on the claim's PersistentVolume,
+not in the VirtualMachine (ADR 0006). The importer init container of Anchor
+Pods of earlier releases is no longer read.
+
+`status.rootDiskImport.claimUID` records that the root disk claim with that
+UID held an imported or used disk. It is a one-way marker written by
+baryon-controller that only prevents another import into the same claim;
+it is reset when the claim is recreated. It is not an API guarantee: the
+PersistentVolume record is the authority (ADR 0006).
 
 The controller derives VirtualMachine Conditions (`Scheduled`,
 `StorageReady`, `Running`, `Ready`, `RestartRequired`) from these and from the
@@ -78,6 +85,14 @@ affinity on `metadata.name`. The list is cleared when the VM is stopped.
 
 Status never contains PIDs, socket paths, TAP names, host paths, or Cloud
 Hypervisor configuration.
+
+Namespace users get access through two ClusterRoles in
+`deploy/base/tenant/roles.yaml`, aggregated into the Kubernetes default
+roles: `baryon-vm-edit` (into `edit` and `admin`: every verb on
+virtualmachines, read on virtualmachineclasses) and `baryon-vm-view` (into
+`view`: read on both). Neither grants `virtualmachines/status`, so
+baryon-controller stays its only writer, and neither grants anything on
+PersistentVolumes.
 
 ## Consequences
 
@@ -121,3 +136,6 @@ Hypervisor configuration.
 - 2026-10-03: `rootDisk` became immutable, including `size`; the import
   state is read from the import Pod instead of an Anchor Pod init container
   (ADR 0004).
+- 2026-10-03: `status.rootDiskImport` (ADR 0006), the tenant roles
+  `baryon-vm-edit` and `baryon-vm-view`, and the removal of the import
+  state read from Anchor Pod init containers of earlier releases.

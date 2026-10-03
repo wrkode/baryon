@@ -1,0 +1,34 @@
+# Access to Baryon objects for namespace users, aggregated into the
+# Kubernetes default roles: edit and admin may manage VirtualMachines, view
+# may read them. VirtualMachineClasses are readable.
+#
+# virtualmachines/status is not granted: baryon-controller is its only
+# writer. Nothing here grants access to PersistentVolumes, where
+# baryon-controller records completed disk imports (ADR 0006).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: baryon-vm-edit
+  labels:
+    app.kubernetes.io/part-of: baryon
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete", "deletecollection"]
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachineclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: baryon-vm-view
+  labels:
+    app.kubernetes.io/part-of: baryon
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachines", "virtualmachineclasses"]
+    verbs: ["get", "list", "watch"]

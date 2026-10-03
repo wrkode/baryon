@@ -19,9 +19,11 @@ in the VM's namespace and owned by the VirtualMachine.
   uniqueness therefore guarantees that at most one Anchor Pod object, and so
   at most one VMM, exists per VM. A replacement is created only after the
   previous pod object is gone. The controller acts only on a pod of that
-  name that it controls (an ownerReference with the VM UID), deletes it with
-  a UID precondition, and otherwise reports `AnchorPodConflict` and leaves
-  the pod alone.
+  name that it controls (an ownerReference with the VM UID) and that
+  requests the `virtualization.baryon.io/vm` resource, which only
+  baryon-controller can give a pod (admission policy `baryon-vm-resource`).
+  It deletes such a pod with a UID precondition. Any other pod of that name
+  is left alone and reported as `AnchorPodConflict`.
 - Every container sets requests equal to limits, so the pod is Guaranteed
   QoS and its cgroup has a memory limit. Memory is
   guest memory plus 128 MiB plus 1/64 of guest memory for the VMM; CPU is the
@@ -50,6 +52,14 @@ in the VM's namespace and owned by the VirtualMachine.
   first use binds there) without /dev/kvm or the anchor socket. Only
   baryon-controller may create pods that request either resource
   (admission policy `baryon-vm-resource`).
+- The import Pod also mounts a downward API file of its own annotation
+  `virtualization.baryon.io/import-approved`. The importer writes nothing
+  until the file equals the claim UID, which baryon-controller sets only
+  after it has checked the claim's bound volume; only baryon-controller may
+  set that annotation (admission policy `baryon-import-approval`, ADR
+  0006). A pod named `<vm>-import` that the VM does not control or that
+  does not request the import resource is never used and blocks the VM
+  (`ImportPodConflict`).
 - Exclusion rule: the Anchor Pod is created only when no import is pending
   for the VM and no import Pod object for it exists; an import Pod that is
   being deleted must be gone first. The exclusion relies on a single
@@ -130,3 +140,9 @@ Baryon never picks a node.
   container (legacy path, ADR 0012). The evacuation consequence was
   corrected after the evacuation design was removed: maintenance stops and
   restarts VMs; migration-based evacuation is Not supported.
+- 2026-10-03: the import Pod waits for an approval annotation that only
+  baryon-controller sets (ADR 0006); a pod named like the import Pod or the
+  Anchor Pod counts only if the VM controls it and it requests the import
+  or vm resource (`ImportPodConflict`, `AnchorPodConflict`). The importer
+  init container of Anchor Pods of earlier releases is no longer read as
+  import evidence.

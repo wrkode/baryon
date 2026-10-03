@@ -1,0 +1,89 @@
+# baryon-controller may change existing PersistentVolumes and pods only in
+# the two ways it needs (ADR 0006):
+#
+# - add the import record annotation virtualization.baryon.io/disk-import
+#   to a PersistentVolume that has none, changing nothing else, for the
+#   claim the volume is bound to (the PV is Bound and the record's
+#   claimUID is its claimRef.uid);
+# - set the approval annotation virtualization.baryon.io/import-approved on
+#   a pod labeled app.kubernetes.io/managed-by=baryon, changing nothing
+#   else.
+#
+# RBAC grants the controller patch on all PersistentVolumes and pods; this
+# policy narrows it, so a compromised controller cannot rebind volumes,
+# change reclaim policies, or relabel workloads.
+#
+# policy/import-approval.yaml is the counterpart for every other user: only
+# baryon-controller may set the approval annotation.
+#
+# The service account name must match deploy/base/controller/rbac.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-controller-writes
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["persistentvolumes", "pods"]
+  matchConditions:
+    - name: is-controller
+      expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-controller'"
+  variables:
+    - name: key
+      expression: >-
+        request.resource.resource == 'persistentvolumes'
+          ? 'virtualization.baryon.io/disk-import'
+          : 'virtualization.baryon.io/import-approved'
+    - name: oldAnn
+      expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
+    - name: newAnn
+      expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: othersUnchanged
+      expression: >-
+        variables.oldAnn.all(k, k == variables.key || (k in variables.newAnn && variables.newAnn[k] == variables.oldAnn[k])) &&
+        variables.newAnn.all(k, k == variables.key || k in variables.oldAnn)
+    - name: metaUnchanged
+      expression: >-
+        (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) &&
+        (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) &&
+        (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])
+  validations:
+    - expression: "object.spec == oldObject.spec && variables.metaUnchanged && variables.othersUnchanged"
+      message: "baryon-controller may change only its import annotation"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'persistentvolumes' ||
+        (!(variables.key in variables.oldAnn) && variables.key in variables.newAnn)
+      message: "baryon-controller may only add an import record to a PersistentVolume that has none"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'persistentvolumes' ||
+        (has(object.status) && has(object.status.phase) && object.status.phase == 'Bound' &&
+         has(object.spec.claimRef) && has(object.spec.claimRef.uid) &&
+         variables.newAnn[variables.key].matches(
+           '^\\{"vmUID":"[0-9a-f-]{36}","claimUID":"' + object.spec.claimRef.uid +
+           '","source":"sha256:[0-9a-f]{64}"\\}$'))
+      message: "the import record must name the claim the PersistentVolume is bound to"
+      reason: Forbidden
+    - expression: >-
+        request.resource.resource != 'pods' ||
+        (has(oldObject.metadata.labels) && 'app.kubernetes.io/managed-by' in oldObject.metadata.labels &&
+         oldObject.metadata.labels['app.kubernetes.io/managed-by'] == 'baryon')
+      message: "baryon-controller may annotate only pods it manages"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-controller-writes
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-controller-writes
+  validationActions: [Deny]

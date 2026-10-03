@@ -28,6 +28,10 @@ pub(crate) struct Observed<'a> {
     pub mac_address: Option<String>,
     /// Nodes to report in `identityConflictNodes`.
     pub identity_conflict_nodes: Vec<String>,
+    /// The disk is not usable and will not be imported: (reason, message).
+    pub storage_blocked: Option<(String, String)>,
+    /// `status.rootDiskImport` to report.
+    pub root_disk_import: Option<baryon_api::vm::RootDiskImportStatus>,
 }
 
 /// Why the running Anchor Pod differs from what the controller would create.
@@ -102,6 +106,7 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
         root_disk_claim: obs.claim_name.clone(),
         mac_address: obs.mac_address.clone(),
         identity_conflict_nodes: obs.identity_conflict_nodes.clone(),
+        root_disk_import: obs.root_disk_import.clone(),
         ..Default::default()
     };
 
@@ -111,29 +116,20 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
         .and_then(|c| c.status.as_ref())
         .and_then(|s| s.phase.as_deref())
         == Some("Bound");
-    // The importer runs in the import Pod; Anchor Pods of earlier releases
-    // ran it as an init container.
-    let import = obs
-        .import_pod
-        .and_then(|p| {
-            container(
-                p.status
-                    .as_ref()
-                    .and_then(|s| s.container_statuses.as_ref()),
-                "import",
-            )
-        })
-        .or_else(|| {
-            obs.pod.and_then(|p| {
-                container(
-                    p.status
-                        .as_ref()
-                        .and_then(|s| s.init_container_statuses.as_ref()),
-                    "import",
-                )
-            })
-        });
-    let storage = if obs.claim.is_none() {
+    // Progress of the importer in the import Pod baryon-controller created.
+    // A completed import is reported once it is recorded (has_import is
+    // then false); an exit code alone never makes the disk ready.
+    let import = obs.import_pod.and_then(|p| {
+        container(
+            p.status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_ref()),
+            "import",
+        )
+    });
+    let storage = if let Some((reason, message)) = &obs.storage_blocked {
+        ConditionUpdate::new(vm::STORAGE_READY, false, reason.clone(), message.clone())
+    } else if obs.claim.is_none() {
         ConditionUpdate::new(
             vm::STORAGE_READY,
             false,
@@ -155,7 +151,12 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
                     .and_then(|s| s.terminated.as_ref())
                     .is_some_and(|t| t.exit_code == 0) =>
             {
-                ConditionUpdate::new(vm::STORAGE_READY, true, "DiskReady", "disk image imported")
+                ConditionUpdate::new(
+                    vm::STORAGE_READY,
+                    false,
+                    "ImportingDisk",
+                    "the importer finished; recording the import",
+                )
             }
             Some(c) => match last_termination(c) {
                 Some((code, msg)) if code != 0 => {
@@ -487,7 +488,7 @@ mod tests {
                 claim: Some(&claim),
                 claim_name: Some("web-root".into()),
                 pod: Some(&p),
-                has_import: true,
+                has_import: false,
                 ..Default::default()
             },
             now(),
@@ -531,7 +532,7 @@ mod tests {
             &Observed {
                 claim: Some(&claim),
                 pod: Some(&p),
-                has_import: true,
+                has_import: false,
                 ..Default::default()
             },
             now(),
@@ -571,7 +572,9 @@ mod tests {
             },
             now(),
         );
-        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ImportingDisk");
+        // An init container of an Anchor-named pod is no evidence of an
+        // import: only the import Pod reports progress.
+        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ImportPending");
 
         let mut stopped = vm();
         stopped.spec.run_policy = RunPolicy::Stopped;
@@ -771,5 +774,33 @@ mod tests {
         assert_eq!(cond(&s, vm::SCHEDULED).reason, "Unschedulable");
         assert_eq!(cond(&s, vm::READY).reason, "Unschedulable");
         assert!(cond(&s, vm::READY).message.contains("Insufficient memory"));
+    }
+
+    #[test]
+    fn an_exited_importer_alone_does_not_make_the_disk_ready() {
+        let claim = bound_claim();
+        let done = import_pod(
+            ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 0,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        let s = derive(
+            &vm(),
+            &Observed {
+                claim: Some(&claim),
+                claim_name: Some("web-root".into()),
+                import_pod: Some(&done),
+                has_import: true,
+                ..Default::default()
+            },
+            now(),
+        );
+        assert_eq!(cond(&s, vm::STORAGE_READY).status, "False");
+        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ImportingDisk");
     }
 }

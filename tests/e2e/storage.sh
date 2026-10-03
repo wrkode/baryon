@@ -110,8 +110,14 @@ if [ -n "$sc" ]; then
 fi
 [ "$(claim_field '{.status.phase}')" = Bound ] && ok "claim is bound" || bad "claim is not bound"
 source_digest="sha256:$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)"
-recorded() { [ "$(claim_field '{.metadata.annotations.virtualization\.baryon\.io/imported-from}')" = "$source_digest" ]; }
-wait_for "completed import recorded on the claim" recorded
+# The completed import is recorded on the bound PersistentVolume.
+recorded() {
+  local pv uid rec
+  pv="$(claim_field '{.spec.volumeName}')"; uid="$(claim_field '{.metadata.uid}')"
+  rec="$(kubectl "${ctx[@]}" get pv "$pv" -o jsonpath='{.metadata.annotations.virtualization\.baryon\.io/disk-import}' 2>/dev/null)"
+  case "$rec" in *"\"claimUID\":\"$uid\""*"\"source\":\"$source_digest\""*) return 0 ;; *) return 1 ;; esac
+}
+wait_for "completed import recorded on the PersistentVolume" recorded
 wait_for "import Pod removed after the import" import_pod_absent
 pv="$(claim_field '{.spec.volumeName}')"
 

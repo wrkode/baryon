@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    ContainerStatus, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    ContainerStatus, PersistentVolume, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
     VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -31,11 +31,12 @@ use kube::runtime::events::{Event, EventType, Recorder};
 use kube::runtime::finalizer::{self, finalizer};
 use kube::{Resource, ResourceExt};
 
-use baryon_api::vm::{RunPolicy, VolumeMode};
+use baryon_api::vm::{RootDiskImportStatus, RunPolicy, VolumeMode};
 use baryon_api::{VirtualMachine, VirtualMachineClass, keys, quantity};
 use baryon_runtime_api::anchor_spec::DiskMode;
 
 use crate::anchor::{self, AnchorInput, SPEC_HASH_ANNOTATION};
+use crate::disk_import;
 use crate::resources;
 use crate::status::{self, Observed};
 
@@ -209,52 +210,73 @@ struct Disk {
     claim: Option<PersistentVolumeClaim>,
     mode: DiskMode,
     import: Option<(String, Option<String>, u64)>,
+    /// The PersistentVolume bound to a claim Baryon created.
+    pv: Option<PersistentVolume>,
+    /// The importer may write: the bound volume was checked to be fresh.
+    approved: bool,
 }
 
+/// The root disk claim and whether its disk must be imported. The second
+/// value is the UID of the claim when it holds an imported or used disk,
+/// for `status.rootDiskImport`, also when the disk is refused.
 async fn ensure_claim(
     ctx: &Context,
     vm: &VirtualMachine,
     ns: &str,
-) -> Result<Result<Disk, (String, String)>, Error> {
+) -> Result<(Result<Disk, (String, String)>, Option<String>), Error> {
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
     let source = &vm.spec.root_disk.source;
     if let Some(existing) = &source.persistent_volume_claim {
         let claim = pvcs.get_opt(&existing.claim_name).await?;
         let Some(claim) = claim else {
-            return Ok(Err((
-                "ClaimNotFound".to_owned(),
-                format!(
-                    "PersistentVolumeClaim {} does not exist",
-                    existing.claim_name
-                ),
-            )));
+            return Ok((
+                Err((
+                    "ClaimNotFound".to_owned(),
+                    format!(
+                        "PersistentVolumeClaim {} does not exist",
+                        existing.claim_name
+                    ),
+                )),
+                None,
+            ));
         };
         let mode = match claim.spec.as_ref().and_then(|s| s.volume_mode.as_deref()) {
             Some("Block") => DiskMode::Block,
             _ => DiskMode::Filesystem,
         };
-        return Ok(Ok(Disk {
-            claim_name: existing.claim_name.clone(),
-            claim: Some(claim),
-            mode,
-            import: None,
-        }));
+        return Ok((
+            Ok(Disk {
+                claim_name: existing.claim_name.clone(),
+                claim: Some(claim),
+                pv: None,
+                mode,
+                import: None,
+                approved: false,
+            }),
+            None,
+        ));
     }
     let Some(http) = &source.http else {
-        return Ok(Err((
-            "InvalidSpec".to_owned(),
-            "rootDisk.source is empty".to_owned(),
-        )));
+        return Ok((
+            Err((
+                "InvalidSpec".to_owned(),
+                "rootDisk.source is empty".to_owned(),
+            )),
+            None,
+        ));
     };
     let Some(size) = vm.spec.root_disk.size.as_ref() else {
-        return Ok(Err((
-            "InvalidSpec".to_owned(),
-            "rootDisk.size is required".to_owned(),
-        )));
+        return Ok((
+            Err((
+                "InvalidSpec".to_owned(),
+                "rootDisk.size is required".to_owned(),
+            )),
+            None,
+        ));
     };
     let size_bytes = match quantity::to_bytes(&size.0) {
         Ok(b) => b,
-        Err(e) => return Ok(Err(("InvalidSpec".to_owned(), e.to_string()))),
+        Err(e) => return Ok((Err(("InvalidSpec".to_owned(), e.to_string())), None)),
     };
     let name = resources::root_claim_name(&vm.name_any());
     let wanted_mode = match vm.spec.root_disk.volume_mode.unwrap_or_default() {
@@ -268,10 +290,13 @@ async fn ensure_claim(
                 .iter()
                 .any(|o| o.uid == vm.meta().uid.clone().unwrap_or_default());
             if !ours {
-                return Ok(Err((
-                    "ClaimConflict".to_owned(),
-                    format!("PersistentVolumeClaim {name} exists and is not owned by this VM"),
-                )));
+                return Ok((
+                    Err((
+                        "ClaimConflict".to_owned(),
+                        format!("PersistentVolumeClaim {name} exists and is not owned by this VM"),
+                    )),
+                    None,
+                ));
             }
             c
         }
@@ -319,26 +344,126 @@ async fn ensure_claim(
         Some("Block") => DiskMode::Block,
         _ => DiskMode::Filesystem,
     };
-    // Import until the claim records a completed import.
     let digest = anchor::source_digest(&http.url);
-    let record = claim.annotations().get(keys::IMPORTED_ANNOTATION).cloned();
-    let imported =
-        record.as_deref() == Some(digest.as_str()) || record.as_deref() == Some(http.url.as_str());
-    // Earlier commits recorded the URL itself; replace it with the digest.
-    // Without this a block device imported by them would be imported again.
-    if record.as_deref() == Some(http.url.as_str()) {
-        let patch = serde_json::json!({
-            "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: digest}}
-        });
-        pvcs.patch(&name, &PatchParams::default(), &Patch::Merge(&patch))
-            .await?;
+    let pv = match claim
+        .spec
+        .as_ref()
+        .and_then(|s| s.volume_name.as_deref())
+        .filter(|_| claim.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Bound"))
+    {
+        Some(pv_name) => {
+            let pvs: Api<PersistentVolume> = Api::all(ctx.client.clone());
+            pvs.get_opt(pv_name).await?
+        }
+        None => None,
+    };
+    let claim_uid = claim.metadata.uid.clone().unwrap_or_default();
+    let imported_before = vm
+        .status
+        .as_ref()
+        .and_then(|s| s.root_disk_import.as_ref())
+        .is_some_and(|i| !claim_uid.is_empty() && i.claim_uid == claim_uid);
+    let was_ready = imported_before || legacy_ready(vm, &claim);
+    let facts = disk_import::Facts {
+        claim: &claim,
+        pv: pv.as_ref(),
+        source: &digest,
+        url: &http.url,
+        legacy_claim_record: claim
+            .annotations()
+            .get(keys::IMPORTED_ANNOTATION)
+            .map(String::as_str),
+        was_ready,
+        block_mode: mode == DiskMode::Block,
+    };
+    // A used disk stays marked as used while the claim is the same object,
+    // also when it is refused.
+    let used = was_ready.then(|| claim_uid.clone());
+    let approved = match disk_import::decide(&facts) {
+        disk_import::Decision::Imported => None,
+        disk_import::Decision::RecordLegacy => {
+            let written = match &pv {
+                Some(pv) => record_import(ctx, pv, vm, &claim, &digest).await?,
+                None => false,
+            };
+            if !written {
+                // Not ready until recorded; look again shortly.
+                return Ok((
+                    Err((
+                        "DiskBindingPending".to_owned(),
+                        "waiting for the claim and its volume to be bound to each other".to_owned(),
+                    )),
+                    used,
+                ));
+            }
+            None
+        }
+        disk_import::Decision::Import { approved } => Some(approved),
+        disk_import::Decision::Refuse(reason, message) => {
+            return Ok((Err((reason, message)), used));
+        }
+    };
+    let imported = approved.is_none().then_some(claim_uid).or(used);
+    Ok((
+        Ok(Disk {
+            claim_name: name,
+            claim: Some(claim),
+            pv,
+            mode,
+            import: approved.map(|_| (http.url.clone(), http.sha256.clone(), size_bytes)),
+            approved: approved.unwrap_or(false),
+        }),
+        imported,
+    ))
+}
+
+/// `status.rootDiskImport`: set once an import into the current claim is
+/// complete and kept while the claim is the same object, so a missing
+/// volume record cannot make that claim look new. A recreated claim (new
+/// UID) starts over.
+fn root_disk_import(
+    vm: &VirtualMachine,
+    imported_claim_uid: Option<String>,
+    claim: Option<&PersistentVolumeClaim>,
+) -> Option<RootDiskImportStatus> {
+    if let Some(uid) = imported_claim_uid.filter(|u| !u.is_empty()) {
+        return Some(RootDiskImportStatus { claim_uid: uid });
     }
-    Ok(Ok(Disk {
-        claim_name: name,
-        claim: Some(claim),
-        mode,
-        import: (!imported).then(|| (http.url.clone(), http.sha256.clone(), size_bytes)),
-    }))
+    let previous = vm.status.as_ref()?.root_disk_import.clone()?;
+    match claim.and_then(|c| c.metadata.uid.as_deref()) {
+        Some(uid) if uid != previous.claim_uid => None,
+        _ => Some(previous),
+    }
+}
+
+/// Record a completed import on the claim's PersistentVolume (ADR 0006).
+async fn record_import(
+    ctx: &Context,
+    pv: &PersistentVolume,
+    vm: &VirtualMachine,
+    claim: &PersistentVolumeClaim,
+    digest: &str,
+) -> Result<bool, Error> {
+    if !disk_import::bound_to(pv, claim) {
+        tracing::warn!(pv = %pv.name_any(), claim = %claim.name_any(), "not recording an import: the volume is not bound to the claim");
+        return Ok(false);
+    }
+    let record = disk_import::ImportRecord {
+        vm_uid: vm.meta().uid.clone().unwrap_or_default(),
+        claim_uid: claim.metadata.uid.clone().unwrap_or_default(),
+        source: digest.to_owned(),
+    };
+    let patch = serde_json::json!({
+        "metadata": {"annotations": {disk_import::RECORD_ANNOTATION: record.to_json()}}
+    });
+    let pvs: Api<PersistentVolume> = Api::all(ctx.client.clone());
+    pvs.patch(
+        &pv.name_any(),
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    )
+    .await?;
+    Ok(true)
 }
 
 async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, Error> {
@@ -352,6 +477,19 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         .get_opt(&import_name)
         .await?
         .filter(|p| owned_by(&p.metadata, &vm_uid));
+    // Only a pod baryon-controller created can request the import resource
+    // (admission policy baryon-vm-resource). Any other pod with the import
+    // Pod's name is left alone, never trusted, and blocks the VM.
+    let import_conflict = import_pod
+        .as_ref()
+        .is_some_and(|p| !requests(p, keys::IMPORT_RESOURCE))
+        || pods
+            .get_opt(&import_name)
+            .await?
+            .is_some_and(|p| !owned_by(&p.metadata, &vm_uid));
+    if import_conflict {
+        import_pod = None;
+    }
 
     let mut obs_blocked = None;
     let mut restart_reason = None;
@@ -360,14 +498,33 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
     let mut has_import = false;
 
     let compute = resolve_class(ctx, vm).await?;
-    let disk = ensure_claim(ctx, vm, ns).await?;
+    let (disk, used_claim_uid) = ensure_claim(ctx, vm, ns).await?;
+    let mut imported_claim_uid = used_claim_uid;
     match (&compute, &disk) {
         (Err(b), _) | (_, Err(b)) => obs_blocked = Some(b.clone()),
         _ => {}
     }
+    if import_conflict && obs_blocked.is_none() {
+        obs_blocked = Some((
+            "ImportPodConflict".to_owned(),
+            format!("pod {import_name} exists and was not created by baryon-controller; delete it"),
+        ));
+    }
+    // A refused import is a storage state: report it on StorageReady too.
+    let storage_blocked = disk
+        .as_ref()
+        .err()
+        .filter(|(reason, _)| disk_import::REFUSALS.contains(&reason.as_str()))
+        .cloned();
     // A pod with the Anchor Pod's name that this VM does not control is left
     // alone and never reported as the VM's.
-    if let Some(p) = pod.as_ref().filter(|p| !owned_by(&p.metadata, &vm_uid)) {
+    // Only a pod baryon-controller created can request the vm resource
+    // (admission policy baryon-vm-resource); any other pod with the Anchor
+    // Pod's name is not the VM's.
+    if let Some(p) = pod
+        .as_ref()
+        .filter(|p| !owned_by(&p.metadata, &vm_uid) || !requests(p, keys::VM_RESOURCE))
+    {
         let message = format!(
             "pod {pod_name} exists and is not controlled by this VirtualMachine; delete or rename it"
         );
@@ -386,6 +543,8 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 .as_ref()
                 .map(|s| s.identity_conflict_nodes.clone())
                 .unwrap_or_default(),
+            storage_blocked: None,
+            root_disk_import: vm.status.as_ref().and_then(|s| s.root_disk_import.clone()),
         };
         write_status(vm, ctx, ns, &observed).await?;
         return Ok(Action::requeue(Duration::from_secs(60)));
@@ -394,30 +553,19 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         claim_name = Some(d.claim_name.clone());
         claim.clone_from(&d.claim);
         has_import = d.import.is_some();
-        // A completed import is recorded on the claim before any Anchor Pod
-        // uses the disk, so no later pod imports again (a raw block volume
-        // has nowhere else to keep that state). Only an import of the
-        // current URL counts. Anchor Pods of earlier releases imported in an
-        // init container.
-        if let Some((url, _, _)) = &d.import {
+        // A completed import is recorded on the claim's PersistentVolume
+        // before any Anchor Pod uses the disk, so no later pod imports again.
+        // Only the import Pod baryon-controller created for this claim and
+        // URL counts (ADR 0006).
+        if let (Some((url, _, _)), Some(c), Some(pv)) = (&d.import, d.claim.as_ref(), d.pv.as_ref())
+        {
+            let claim_uid = c.metadata.uid.as_deref().unwrap_or_default();
             let done = import_pod
                 .as_ref()
-                .is_some_and(|p| import_pod_succeeded(p, url))
-                || pod.as_ref().is_some_and(|p| {
-                    owned_by(&p.metadata, &vm_uid) && legacy_import_succeeded(p, url)
-                });
-            if done {
-                let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
-                let patch = serde_json::json!({
-                    "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: anchor::source_digest(url)}}
-                });
-                pvcs.patch(
-                    &d.claim_name,
-                    &PatchParams::default(),
-                    &Patch::Merge(&patch),
-                )
-                .await?;
+                .is_some_and(|p| import_pod_succeeded(p, url, &d.claim_name, claim_uid));
+            if done && record_import(ctx, pv, vm, c, &anchor::source_digest(url)).await? {
                 has_import = false;
+                imported_claim_uid = c.metadata.uid.clone();
                 event(
                     ctx,
                     vm,
@@ -472,14 +620,36 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
             .ok()
             .and_then(|d| d.import.as_ref())
             .map(|i| anchor::source_digest(&i.0));
+        let current_claim = disk
+            .as_ref()
+            .ok()
+            .and_then(|d| d.claim.as_ref())
+            .and_then(|c| c.metadata.uid.as_deref());
         let stale = !should_run
             || !has_import
             || ip.annotations().get(anchor::IMPORT_SOURCE_ANNOTATION) != wanted.as_ref()
+            || !current_claim.is_some_and(|uid| import_pod_for_claim(ip, uid))
             || ip.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed");
         if stale {
             // The Anchor Pod is created only once this pod is gone, so a
             // VMM never runs while an importer may still write.
             pods.delete(&import_name, &delete_this(ip)).await?;
+        } else if let Ok(d) = &disk
+            && d.approved
+            && let Some(claim_uid) = d.claim.as_ref().and_then(|c| c.metadata.uid.as_deref())
+            && ip
+                .annotations()
+                .get(anchor::IMPORT_APPROVED_ANNOTATION)
+                .map(String::as_str)
+                != Some(claim_uid)
+        {
+            // The claim is bound to a volume provisioned for it: let the
+            // importer write.
+            let patch = serde_json::json!({
+                "metadata": {"annotations": {anchor::IMPORT_APPROVED_ANNOTATION: claim_uid}}
+            });
+            pods.patch(&import_name, &PatchParams::default(), &Patch::Merge(&patch))
+                .await?;
         }
     } else if import_pod.is_some() {
         // Terminating; wait for it to go.
@@ -617,9 +787,19 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         restart_reason,
         mac_address: Some(resources::vm_mac(&vm_uid)),
         identity_conflict_nodes: conflict_nodes,
+        storage_blocked,
+        root_disk_import: root_disk_import(vm, imported_claim_uid, claim.as_ref()),
     };
     write_status(vm, ctx, ns, &observed).await?;
-    Ok(Action::requeue(Duration::from_secs(300)))
+    // The controller does not watch PersistentVolumes: look again soon while
+    // the disk is refused, so a corrected volume is picked up.
+    let requeue = match observed.storage_blocked.as_ref().map(|(r, _)| r.as_str()) {
+        Some("DiskBindingPending") => 30,
+        // Refusals that wait for an administrator.
+        Some(_) => 120,
+        None => 300,
+    };
+    Ok(Action::requeue(Duration::from_secs(requeue)))
 }
 
 /// Derive the status and write it with server-side apply when it changed.
@@ -693,6 +873,15 @@ fn anchor_input(
         claim_name: d.claim_name.clone(),
         disk_mode: d.mode,
         import: d.import.clone(),
+        claim_uid: d
+            .claim
+            .as_ref()
+            .and_then(|c| c.metadata.uid.clone())
+            .unwrap_or_default(),
+        import_approval: d
+            .approved
+            .then(|| d.claim.as_ref().and_then(|c| c.metadata.uid.clone()))
+            .flatten(),
         anchor_image: ctx.anchor_image.clone(),
         restarted_at,
         avoid_nodes: avoid_nodes.to_vec(),
@@ -737,9 +926,28 @@ fn importer_exited_0(statuses: Option<&Vec<ContainerStatus>>) -> bool {
     })
 }
 
-/// Whether the import Pod `pod` imported `url` successfully.
-fn import_pod_succeeded(pod: &Pod, url: &str) -> bool {
-    pod.annotations().get(anchor::IMPORT_SOURCE_ANNOTATION) == Some(&anchor::source_digest(url))
+/// Whether the import Pod `pod` imported `url` into the claim
+/// `claim_name` with UID `claim_uid` successfully.
+///
+/// Only the pod's spec counts, which is immutable and, for a pod that
+/// requests the `virtualization.baryon.io/import` resource, written by
+/// baryon-controller (admission policy baryon-vm-resource): the resource,
+/// the mounted claim, and the URL and claim UID in the importer's
+/// arguments. Annotations, which namespace users can change, do not.
+fn import_pod_succeeded(pod: &Pod, url: &str, claim_name: &str, claim_uid: &str) -> bool {
+    let args_ok = pod.spec.as_ref().is_some_and(|s| {
+        s.containers.iter().any(|c| {
+            c.name == anchor::IMPORT_CONTAINER
+                && c.args.as_ref().is_some_and(|a| {
+                    a.contains(&format!("--url={url}"))
+                        && a.contains(&format!("--claim-uid={claim_uid}"))
+                })
+        })
+    });
+    !claim_uid.is_empty()
+        && requests(pod, keys::IMPORT_RESOURCE)
+        && uses_claim(pod, claim_name)
+        && args_ok
         && importer_exited_0(
             pod.status
                 .as_ref()
@@ -747,26 +955,46 @@ fn import_pod_succeeded(pod: &Pod, url: &str) -> bool {
         )
 }
 
-/// Whether an Anchor Pod of an earlier release imported `url` successfully
-/// in its init container.
-fn legacy_import_succeeded(pod: &Pod, url: &str) -> bool {
-    let arg = format!("--url={url}");
-    let imports_url = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.init_containers.as_ref())
-        .is_some_and(|cs| {
-            cs.iter().any(|c| {
-                c.name == anchor::IMPORT_CONTAINER
-                    && c.args.as_ref().is_some_and(|a| a.contains(&arg))
-            })
-        });
-    imports_url
-        && importer_exited_0(
-            pod.status
+/// Whether the import Pod `pod` imports into the claim with UID `claim_uid`
+/// (its importer's `--claim-uid` argument).
+fn import_pod_for_claim(pod: &Pod, claim_uid: &str) -> bool {
+    let arg = format!("--claim-uid={claim_uid}");
+    pod.spec.as_ref().is_some_and(|s| {
+        s.containers.iter().any(|c| {
+            c.name == anchor::IMPORT_CONTAINER && c.args.as_ref().is_some_and(|a| a.contains(&arg))
+        })
+    })
+}
+
+/// Whether a container of `pod` requests the extended resource `name`.
+fn requests(pod: &Pod, name: &str) -> bool {
+    pod.spec.as_ref().is_some_and(|s| {
+        s.containers.iter().any(|c| {
+            c.resources
                 .as_ref()
-                .and_then(|s| s.init_container_statuses.as_ref()),
-        )
+                .and_then(|r| r.limits.as_ref())
+                .is_some_and(|l| l.contains_key(name))
+        })
+    })
+}
+
+/// Whether the VM's status shows, from an earlier release, a root disk that
+/// became ready after this claim was created: such a disk may have been
+/// used by a guest. A StorageReady=True older than the claim belongs to a
+/// claim that no longer exists.
+fn legacy_ready(vm: &VirtualMachine, claim: &PersistentVolumeClaim) -> bool {
+    let Some(status) = vm.status.as_ref() else {
+        return false;
+    };
+    let same_claim = status.root_disk_claim.as_deref() == claim.metadata.name.as_deref();
+    let ready_since = baryon_api::conditions::find(
+        &status.conditions,
+        baryon_api::conditions::vm::STORAGE_READY,
+    )
+    .filter(|c| c.status == baryon_api::conditions::TRUE)
+    .map(|c| c.last_transition_time.0);
+    let created = claim.metadata.creation_timestamp.as_ref().map(|t| t.0);
+    same_claim && matches!((ready_since, created), (Some(r), Some(c)) if r >= c)
 }
 
 /// Upper bound of `identityConflictNodes`.
@@ -922,51 +1150,115 @@ mod tests {
 
     #[test]
     fn an_import_counts_only_for_the_url_it_imported() {
-        let mut p = Pod {
-            metadata: ObjectMeta {
-                annotations: Some(
-                    [(
-                        anchor::IMPORT_SOURCE_ANNOTATION.to_owned(),
-                        anchor::source_digest("https://a/d.raw"),
-                    )]
-                    .into(),
-                ),
-                ..Default::default()
-            },
-            status: Some(k8s_openapi::api::core::v1::PodStatus {
-                container_statuses: Some(vec![exited(0)]),
-                ..Default::default()
-            }),
-            ..Default::default()
+        use k8s_openapi::api::core::v1::{
+            Container, PersistentVolumeClaimVolumeSource, PodSpec, PodStatus, ResourceRequirements,
+            Volume,
         };
-        assert!(import_pod_succeeded(&p, "https://a/d.raw"));
-        assert!(!import_pod_succeeded(&p, "https://b/d.raw"));
-        p.status = Some(k8s_openapi::api::core::v1::PodStatus {
-            container_statuses: Some(vec![exited(1)]),
-            ..Default::default()
-        });
-        assert!(!import_pod_succeeded(&p, "https://a/d.raw"));
-    }
-
-    #[test]
-    fn legacy_init_container_imports_are_matched_by_url() {
-        let p = Pod {
-            spec: Some(k8s_openapi::api::core::v1::PodSpec {
-                init_containers: Some(vec![k8s_openapi::api::core::v1::Container {
+        use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+        let pod = |slot: &str, claim: &str, url: &str, claim_uid: &str, code: i32| Pod {
+            spec: Some(PodSpec {
+                containers: vec![Container {
                     name: "import".into(),
-                    args: Some(vec!["import".into(), "--url=https://a/d.raw".into()]),
+                    args: Some(vec![
+                        "import".into(),
+                        format!("--url={url}"),
+                        format!("--claim-uid={claim_uid}"),
+                    ]),
+                    resources: Some(ResourceRequirements {
+                        limits: Some([(slot.to_owned(), Quantity("1".into()))].into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }],
+                volumes: Some(vec![Volume {
+                    name: "root-disk".into(),
+                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                        claim_name: claim.into(),
+                        read_only: None,
+                    }),
                     ..Default::default()
                 }]),
                 ..Default::default()
             }),
-            status: Some(k8s_openapi::api::core::v1::PodStatus {
-                init_container_statuses: Some(vec![exited(0)]),
+            status: Some(PodStatus {
+                container_statuses: Some(vec![exited(code)]),
                 ..Default::default()
             }),
             ..Default::default()
         };
-        assert!(legacy_import_succeeded(&p, "https://a/d.raw"));
-        assert!(!legacy_import_succeeded(&p, "https://b/d.raw"));
+        let a = "https://a/d.raw";
+        let ok = |p: &Pod| import_pod_succeeded(p, a, "web-root", "claim-1");
+        assert!(ok(&pod(keys::IMPORT_RESOURCE, "web-root", a, "claim-1", 0)));
+        // another URL, a failed importer, another claim UID, another claim
+        assert!(!ok(&pod(
+            keys::IMPORT_RESOURCE,
+            "web-root",
+            "https://b/d.raw",
+            "claim-1",
+            0
+        )));
+        assert!(!ok(&pod(
+            keys::IMPORT_RESOURCE,
+            "web-root",
+            a,
+            "claim-1",
+            1
+        )));
+        assert!(!ok(&pod(
+            keys::IMPORT_RESOURCE,
+            "web-root",
+            a,
+            "claim-0",
+            0
+        )));
+        assert!(!ok(&pod(keys::IMPORT_RESOURCE, "db-root", a, "claim-1", 0)));
+        // a pod without the controller-only import slot (made by someone else)
+        assert!(!ok(&pod("cpu", "web-root", a, "claim-1", 0)));
+        // annotations play no part: an otherwise identical pod is the same
+        let mut annotated = pod(keys::IMPORT_RESOURCE, "web-root", a, "claim-1", 0);
+        annotated.metadata.annotations = Some(
+            [(
+                anchor::IMPORT_APPROVED_ANNOTATION.to_owned(),
+                "claim-9".to_owned(),
+            )]
+            .into(),
+        );
+        assert!(ok(&annotated));
+        assert!(requests(&annotated, keys::IMPORT_RESOURCE));
+        assert!(!requests(&annotated, keys::VM_RESOURCE));
+    }
+
+    #[test]
+    fn legacy_readiness_counts_only_for_the_current_claim() {
+        let vm = |claim: &str, ready_at: i64| -> VirtualMachine {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "virtualization.baryon.io/v1alpha1",
+                "kind": "VirtualMachine",
+                "metadata": {"name": "web", "namespace": "default", "uid": "vm-1"},
+                "spec": {"className": "small", "rootDisk": {"size": "4Gi", "source": {"http": {"url": "https://a/d.raw"}}}},
+                "status": {
+                    "rootDiskClaim": claim,
+                    "conditions": [{"type": "StorageReady", "status": "True", "reason": "DiskReady", "message": "",
+                        "lastTransitionTime": k8s_openapi::jiff::Timestamp::from_second(ready_at).unwrap().to_string()}]
+                }
+            }))
+            .unwrap()
+        };
+        let claim = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some("web-root".into()),
+                creation_timestamp: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                    k8s_openapi::jiff::Timestamp::from_second(100).unwrap(),
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(legacy_ready(&vm("web-root", 150), &claim));
+        // ready before this claim existed: it was another claim
+        assert!(!legacy_ready(&vm("web-root", 50), &claim));
+        // status about another claim
+        assert!(!legacy_ready(&vm("db-root", 150), &claim));
     }
 
     #[test]
@@ -990,5 +1282,71 @@ mod tests {
         assert!(uses_claim(&pod("web-root"), "web-root"));
         assert!(!uses_claim(&pod("db-root"), "web-root"));
         assert!(!uses_claim(&Pod::default(), "web-root"));
+    }
+
+    #[test]
+    fn the_import_status_is_kept_for_the_same_claim_only() {
+        let vm = |imported: Option<&str>| -> VirtualMachine {
+            let mut v = serde_json::json!({
+                "apiVersion": "virtualization.baryon.io/v1alpha1",
+                "kind": "VirtualMachine",
+                "metadata": {"name": "web", "namespace": "default", "uid": "vm-1"},
+                "spec": {"className": "small", "rootDisk": {"size": "4Gi", "source": {"http": {"url": "https://a/d.raw"}}}}
+            });
+            if let Some(uid) = imported {
+                v["status"] = serde_json::json!({"rootDiskImport": {"claimUID": uid}});
+            }
+            serde_json::from_value(v).unwrap()
+        };
+        let claim = |uid: &str| PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                uid: Some(uid.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let uid = |r: Option<RootDiskImportStatus>| r.map(|r| r.claim_uid);
+        // A completed import sets it.
+        assert_eq!(
+            uid(root_disk_import(
+                &vm(None),
+                Some("c1".into()),
+                Some(&claim("c1"))
+            )),
+            Some("c1".into())
+        );
+        // Kept while the claim is the same object, also when nothing else
+        // proves the import.
+        assert_eq!(
+            uid(root_disk_import(&vm(Some("c1")), None, Some(&claim("c1")))),
+            Some("c1".into())
+        );
+        assert_eq!(
+            uid(root_disk_import(&vm(Some("c1")), None, None)),
+            Some("c1".into())
+        );
+        // A recreated claim starts over.
+        assert_eq!(
+            uid(root_disk_import(&vm(Some("c1")), None, Some(&claim("c2")))),
+            None
+        );
+    }
+
+    #[test]
+    fn an_import_pod_for_another_claim_is_stale() {
+        let p = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                containers: vec![k8s_openapi::api::core::v1::Container {
+                    name: "import".into(),
+                    args: Some(vec!["import".into(), "--claim-uid=claim-1".into()]),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(import_pod_for_claim(&p, "claim-1"));
+        assert!(!import_pod_for_claim(&p, "claim-2"));
+        assert!(!import_pod_for_claim(&Pod::default(), "claim-1"));
     }
 }

@@ -77,7 +77,7 @@ identities.
 |---|---|---|---|
 | Kubernetes 1.32 or later for a supported installation | The admission policies below. | [security.md](security.md) | Verified on 1.34 (kind host) and 1.36 (k3s, Hadron node) |
 | Kubernetes 1.29 or later for the CRDs | CRD validation rules (`x-kubernetes-validations`, GA in 1.29). Client types are generated for 1.36 (k8s-openapi `latest`) and only stable fields are used. | ADR 0008 | Verified on 1.34 (kind host), 1.36 (k3s v1.36.4+k3s1, Hadron node), and 1.36 (k0s v1.36.4+k0s.1 API server in CI) |
-| Kubernetes 1.30 or later for the admission policies, 1.32 or later for `baryon-node-agent-own-node` | ValidatingAdmissionPolicy (`admissionregistration.k8s.io/v1`, GA in 1.30); the node name in pod-bound service account tokens (`authentication.kubernetes.io/node-name`). [security.md](security.md) makes the policies part of the supported installation. | ADR 0009, [security.md](security.md) | Verified on 1.34 (kind host), 1.36 (k3s, Hadron node), and 1.36 (k0s API server in CI, `baryon-vm-resource` denial only) |
+| Kubernetes 1.30 or later for the admission policies, 1.32 or later for `baryon-node-agent-own-node` | ValidatingAdmissionPolicy (`admissionregistration.k8s.io/v1`, GA in 1.30); the node name in pod-bound service account tokens (`authentication.kubernetes.io/node-name`). [security.md](security.md) makes the policies part of the supported installation. | ADR 0009, [security.md](security.md) | Verified on 1.34 (kind host) and 1.36 (k3s, Hadron node) for `baryon-vm-resource` and `baryon-node-agent-own-node`; on 1.36 (k0s API server in CI) for the `baryon-vm-resource` denials and every allow and deny case of `baryon-controller-writes` and `baryon-import-approval` |
 | kubelet with one cgroup per pod (`cgroupsPerQOS`, default) | Pod identity from cgroup paths. | ADR 0005 | Verified (systemd driver: kind host, Hadron node) |
 | kubelet cgroup driver systemd | See Host requirements; cgroupfs is Not supported. baryon-virtd still parses both path forms to identify the pod. | ADR 0005 | Verified (kind host, Hadron node) |
 | containerd as the CRI runtime, with runc | Stopping the container (its systemd scope) must kill every process in the container cgroup. Block mode: the runtime must create granted device nodes on the container's `/dev` tmpfs. | ADR 0005, ADR 0006 | Verified with containerd 2.1 (kind host), the containerd embedded in k3s v1.36.4+k3s1 (Hadron node), and the containerd shipped with k0s v1.36.4+k0s.1 (k0s cluster), all with runc and the systemd driver. CRI-O and crun: Open |
@@ -156,6 +156,9 @@ backend is Open. Other CNIs are not tested.
 | Block-mode claims: device node accessible to the VM's host identity | The VMM reopens the device as that identity; kubelet does not apply `fsGroup` to raw block devices, so access is governed by the device ownership the container runtime sets for the pod (ADR 0011). | Verified with containerd `device_ownership_from_security_context = true` (OpenEBS LVM LocalPV, Ceph RBD; k0s cluster) |
 | Drivers with NodeStage and attach | Teardown ordering under real detach. | Verified for stop, move to another node, and deletion with Ceph RBD (k0s cluster). SIGKILL, forced delete, and baryon-virtd down: Open |
 | One running VM per claim | Baryon refuses a second VM on a claim (`ClaimInUse`). `ReadWriteMany` block claims shared across nodes are Not supported. | Verified for `ClaimInUse` (storage E2E, k0s cluster) |
+| Dynamic provisioners set `pv.kubernetes.io/provisioned-by` on the PersistentVolumes they create | Without an import record, Baryon imports only into a volume dynamically provisioned for its claim (ADR 0006); a volume without the annotation is refused (`DiskNotProvisionedForClaim`). | Verified with OpenEBS LVM LocalPV and Ceph RBD block volumes (import integrity E2E, k0s cluster). Other drivers: Inferred from upstream code (sig-storage-lib-external-provisioner, used by the CSI external-provisioner, sets it to the StorageClass provisioner in `controller/controller.go`); a provisioner that does not use it must set the annotation itself |
+| Storage tooling preserves PersistentVolume annotations | The import record `virtualization.baryon.io/disk-import` lives on the PersistentVolume. Backup, restore, or migration tooling that drops it makes a used block claim refuse to start (`ImportStateUnknown`) while the VM status still marks the claim as used; if the status is lost too, a volume that looks fresh can be imported again. | Open (no backup or restore tool tested) |
+| Thin-provisioned block storage: room for the full size of every imported volume, newly provisioned blocks zeroed | A block import zeroes or writes the whole device; dm-thin has no write-zeroes support, so an import allocates the whole volume. | Inferred from the kernel's dm-thin target; not tested |
 
 ## Guest requirements
 
@@ -199,15 +202,38 @@ Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
 - The node agent published `protocolVersion` 1.0 for old hosts and 1.1 with
   features for new ones.
 
-Import records across releases: the published release a73f37f imports
-only into filesystem-mode claims and records the import with the marker
-file. Claims from it get an import Pod once, which finds the marker, leaves
-the disk unchanged, and records the digest (observed on the k0s cluster for
-filesystem claims without a digest record, also during the rolling Kairos
-Operator upgrade). Commits c8e6c08 to 597b637, published together with
-this change, recorded the source URL itself in the `imported-from`
-annotation, for filesystem-mode and block-mode claims. baryon-controller
-accepts an annotation equal to the current URL as a completed import and
-rewrites it to the `sha256:` digest (`ensure_claim` in
-`crates/controller/src/reconcile.rs`), so such a claim, including a block
-device, is not imported again.
+Import records across releases: since this change, the authoritative
+record of a completed import is the annotation
+`virtualization.baryon.io/disk-import` on the bound PersistentVolume (ADR
+0006). Earlier releases recorded imports differently, and baryon-controller
+migrates them:
+
+- The published release a73f37f imports only into filesystem-mode claims
+  and records the import with the marker file. Such a claim gets an import
+  Pod once if its volume passes the freshness check; the importer finds the
+  marker, leaves the disk unchanged, and the record is written on the
+  volume (observed on the k0s cluster before this change, also during the
+  rolling Kairos Operator upgrade, when the record was still a claim
+  annotation). A volume that does not pass the check is refused
+  (`DiskNotProvisionedForClaim`); adopt it with
+  `rootDisk.source.persistentVolumeClaim`.
+- Commits c8e6c08 to 1835c0c recorded the import in the claim annotation
+  `virtualization.baryon.io/imported-from`, as the URL or as `sha256:` and
+  the hex SHA-256 of the URL, for filesystem-mode and block-mode claims.
+  baryon-controller no longer writes it. When a VirtualMachine has no
+  record on its volume, the claim annotation equals the current source
+  digest or URL, and the status written by the earlier controller shows
+  StorageReady=True for the same claim name with a transition no earlier
+  than the claim's creation, baryon-controller writes the PersistentVolume
+  record and treats the disk as imported (`DiskBindingPending` until claim
+  and volume are bound to each other). Such a claim, including a block
+  device, is not imported again.
+- A block-mode VirtualMachine of an earlier release whose status shows a
+  ready disk but whose claim annotation does not match is refused
+  (`ImportStateUnknown`), never imported again.
+- Upgrading requires the new RBAC (PersistentVolume `get` and `patch`, pod
+  `patch`) and the policies `baryon-controller-writes` and
+  `baryon-import-approval`; `kubectl apply --server-side -k deploy/base`
+  installs them. A VirtualMachine's status must be kept for the migration:
+  a VirtualMachine of an earlier release restored without status has no
+  evidence of its import.

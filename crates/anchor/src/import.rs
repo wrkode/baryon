@@ -51,6 +51,37 @@ pub(crate) enum Target<'a> {
     Device(&'a Path),
 }
 
+/// How long the importer waits for its approval before it fails and the
+/// pod restarts it.
+const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Wait until `file` holds the approval: the claim UID `expected`, or any
+/// value when none is expected. Nothing is written to the disk before.
+pub(crate) async fn wait_for_approval(file: &Path, expected: Option<&str>) -> anyhow::Result<()> {
+    let start = std::time::Instant::now();
+    let mut logged = false;
+    loop {
+        match std::fs::read_to_string(file) {
+            Ok(v) if !v.trim().is_empty() && expected.is_none_or(|e| v.trim() == e) => {
+                tracing::info!("import approved");
+                return Ok(());
+            }
+            Ok(_) | Err(_) if start.elapsed() >= APPROVAL_TIMEOUT => {
+                bail!(
+                    "the import was not approved within {} s",
+                    APPROVAL_TIMEOUT.as_secs()
+                );
+            }
+            _ => {}
+        }
+        if !logged {
+            tracing::info!("waiting for baryon-controller to approve the import");
+            logged = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
 pub(crate) async fn import(
     url: &str,
     sha256: Option<&str>,
@@ -879,6 +910,31 @@ mod tests {
             assert_eq!(&out[..image.len()], &image[..], "size {size}");
             assert!(out[image.len()..].iter().all(|b| *b == 0), "size {size}");
         }
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_non_empty_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("approved");
+        std::fs::write(&f, "").unwrap();
+        let waiter = tokio::spawn({
+            let f = f.clone();
+            async move { wait_for_approval(&f, Some("claim-uid")).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(!waiter.is_finished(), "an empty approval must not proceed");
+        std::fs::write(&f, "another-claim").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(
+            !waiter.is_finished(),
+            "an approval for another claim must not proceed"
+        );
+        std::fs::write(&f, "claim-uid").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

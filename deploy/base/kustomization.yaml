@@ -1,5 +1,5 @@
-# Baryon cluster components: CRDs, namespace, node agent, controller, and
-# admission policies. Apply with `kubectl apply --server-side -k deploy/base/`.
+# Baryon cluster components: CRDs, namespace, node agent, controller,
+# admission policies, and the namespace user roles. Apply with `kubectl apply --server-side -k deploy/base/`.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
@@ -11,3 +11,6 @@ resources:
   - controller/deployment.yaml
   - policy/vm-resource.yaml
   - policy/node-agent.yaml
+  - policy/controller-writes.yaml
+  - policy/import-approval.yaml
+  - tenant/roles.yaml

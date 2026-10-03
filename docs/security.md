@@ -17,7 +17,9 @@ maintained with the implementation. Each claim carries a status:
 Last full review: 2026-10-03 (baryon-security review of the privileged host
 implementation and the runtime-boundary experiments), followed on the same
 day by a review of block-mode storage, the image import, and the disk
-handoff. Findings and their resolution are listed in
+handoff, and by a review of import integrity (where the import record
+lives, what counts as a completed import, and who can approve one).
+Findings and their resolution are listed in
 [Review findings](#review-findings).
 
 ## Trust boundaries
@@ -91,8 +93,9 @@ gid changes, packet sockets, the VMM tmpfs mounts) is future hardening.
 | Change the pod interface MAC, add tc filters | baryon-virtd | netlink, in the pod network namespace | Implemented, Tested |
 | Answer guest DHCP | the DHCP responder (`baryon-virtd dhcp-responder`, shown as `baryon-dhcp`), with the same confinement as Cloud Hypervisor but without the kvm group | baryon-virtd opens a packet socket bound to the TAP in the pod network namespace and hands it to the responder; it never parses guest DHCP itself | Implemented, Tested |
 | Open PVC data | Cloud Hypervisor, as the VM's identity | baryon-virtd resolves the disk with `openat2(RESOLVE_IN_ROOT, RESOLVE_NO_MAGICLINKS)` under the anchor's `/proc/<pid>/root`, accepts only `/var/lib/baryon/disks/root/disk.img` as a regular file and `/dev/baryon/root` as a block device node on the container's `/dev` mount (`UnknownPath`, `KindMismatch`, `DeviceOutsideDev`, all reported as `StorageFailed`), refuses a block device another VM on the node uses (`DiskInUse`), and passes an `O_PATH` fd; the VMM reopens it through `/proc/self/fd/<n>` with its own credentials. For a block device the kernel's permission check at that reopen, and the Anchor container's device cgroup, which the VMM shares, decide access; baryon-virtd's `check_device_access` (`BlockDeviceAccessDenied`) only reports a likely failure early | Implemented, Tested (filesystem mode: Hadron node, kind host, k0s cluster; block mode: k0s cluster; refusal of a pod-made device node: hostile-disk E2E) |
-| Import an image | the import Pod (`baryon-anchor import`), as the VM's identity, in the pod network namespace | writes the claim before the first Anchor Pod exists; requests the placement-only `virtualization.baryon.io/import` resource and receives neither /dev/kvm nor the anchor socket | Implemented, Tested (deletion E2E checks the importer's view on the k0s cluster) |
-| Record a completed import | baryon-controller | patches the claim annotation `virtualization.baryon.io/imported-from` (`sha256:` and the hex SHA-256 of the URL) after the import Pod whose `import-source` digest matches the current URL exited 0, then deletes the import Pod; the Anchor Pod is created only once the import Pod is gone | Implemented, Tested (storage E2E) |
+| Import an image | the import Pod (`baryon-anchor import`), as the VM's identity, in the pod network namespace | writes the claim before the first Anchor Pod exists, and only after its approval file equals the claim UID; requests the placement-only `virtualization.baryon.io/import` resource and receives neither /dev/kvm nor the anchor socket | Implemented, Tested (deletion E2E checks the importer's view; import integrity E2E; k0s cluster) |
+| Approve an import | baryon-controller | sets the annotation `virtualization.baryon.io/import-approved` on the import Pod to the claim UID, at creation or once the claim is bound, after checking that the bound volume was dynamically provisioned for the claim (ADR 0006); the importer reads it through a downward API file. Only baryon-controller may set, change, or remove it (`baryon-import-approval`) | Implemented, Tested (CI API server checks; import integrity E2E on the k0s cluster) |
+| Record a completed import | baryon-controller | adds the annotation `virtualization.baryon.io/disk-import` (`{"vmUID","claimUID","source"}`, `source` is `sha256:` and the hex SHA-256 of the URL) to the bound PersistentVolume, only when claim and volume are bound to each other and the import Pod's spec (import resource, mounted claim, `--url=` and `--claim-uid=` arguments) shows an importer that exited 0; then deletes the import Pod. The Anchor Pod is created only once the import Pod is gone. `baryon-controller-writes` limits the write to adding the record once | Implemented, Tested (storage and import integrity E2E, k0s cluster) |
 | Place the VMM in a cgroup | baryon-virtd | writes the child into the Anchor container's `cgroup.procs` before `execve`; refuses a container cgroup that is not a systemd scope (`CgroupDriverUnsupported`), as the first step of a start, because only stopping the scope guarantees the VMM is gone before volume teardown | Implemented, Tested (placement); the refusal is Implemented with unit tests for scope detection and was not exercised on a cgroupfs node |
 | Keep a running VM's logs from retention | baryon-virtd | holds a shared `flock` on the VM's log directory under `/var/log/baryon/vms/`, which `systemd-tmpfiles` skips; released at cleanup, taken again for re-adopted VMs | Implemented, Tested on the Hadron node (retention with a locked directory) |
 | Supervise and stop the VMM | baryon-virtd | pidfd, `pidfd_send_signal`, Cloud Hypervisor API; recovery from a runtime record after a restart | Implemented, Tested |
@@ -108,6 +111,7 @@ gid changes, packet sockets, the VMM tmpfs mounts) is future hardening.
 | Anchor container | `/dev/kvm` | read-write, injected by the device plugin | the VMM shares the container's device cgroup |
 | Anchor container | `/dev/baryon/root` (block mode) | read-write device node created by the container runtime on the container's `/dev` tmpfs, from the claim's `volumeDevices` | the VM's root disk; baryon-virtd accepts a block disk only there |
 | import Pod container | the claim at `/var/lib/baryon/disks/root` or `/dev/baryon/root` | read-write | writes the imported image; no /dev/kvm, no anchor socket |
+| import Pod container | `/etc/baryon/import/approved` (downward API volume) | read-only | the import approval, the pod's own `virtualization.baryon.io/import-approved` annotation |
 | baryon-controller | none | | |
 
 Block-mode disks require containerd `device_ownership_from_security_context =
@@ -146,28 +150,43 @@ own VM, because a different spec for the same pod is refused.
 
 | Subject | Rights | Notes |
 |---|---|---|
-| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; pods: get, list, watch, create, delete; persistentvolumeclaims: get, list, watch, create, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. Claim `patch` records the import digest; it also lets a compromised controller change any claim's metadata and request volume expansion. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. A controller without claim `patch` fails closed: the import is not recorded and no Anchor Pod is created. |
+| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and to setting the import approval on Baryon pods; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
+| `baryon-vm-edit` (ClusterRole, aggregated into `edit` and `admin`) | virtualmachines: get, list, watch, create, update, patch, delete, deletecollection; virtualmachineclasses: get, list, watch | For namespace users (`deploy/base/tenant/roles.yaml`). No `virtualmachines/status`: baryon-controller is its only writer. Nothing on PersistentVolumes. |
+| `baryon-vm-view` (ClusterRole, aggregated into `view`) | virtualmachines, virtualmachineclasses: get, list, watch | Read access for namespace users. |
 | baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Narrowed per node by admission, below. |
 
 ### Admission policies
 
-`deploy/base/policy/` holds two ValidatingAdmissionPolicies. They need
+`deploy/base/policy/` holds four ValidatingAdmissionPolicies. They need
 Kubernetes 1.30 or later, and 1.32 or later for the node name in service
-account identities. Both are Implemented and Tested on the kind host
-(Kubernetes 1.34) and the Hadron node (k3s 1.36); the CI API server checks
-(k0s 1.36) confirm the `baryon-vm-resource` denial for a pod that requests
-the vm resource, a pod that requests the import resource, and an init
-container that requests the vm resource.
+account identities. `baryon-vm-resource` and `baryon-node-agent-own-node`
+are Implemented and Tested on the kind host (Kubernetes 1.34) and the
+Hadron node (k3s 1.36); the CI API server checks (k0s 1.36) confirm the
+`baryon-vm-resource` denial for a pod that requests the vm resource, a pod
+that requests the import resource, and an init container that requests the
+vm resource. `baryon-controller-writes` and `baryon-import-approval` are
+Implemented and Tested by the CI API server checks, which run every allow
+and deny case below by impersonation, and by the import integrity E2E on
+the k0s cluster, which runs with both installed and checks that a namespace
+user cannot set an import approval (see [testing.md](testing.md#results)).
 
 | Policy | Rule |
 |---|---|
 | `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. |
 | `baryon-node-agent-own-node` | baryon-node-agent may create or update only the VirtualizationNode named after the node in its token (`userInfo.extra["authentication.kubernetes.io/node-name"]`). Requests without that information are denied. |
+| `baryon-controller-writes` | Updates of PersistentVolumes and pods by baryon-controller. A PersistentVolume may only gain the annotation `virtualization.baryon.io/disk-import` when it has none, with spec, labels, finalizers, owner references, and every other annotation unchanged; the volume must be Bound, and the record must have the form `{"vmUID":"<uuid>","claimUID":"<claimRef.uid>","source":"sha256:<64 hex>"}` with the volume's own `claimRef.uid`. A pod update may only change `virtualization.baryon.io/import-approved`, with everything else unchanged, and only on pods labeled `app.kubernetes.io/managed-by=baryon`. CI checks: a PV spec change, another PV annotation, a record for another claim, rewriting and removing the record, relabeling a Baryon pod, and annotating an unmanaged pod are denied; adding the record for the bound claim and approving a Baryon pod are allowed. |
+| `baryon-import-approval` | Nobody but baryon-controller may set, change, or remove the annotation `virtualization.baryon.io/import-approved` on any pod, at creation or by update. Namespace users can patch pods, so without this policy they could approve an import into a volume the controller would refuse. CI checks: another user changing, removing, or setting the approval is denied; another user changing other annotations of a pod with an approval is allowed. |
 
-Without these policies, any pod admitted through the API server could
-request the vm resource, receive /dev/kvm and the anchor socket, and ask
-baryon-virtd to start a VM in its own pod, running as the identity of the
-VM UID it names. The policies are part of the supported installation.
+The policies are part of the supported installation. Without them:
+
+- `baryon-vm-resource`: any pod admitted through the API server could
+  request the vm resource, receive /dev/kvm and the anchor socket, and ask
+  baryon-virtd to start a VM in its own pod, running as the identity of the
+  VM UID it names.
+- `baryon-import-approval`: a namespace user could approve an import into
+  a volume baryon-controller would refuse.
+- `baryon-controller-writes`: baryon-controller's PersistentVolume and pod
+  `patch` rights are unrestricted.
 
 They are an API server control. They do not constrain static pods, which
 the kubelet runs from a manifest directory on the node without admission
@@ -303,28 +322,68 @@ What it does not give:
   `app.kubernetes.io/managed-by=baryon` (policies that select VMs by
   `vm-name` do not select the import Pod). Imported images are mode 0600,
   owned by the VM's identity.
-- Source URL exposure: annotations and Events carry only a digest of the
-  URL (`sha256:<hex>`). The URL itself remains in the VirtualMachine spec,
+- Source URL exposure: annotations (the import Pod's `import-source`, the
+  PersistentVolume record) and Events carry only a digest of the URL
+  (`sha256:<hex>`). The URL itself remains in the VirtualMachine spec,
   in the import Pod's arguments, and in the filesystem-mode import marker
   on the volume. URLs must not carry secrets.
-- Block import: the importer opens the device with `O_EXCL` and
-  `O_NOFOLLOW`, refuses anything but a block device, checks the size limit
-  before each write, zeroes the first 1 MiB of the device before the
-  download, and writes the image's first 1 MiB only after the size and
-  SHA-256 checks pass, so a failed import leaves no partition table or boot
-  loader at the start of the device. The image tail and a backup GPT at the
-  end of the device are not cleared by a failed import. Zero runs and the
-  rest of the device are zeroed with `FALLOC_FL_PUNCH_HOLE`, else
-  `FALLOC_FL_ZERO_RANGE`, else written zeros (only on `EOPNOTSUPP`);
-  unaligned edges are written as zeros. On a device without write-zeroes
-  support the kernel writes zeros and allocates the whole device on a thin
-  backend. See [storage.md](storage.md#block-import).
-- Import record trust: the claim annotation `imported-from` and the import
-  Pod's `import-source` annotation are trusted as written. Anyone who can
-  update claims or create pods in the namespace can set or remove them.
-  Removing the claim annotation while a VM runs makes the next replacement
-  of the Anchor Pod import again, which overwrites a block device;
-  filesystem-mode claims are protected by the marker file.
+- Block import contract: after a successful import every byte of the
+  device is the image's byte at that offset or zero. The importer opens the
+  device with `O_EXCL` and `O_NOFOLLOW`, refuses anything but a block
+  device, and refuses a device whose logical block size (`BLKSSZGET`) does
+  not divide 4096. Before the download it zeroes the first and the last
+  1 MiB of the device and flushes them; image data in those two regions is
+  held in memory and written only after the size and SHA-256 checks pass,
+  so a failed import leaves no partition table, boot loader, or backup GPT
+  at either end. Every zero run of the image and everything after the
+  image are zeroed explicitly: with `FALLOC_FL_PUNCH_HOLE` (block layer
+  write-zeroes that may deallocate and must read back zero), else
+  `FALLOC_FL_ZERO_RANGE` (the kernel falls back to writing zeros), else
+  written zeros; only `EOPNOTSUPP` moves to the next method. Unaligned
+  edges are written as zeros. `BLKDISCARD` is not used, because discard
+  gives no guarantee that the range reads back zero. The download must have
+  the length of `Content-Length` when the server sends one; without a
+  digest, a response without `Content-Length` is refused, for file and
+  block imports, so a truncated download is not taken for a complete
+  image. See [storage.md](storage.md#block-import).
+- Thin storage: every block import zeroes or writes the whole device. dm-thin
+  has no write-zeroes support, so on a thin pool an import allocates the
+  whole volume. A thin pool must have room for the full size of every
+  volume imported into it and must zero newly provisioned blocks
+  (Documented residual).
+- Stale data from the backend: a new volume may hold an earlier user's data.
+  The block import contract leaves none of it on an imported block device
+  (checked by the import integrity E2E with a full-device scan); a
+  filesystem-mode import writes a new sparse `disk.img`. A claim adopted
+  with `rootDisk.source.persistentVolumeClaim` is used as is: Baryon
+  neither imports into it nor clears it.
+- Import record: the completed import is recorded in the annotation
+  `virtualization.baryon.io/disk-import` on the bound PersistentVolume
+  (ADR 0006), which namespace users cannot write. Completion is judged from
+  the import Pod's spec and its importer's exit code, the import approval
+  is set only by baryon-controller (`baryon-import-approval`), and without
+  a record an import runs only into a volume dynamically provisioned for
+  the claim. Claim metadata and pod annotations, which namespace users can
+  change, cannot cause an import: the claim annotation of earlier releases
+  counts only together with a StorageReady=True that baryon-controller
+  wrote, and then only to record an import, never to start one. The tenant
+  roles do not grant `virtualmachines/status`. A disk with an image source
+  is reported ready (StorageReady=True) only once its record exists; an
+  importer's exit code alone never makes it ready. For VirtualMachines
+  created by earlier releases, StorageReady=True written by the earlier
+  controller is trusted once, to migrate the record to the volume.
+  `status.rootDiskImport` is a second, one-way marker that keeps a used
+  block claim from being imported again when its record is lost
+  (`ImportStateUnknown`). Accepted residual, with cluster administrators
+  trusted: if both the status and the record are lost (for example a
+  restore without status and an administrator removing the record), a
+  fresh-looking volume can be imported again.
+- Restores: snapshot restores and clones carry a data source and are
+  refused for a VirtualMachine with an `http` source
+  (`DiskNotProvisionedForClaim`). Restore a VM disk by referencing the
+  restored claim with `rootDisk.source.persistentVolumeClaim`. A
+  VirtualMachine with an `http` source on a restored volume that has no
+  record, and that otherwise looks fresh, can import over it.
 - Runtime records (`/run/baryon/vms/<pod-uid>/record.json`, tmpfs, mode 0600):
   the VM spec, VMM pid and start time, uid, cgroup paths, and guest MAC. No
   secrets. A record is trusted after a restart only if the process start time
@@ -412,19 +471,19 @@ and the disk handoff:
 
 | Finding | Severity | State |
 |---|---|---|
-| A block device was imported again over the guest's data when the import record was missing | High | Partially fixed: the import runs in a separate import Pod and is recorded before the first Anchor Pod exists; `rootDisk` is immutable; a controller without claim `patch` fails closed. Still open: removing the `imported-from` annotation makes the next Anchor Pod replacement import again (see [Data handling](#data-handling)) |
-| The import record could name a URL the pod did not import | Medium | Fixed: only an import Pod whose `import-source` digest equals the current URL's counts; legacy Anchor Pods count only if their `--url=` argument equals the URL |
+| A block device was imported again over the guest's data when the import record was missing | High | Fixed: the record is on the PersistentVolume, an import needs an approval that only baryon-controller sets, and completion is judged from the import Pod's spec (import integrity review below) |
+| The import record could name a URL the pod did not import | Medium | Fixed: only an import Pod whose importer arguments carry the current URL counts; since the import integrity review, the claim UID and the import resource too, and the legacy init container path is removed |
 | The VMM's OFD lock does not exclude a second VMM on the same block device: each container has its own device node | Medium | Fixed for VMMs: `DiskInUse` registry in baryon-virtd, kept across restarts; the controller refuses a second VM on a claim in use (`ClaimInUse`). The importer is excluded only by the controller's ordering |
 | baryon-virtd accepted a block device at any container path and for filesystem-mode disks | Medium | Fixed (`UnknownPath`, `KindMismatch`, `DeviceOutsideDev`); the device cgroup remains a second layer. Tested (hostile-disk E2E) |
-| Zeroing with `FALLOC_FL_ZERO_RANGE` disabled deallocation and could fill thin pools | Medium | Partially fixed: `FALLOC_FL_PUNCH_HOLE` first; on devices without write-zeroes support the kernel writes zeros and allocates the device |
+| Zeroing with `FALLOC_FL_ZERO_RANGE` disabled deallocation and could fill thin pools | Medium | Partially fixed: `FALLOC_FL_PUNCH_HOLE` first; on devices without write-zeroes support the kernel writes zeros and allocates the device (thin pools: Documented, import integrity review below) |
 | The import Pod requested the vm resource and received /dev/kvm and the anchor socket | Medium | Fixed: the placement-only `virtualization.baryon.io/import` resource grants nothing, and admission restricts it to baryon-controller; the deletion E2E checks that the importer sees neither /dev/kvm nor the anchor socket |
 | Unaligned image length made tail zeroing fall back to user-space writes | Low | Fixed |
 | Size limit checked after writing | Low | Fixed |
-| A failed import left bootable content | Low | Partially fixed: the first 1 MiB; the image tail and a backup GPT at the device end are not covered |
+| A failed import left bootable content | Low | Fixed: the first and the last 1 MiB are zeroed before the download and receive image data only after verification |
 | Importer did not check that the target is a block device | Low | Fixed |
 | A corrected URL did not replace a failing import | Low | Fixed: `rootDisk` is immutable; recreate the VirtualMachine |
-| The import record (claim annotation, import Pod) is trusted as written by anyone who can edit claims or create pods in the namespace | Low | Documented (Data handling) |
-| Controller claim `patch` is cluster-wide | Low | Documented (RBAC) |
+| The import record (claim annotation, import Pod) is trusted as written by anyone who can edit claims or create pods in the namespace | Low | Superseded by the PersistentVolume record (import integrity review below) |
+| Controller claim `patch` is cluster-wide | Low | Fixed: claim `patch` removed |
 | containerd `device_ownership_from_security_context` is a node-wide requirement and makes /dev/kvm openable in Anchor containers | Low | Documented (Host paths and devices) |
 | A stale import Pod was deleted and the Anchor Pod created in the same reconcile | Low | Fixed: the Anchor Pod is created only after the import Pod is gone |
 | The source URL was copied to annotations and events | Low | Partially fixed: annotations hold a digest and the event has no URL; the URL remains in the import Pod arguments, the VirtualMachine, and the filesystem import marker; URLs must not carry secrets |
@@ -432,6 +491,27 @@ and the disk handoff:
 | `check_device_access` is a diagnostic, not a control | Note | Documented (Who does what) |
 | The `/dev` mount check read the statx mount id without checking the returned mask, and does not fit user namespaces | Note | Partially fixed: the mask is checked and the check fails closed; Kubernetes user namespaces with bind-mounted device nodes would be refused (Planned item below) |
 | A reused device minor after a forced detach could point a reopen at another volume | Note | Open |
+
+Findings of the 2026-10-03 review of import integrity (the import record,
+completion evidence, and the import approval), including one finding of the
+architecture review:
+
+| Finding | Severity | State |
+|---|---|---|
+| Import completion was judged from pod metadata that namespace users can write, and the record was written without checking that claim and volume are bound to each other | High | Fixed: completion only from the import Pod's spec (import resource, mounted claim, `--url=` and `--claim-uid=` arguments) and the importer's exit code; the record is written on the PersistentVolume only when claim and volume are mutually bound |
+| `ImportStateUnknown` cleared itself on the next reconcile | High | Fixed: `status.rootDiskImport` is kept while the claim UID is unchanged, also on refusal |
+| A namespace user's pod named like the import Pod made StorageReady True | Medium | Fixed: such a pod is never used and blocks the VM (`ImportPodConflict`); Tested by the import integrity E2E |
+| StorageReady was derived from the init container of a pod with the Anchor Pod's name, and from a stale import Pod | Medium | Fixed: only the import Pod for the current claim UID reports import progress; StorageReady=True needs the record; a pod with the Anchor Pod's name that does not request the vm resource is `AnchorPodConflict` |
+| A namespace user could set the import approval on the import Pod (found by the architecture review) | High | Fixed: `baryon-import-approval`; Tested by the CI API server checks and the import integrity E2E |
+| Thin pools allocate the whole volume on import (dm-thin has no write-zeroes) | Medium | Documented (Data handling) |
+| Claim exclusion between concurrent reconciles of different VMs can race | Low | Partially fixed: the `ClaimInUse` check runs before both the import Pod and the Anchor Pod are created; a race between concurrent reconciles of two VMs remains; `ReadWriteOncePod` for claims Baryon creates is Planned (Future hardening) |
+| Logical block sizes above 4 KiB broke the zeroing alignment | Low | Fixed: such devices are refused |
+| The initial zeroing of the device ends was not flushed before the download | Low | Fixed: flushed before the download |
+| An HTTPS import without a digest accepted a truncated body | Low | Fixed: the length must equal `Content-Length`, and without a digest a response without `Content-Length` is refused |
+| `record_import` reported success without writing the record | Low | Fixed: it writes only for a mutually bound claim and volume and otherwise reports `DiskBindingPending` |
+| The record rule did not require a Bound PersistentVolume | Note | Fixed: `bound_to` and `baryon-controller-writes` require it |
+| The readiness of earlier releases compares timestamps with one-second resolution | Note | Accepted: a StorageReady=True of an earlier claim with the same name that changed in the same second as the current claim's creation counts for the current claim; the effect is a refusal or a disk treated as already imported (the VM boots an empty volume), never an import over a used disk |
+| PersistentVolume `get` is cluster-wide and PersistentVolume `patch` depends on `baryon-controller-writes` | Low | Documented (RBAC) |
 
 ## Future hardening
 
@@ -442,9 +522,8 @@ and the disk handoff:
 | A Baryon-owned seccomp or Landlock layer for the VMM on top of Cloud Hypervisor's | Designed |
 | Kubernetes user namespaces (`hostUsers: false`) as additional hardening for the Anchor container; not the VM identity contract (ADR 0011) | Planned (evaluation) |
 | A `/dev` check that works with runtime bind-mounted device nodes before user namespaces are adopted | Planned |
-| Zero the last 1 MiB of a block device before import and write it only after verification | Planned |
 | `ReadWriteOncePod` for claims Baryon creates where the CSI driver supports it | Planned |
-| Admission policy limiting baryon-controller's claim updates to the import annotation on claims it created | Planned |
+| Admission policy limiting baryon-controller's PersistentVolume and pod updates (`baryon-controller-writes`) | Implemented, Tested (CI API server checks) |
 | Record and verify the block device identity across VMM recovery | Planned |
 | Feature-aware placement (one placement-only resource per runtime protocol feature, ADR 0012) | Planned |
 | Dependency gate in CI (cargo-deny or cargo-audit) and a smaller parsing surface in baryon-virtd | Designed |

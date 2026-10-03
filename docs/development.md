@@ -18,7 +18,8 @@ files are compiled with protox.
 |---|---|
 | `crates/` | Rust workspace members (see [architecture.md](architecture.md)) |
 | `deploy/` | CRDs, namespace, controller and node agent manifests |
-| `deploy/base/policy/` | ValidatingAdmissionPolicies: `vm-resource.yaml`, `node-agent.yaml` (Kubernetes 1.30 or later; 1.32 or later for the node agent policy) |
+| `deploy/base/policy/` | ValidatingAdmissionPolicies: `vm-resource.yaml`, `node-agent.yaml`, `controller-writes.yaml`, `import-approval.yaml` (Kubernetes 1.30 or later; 1.32 or later for the node agent policy) |
+| `deploy/base/tenant/` | ClusterRoles for namespace users, aggregated into `edit`, `admin`, and `view` |
 | `packaging/images/` | container images for anchor, node agent, controller |
 | `packaging/hadron/` | Baryon-enabled Hadron image |
 | `packaging/versions.env` | pinned host components and checksums |
@@ -114,7 +115,7 @@ true` ([compatibility.md](compatibility.md); k0s:
    `deploy/base/node-agent/daemonset.yaml` to the images you pushed (or use
    a kustomize overlay with an `images:` entry).
 2. Apply the manifests (CRDs, namespace, node agent, controller, admission
-   policies) and the example classes:
+   policies, roles for namespace users) and the example classes:
 
    ```bash
    kubectl apply --server-side -k deploy/base
@@ -133,7 +134,10 @@ true` ([compatibility.md](compatibility.md); k0s:
 The admission policies in `deploy/base/policy/` are part of the supported
 installation ([security.md](security.md#admission-policies)). With
 `baryon-vm-resource` installed, only baryon-controller can create pods that
-request `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`.
+request `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`;
+`baryon-controller-writes` limits baryon-controller's PersistentVolume and
+pod updates to the import record and the import approval; and
+`baryon-import-approval` lets only baryon-controller approve an import.
 
 baryon-virtd ships in the host image and is updated with a Kairos A/B
 upgrade, not by copying binaries onto a node. Running VMs keep running

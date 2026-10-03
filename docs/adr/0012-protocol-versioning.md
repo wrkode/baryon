@@ -82,9 +82,10 @@ express a breaking change except changing the package.
   vocabulary in their termination messages (for example
   `IdentityConflict`), the container names `anchor` and `import`, the
   annotations `virtualization.baryon.io/spec-hash` and
-  `virtualization.baryon.io/restartedAt`, and the legacy import init
-  container's `--url=` argument. Legacy paths are removed one release
-  later.
+  `virtualization.baryon.io/restartedAt`, and, for disks imported by an
+  earlier release, the claim annotation `virtualization.baryon.io/imported-from`
+  together with the StorageReady=True that the earlier controller wrote
+  (ADR 0006). Legacy paths are removed one release later.
 - Support window: a cluster release supports Anchor Pods of the previous
   release and hosts of the same major version. The minimum host image for
   each cluster release is recorded in
@@ -143,3 +144,7 @@ express a breaking change except changing the package.
   previous-release Anchor Pods, the support window, and the mixed-version
   evidence.
 - 2026-10-03: accepted after the architecture gate.
+- 2026-10-03: the legacy import init container's `--url=` argument is no
+  longer read as import evidence (ADR 0006); disks imported by earlier
+  releases are recognized by the claim annotation and the earlier
+  controller's StorageReady=True instead.

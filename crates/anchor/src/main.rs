@@ -55,6 +55,14 @@ enum Command {
         /// Write to this raw block device instead of an image file in `dir`.
         #[arg(long)]
         device: Option<PathBuf>,
+        /// Write nothing until this file is non-empty: baryon-controller
+        /// approves the import once the claim is bound to a volume
+        /// provisioned for it.
+        #[arg(long)]
+        approval_file: Option<PathBuf>,
+        /// UID of the claim; the approval must name it.
+        #[arg(long)]
+        claim_uid: Option<String>,
     },
 }
 
@@ -90,15 +98,23 @@ fn main() -> ExitCode {
             size_bytes,
             dir,
             device,
-        } => match rt.block_on(import::import(
-            &url,
-            sha256.as_deref(),
-            size_bytes,
-            match &device {
-                Some(d) => import::Target::Device(d),
-                None => import::Target::File(&dir),
-            },
-        )) {
+            approval_file,
+            claim_uid,
+        } => match rt.block_on(async {
+            if let Some(f) = &approval_file {
+                import::wait_for_approval(f, claim_uid.as_deref()).await?;
+            }
+            import::import(
+                &url,
+                sha256.as_deref(),
+                size_bytes,
+                match &device {
+                    Some(d) => import::Target::Device(d),
+                    None => import::Target::File(&dir),
+                },
+            )
+            .await
+        }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 tracing::error!(error = %format!("{e:#}"), "import failed");

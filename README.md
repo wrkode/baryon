@@ -38,10 +38,13 @@ entries name the environment they were observed on, summarized in
 | Identity conflict between two VMs on one node: refused by baryon-virtd, VM placed on another node | Implemented, unit tests; not exercised on a cluster |
 | DHCP responder as a separate process with the VMM's confinement | Tested on the k0s cluster, the Hadron k3s node, and the kind host |
 | Admission policies (`deploy/base/policy/`): vm and import resources only for baryon-controller, node agent writes only its own node | Tested: CI API server checks (vm resource, import resource, and init container denial); enforced on the Hadron k3s node and the kind host |
+| Admission policies for the import: baryon-controller may only add the import record to a PersistentVolume and set the import approval on Baryon pods (`baryon-controller-writes`); only baryon-controller may set the import approval (`baryon-import-approval`) | Tested: CI API server checks, every allow and deny case by impersonation; `baryon-import-approval` also by the import integrity E2E on the k0s cluster |
+| Roles for namespace users (`baryon-vm-edit`, `baryon-vm-view`, aggregated into `edit`, `admin`, and `view`; no VirtualMachine status, no PersistentVolumes) | Tested: the import integrity E2E runs as a service account bound to `edit` on the k0s cluster |
 | Pod network for VMs (TAP in the pod namespace, guest takes the pod IP) | Tested from a probe pod to VMs on all three nodes and through a ClusterIP Service by DNS name: multi-node E2E on the k0s cluster (k0s default CNI, kube-router); lifecycle E2E on the Hadron k3s node (flannel) and the kind host (kindnet). NetworkPolicy and guest-initiated egress: Inferred, not tested |
 | PVC root disks, HTTP raw image import (filesystem mode) | Tested: storage E2E with OpenEBS LVM LocalPV and Ceph RBD on the k0s cluster; lifecycle E2E with local-path on the Hadron k3s node and the kind host |
 | Block-mode root disks | Tested: storage E2E with OpenEBS LVM LocalPV and Ceph RBD on the k0s cluster, including a move of a Ceph RBD VM to another node. Requires containerd `device_ownership_from_security_context = true` ([compatibility.md](docs/compatibility.md)) |
-| Image import in a separate import Pod, recorded on the claim before the first Anchor Pod exists | Tested: deletion and storage E2E on the k0s cluster |
+| Image import in a separate import Pod, recorded on the bound PersistentVolume before the first Anchor Pod exists | Tested: deletion and storage E2E on the k0s cluster |
+| Import integrity: import only into a volume provisioned for the claim, an approval only baryon-controller can give, completion only from the import Pod's spec, refusal instead of a second import, every byte of an imported block device the image's or zero | Tested: import integrity E2E with OpenEBS LVM LocalPV and Ceph RBD block volumes on the k0s cluster, including the check that a namespace user cannot set an import approval; unit tests for the import decision |
 | One running VM per claim (`ClaimInUse` in the controller, `DiskInUse` in baryon-virtd) | `ClaimInUse` Tested by the storage E2E on the k0s cluster; `DiskInUse` Implemented, unit tests |
 | baryon-virtd accepts only the Anchor container's disk paths, kinds, and `/dev` device nodes | Tested: hostile-disk E2E on the k0s cluster |
 | Runtime protocol versions and feature negotiation (ADR 0012) | Tested: version skew E2E on the k0s cluster with mixed protocol 1.0 and 1.1 hosts, under both cluster releases |
@@ -75,8 +78,9 @@ VirtualMachine --> baryon-controller --> import Pod (imported disks only, runs f
   storage through CSI, and connects it through CNI. Baryon does not schedule,
   provide storage, or provide networking.
 - A VM whose disk is imported over HTTP first gets an import Pod that writes
-  the image into the root disk claim and exits; the Anchor Pod is created
-  after the import is recorded and the import Pod is gone.
+  the image into the root disk claim, once baryon-controller has approved
+  it, and exits; the Anchor Pod is created after the import is recorded on
+  the claim's PersistentVolume and the import Pod is gone.
 - Cloud Hypervisor runs as a host process started by baryon-virtd, but as
   the VM's own unprivileged host identity (the same as the Anchor
   container's), without capabilities, in its own empty network namespace,

@@ -16,6 +16,7 @@ far. Other documents state a status label and link to
 | E2E multi-node | `tests/e2e/multinode.sh` | one VM per node, controller restart, baryon-virtd restart and outage on one node, VMM crash, Anchor Pod replacement behind a Service, cordon, deleting one VM, each without effect on the VMs of other nodes | at least three Baryon nodes | no |
 | E2E storage | `tests/e2e/storage.sh` | one StorageClass and volume mode: import, boot, one VM per claim (`ClaimInUse`), Anchor Pod replacement and stop and start without a second import, a move to another node, deletion with claim, volume, and host cleanup | a cluster of Baryon nodes with the StorageClass | no |
 | E2E version skew | `tests/e2e/skew.sh` | one VM per node under whatever mix of cluster release and host image versions runs, reattach across versions after a baryon-virtd restart | a cluster of Baryon nodes during a rolling upgrade | no |
+| E2E import integrity | `tests/e2e/import-integrity.sh` | a block-mode imported disk: no stale backend data after the import, a namespace user's pods named like the Anchor Pod or the import Pod are not trusted, a namespace user cannot change the import record, the VM status, the disk source, or an import approval, exactly one import across start, Anchor Pod replacement, and a baryon-controller restart, `ImportStateUnknown` when an administrator removes the record | a cluster of Baryon nodes with a block-mode StorageClass, `NODE_SHELL`, and a namespace that admits root pods | no |
 | E2E hostile disk | `tests/e2e/hostile-disk.sh` | a claim whose `disk.img` is a block device node made by a pod is refused (`StorageFailed`) and no VMM starts | a cluster of Baryon nodes and a namespace that admits a root pod with the runtime's default capabilities | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
@@ -38,10 +39,10 @@ cargo test --workspace --locked
 | `baryon-cloud-hypervisor` | command line construction (including `--landlock-rules` for writable directories) and option injection rejection, API client against a fake Unix socket server (status codes, timeouts), event monitor decoding with split writes and truncation, version parsing |
 | `baryon-virtd` | pod cgroup parsing (systemd, cgroupfs, nested roots) and systemd scope detection, peer pidfd, the anchor identity check (`IdentityMismatch`) and the refusal of a second VM with the same identity on a node (`IdentityConflict`), disk resolution confinement (absolute symlink and `..` escapes), the accepted disk paths and kinds (`UnknownPath`, `KindMismatch`), device nodes outside the container's `/dev` mount, one VM per block device on a node (`DiskInUse`), `/proc/self/fd` reopen, access to the VMM-owned directory (bounded tail reads; symlinks, hard links, other file types, and a foreign owner refused; socket connection through a checked descriptor), DHCP responses (routed, bridged, and off-link gateway route tables, NAK, other clients), IPv4 and UDP checksums, DHCP responder protocol (lease configuration round trip, only events matching the lease forwarded, overlong lines rejected), gratuitous ARP frame layout, tc filter encoding, cgroup limits, serial prompt detection and capture, record round trip, spec validation |
 | `baryon-runtime-api` | per-VM identity (deterministic, distinct for different VMs, unprivileged and inside the reserved range, verification), guest MAC derivation, anchor spec round trip, protocol versions and features (a peer without a version is 1.0 with the 1.0 features, same major interoperates, another major and missing features refused) |
-| `baryon-anchor` | sparse writes, block device import (zero runs, tail zeroing, data past the first 1 MiB, unaligned device end, a failed import leaves the first 1 MiB zero, the size limit holds before writing), redirect resolution (absolute, root-relative, path-relative; HTTPS to HTTP refused), import against a local HTTP server with checksum and marker handling, protocol negotiation results, termination messages |
+| `baryon-anchor` | sparse writes, block device import (zero runs, tail zeroing, data past the first 1 MiB, unaligned device end, the size limit holds before writing), the block import contract on a device full of stale data with each of the three zeroing methods (every byte the image's or zero), a small image on a large device, a failed import leaves both the first and the last 1 MiB zero, devices smaller than the two protected regions, waiting for an approval that names the claim UID (empty and foreign values do not proceed), length checks (`Content-Length` mismatch refused, no length without a digest refused), redirect resolution (absolute, root-relative, path-relative; HTTPS to HTTP refused), import against a local HTTP server with checksum and marker handling, protocol negotiation results, termination messages |
 | `baryon-api` | CRD generation with CEL rules and list-map markers, defaults, conditions, quantities |
 | `baryon-node-agent` | device plugin slots and allocation, the import resource granting nothing, VirtualizationNode status translation including `ProtocolIncompatible` |
-| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access, no init container), import Pod shape (VM's CPU and memory, the import slot and no vm slot, no `vm-name` label, URL digest annotation), block mode, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, an import counted only for the URL it imported (import Pod and legacy init container), pods that use a claim, status derivation for ready, failed, importing, pending import, unschedulable import Pod, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons, the watch trigger backoff |
+| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access, no init container), import Pod shape (VM's CPU and memory, the import slot and no vm slot, no `vm-name` label, URL digest annotation, the approval file and no approval until the volume is checked, an approved import Pod carries its approval without changing the Anchor Pod hash), block mode, the import decision (`decide`: fresh volume, record for this claim, claim metadata not deciding, records for another claim or source, unreadable record, static, pre-bound, foreign, and cloned volumes, migration of earlier records and fail-closed `ImportStateUnknown`, the record's JSON field names), mutual binding of claim and volume before a record is written, completion only from the import Pod's spec (resource, claim, URL, claim UID, exit code; annotations ignored), an import Pod for another claim UID is stale, readiness of earlier releases only for the current claim, `status.rootDiskImport` kept for the same claim and reset for a recreated one, an exited importer alone does not make the disk ready, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, an init container of a pod with the Anchor Pod's name is no import evidence, pods that use a claim, status derivation for ready, failed, importing, pending import, unschedulable import Pod, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons, the watch trigger backoff |
 
 Kubernetes API behavior is covered by the API server checks and by the E2E
 tests. An envtest-based tier (kube-rs `envtest` crate) would need a Go
@@ -59,8 +60,8 @@ hack/ci/k0s.sh stop
 ```
 
 `hack/ci/apiserver-checks.sh` applies the CRDs, the example classes, the
-namespace, and the admission policies, then uses server-side dry runs to
-confirm that:
+namespace, and each admission policy file, then uses server-side dry runs
+to confirm that:
 
 - the example VirtualMachine is accepted
 - a VirtualMachine with two disk sources is rejected
@@ -72,6 +73,20 @@ confirm that:
   a pod that requests `virtualization.baryon.io/import`, and a pod whose
   init container requests `virtualization.baryon.io/vm`
 - a plain pod is admitted
+
+It then applies the controller RBAC and, impersonating baryon-controller's
+service account against a PersistentVolume bound to a claim, a Baryon pod,
+and an unmanaged pod, confirms that:
+
+- `baryon-controller-writes` denies a PersistentVolume spec change, another
+  PersistentVolume annotation, an import record for another claim UID,
+  rewriting the record, removing it, relabeling a Baryon pod, and
+  annotating a pod that is not labeled `app.kubernetes.io/managed-by=baryon`
+- the controller may add the import record for the bound claim and set the
+  import approval on a Baryon pod
+- `baryon-import-approval` denies another user changing, removing, or
+  setting the approval, and admits another user changing other annotations
+  of a pod that has one
 
 The script works against any cluster: set `KUBECTL` to the kubectl command
 to use, for example `KUBECTL=kubectl hack/ci/apiserver-checks.sh`. It
@@ -94,6 +109,7 @@ virtualization evidence.
 | `tests/e2e/storage.sh` | root disk storage for one StorageClass (`STORAGE_CLASS`) and volume mode (`VOLUME_MODE`) |
 | `tests/e2e/skew.sh` | one VM per node under the current version mix; needs `NODE_SHELL` |
 | `tests/e2e/hostile-disk.sh` | a hostile `disk.img` is refused |
+| `tests/e2e/import-integrity.sh` | integrity of a block-mode import against stale data and namespace users; needs `NODE_SHELL`, `STORAGE_CLASS` (block volumes), and a namespace that admits root pods |
 | `tests/e2e/repeat.sh <count> <script> [args...]` | runs a script repeatedly, stops at the first failing run, and writes each run's output to `_output/e2e/<script>-<n>.log` in the current directory |
 
 The scripts are multi-node aware: each host check runs on the node that the
@@ -150,6 +166,37 @@ that generates them again ran from a fresh disk. It moves the VM to another
 node (cordon, restart) only when the volume is not bound to a node, and
 starts a second VirtualMachine on the same claim to check `ClaimInUse`.
 
+`storage.sh` checks that the completed import is recorded on the bound
+PersistentVolume for the claim's UID and the URL digest.
+
+`import-integrity.sh` runs as a namespace user: a service account bound to
+the Kubernetes `edit` role through the aggregated `baryon-vm-edit` role.
+In order, it:
+
+1. creates a stopped block-mode VirtualMachine as that user and fills the
+   claim's whole device with a marker from a root pod (the stale data);
+2. creates, as that user, a pod named `<vm>-anchor` owned by the VM with an
+   `import` init container, and a pod named `<vm>-import` owned by the VM,
+   then starts the VM: the VM reports `AnchorPodConflict` and StorageReady
+   is not True; after the fake Anchor Pod is deleted it reports
+   `ImportPodConflict`, no Anchor Pod is created, and no import record is
+   written;
+3. deletes the fake import Pod, waits for Ready, checks the record on the
+   PersistentVolume for this claim UID and a first boot from the imported
+   image (the guest generates SSH host keys);
+4. stops the VM and scans the whole device: no marker is left;
+5. as the user, removes and changes claim annotations, and checks that the
+   user cannot change the PersistentVolume, set an import approval on a
+   pod, write the VM status, or change the disk source;
+6. starts the VM, replaces the Anchor Pod, and restarts baryon-controller
+   and then the VM; after each, exactly one `Importing` event, no import
+   Pod, and a boot from the existing disk (no new SSH host keys);
+7. checks `status.rootDiskImport` for this claim, stops the VM, removes
+   the record as an administrator, and starts the VM: it is refused with
+   `ImportStateUnknown` and not imported; restoring the record lets it
+   boot the existing disk;
+8. deletes the VM and checks the node for leftovers.
+
 `hostile-disk.sh` creates a filesystem-mode claim, lets a root pod create a
 block device node as `disk.img` on it (`mknod`, which needs `CAP_MKNOD`),
 and starts a VM on that claim. It expects `StorageFailed` with a message
@@ -160,8 +207,10 @@ Anchor Pod.
 
 `lib.sh` reads the following; `lifecycle.sh` also reads `PROBE_IMAGE` and
 `SKIP_NETWORK`; `multinode.sh` and `hostile-disk.sh` read `PROBE_IMAGE`;
-`multinode.sh`, `storage.sh`, `skew.sh`, and `hostile-disk.sh` read
-`STORAGE_CLASS`; `storage.sh` reads `VOLUME_MODE`; `skew.sh` reads
+`multinode.sh`, `storage.sh`, `skew.sh`, `hostile-disk.sh`, and
+`import-integrity.sh` read `STORAGE_CLASS` (required by
+`import-integrity.sh`); `import-integrity.sh` also reads `PROBE_IMAGE` and
+`SCAN_IMAGE`; `storage.sh` reads `VOLUME_MODE`; `skew.sh` reads
 `EXPECT_MIXED`.
 
 | Variable | Meaning |
@@ -178,6 +227,7 @@ Anchor Pod.
 | `STORAGE_CLASS` | StorageClass of the root disk claims (default: the cluster's default StorageClass) |
 | `VOLUME_MODE` | `storage.sh` only: `Filesystem` (default) or `Block` |
 | `EXPECT_MIXED` | `skew.sh` only: `1` fails unless the nodes run at least two different baryon-virtd builds |
+| `SCAN_IMAGE` | `import-integrity.sh` only: image with `python3` for the root pods that fill and scan the device (default: `python:3.13-alpine`) |
 
 `NODE_SHELL` is supplied by the user; Baryon ships no node access tool.
 Any mechanism that runs a command as root on the named node works. An
@@ -205,6 +255,7 @@ NODE_SHELL=<path to your node-shell command> tests/e2e/delete.sh
 NODE_SHELL=<path to your node-shell command> tests/e2e/multinode.sh
 NODE_SHELL=<path to your node-shell command> STORAGE_CLASS=<class> VOLUME_MODE=Block tests/e2e/storage.sh
 NODE_SHELL=<path to your node-shell command> tests/e2e/hostile-disk.sh
+NODE_SHELL=<path to your node-shell command> STORAGE_CLASS=<block-capable class> tests/e2e/import-integrity.sh
 NODE_SHELL=<path to your node-shell command> EXPECT_MIXED=1 tests/e2e/skew.sh
 ```
 
@@ -290,6 +341,10 @@ An environment for the E2E tests and the manual procedures needs:
   true` ([compatibility.md](compatibility.md#csi-requirements)).
 - For `hostile-disk.sh`, a namespace that admits a pod running as root with
   the container runtime's default capabilities.
+- For `import-integrity.sh`, a StorageClass that provisions block volumes,
+  a namespace that admits pods running as root (the filler and scanner
+  read and write the raw device), and `deploy/base/tenant/roles.yaml`
+  installed (part of `deploy/base`).
 - Network connectivity: a CNI that meets
   [compatibility.md](compatibility.md#cni-requirements); pods can reach
   `IMAGE_URL` and pull `PROBE_IMAGE`; the machine running the tests can
@@ -343,9 +398,15 @@ listed because some behavior was observed only there. All runs were on
 ### k0s cluster
 
 Results are counted as passed checks of the total. The commit names the
-code that ran; "working tree" is the change set that introduced the import
+code that ran. "working tree" is the change set that introduced the import
 Pod, the immutable `rootDisk`, the importer hardening, the disk checks in
-baryon-virtd, `ClaimInUse`, and the controller watch backoff.
+baryon-virtd, `ClaimInUse`, and the controller watch backoff, since
+committed as 4d2b5df to 1835c0c. "import integrity change" is the change on
+top of 1835c0c that moved the import record to the PersistentVolume and
+added the import approval, the block import contract, and the tenant
+roles; "import integrity change, earlier revision" is the same change
+before the `baryon-import-approval` policy and the split of the requeue
+interval for refused VMs were added.
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|
@@ -356,6 +417,9 @@ baryon-virtd, `ClaimInUse`, and the controller watch backoff.
 | Root disk storage, filesystem mode | c8e6c08 | E2E storage | ceph-rbd 44 of 44 (with the move); lvm-local 33 of 33 |
 | Root disk storage with the import Pod and `ClaimInUse` (a second VM on the running VM's claim reports `ClaimInUse` and gets no Anchor Pod) | working tree | E2E storage | lvm-local Block 36 of 36; ceph-rbd Block 47 of 47; ceph-rbd Filesystem 47 of 47; lvm-local Filesystem 36 of 36 |
 | A block device node made by a pod as `disk.img` is refused | working tree | E2E hostile disk | 4 of 4 |
+| Import integrity on block volumes (stale data, a namespace user's pods and edits, one import across start, Anchor Pod replacement, and controller restart, `ImportStateUnknown` and recovery) | import integrity change; earlier revision | E2E import integrity | import integrity change: lvm-local Block 52 of 52 and ceph-rbd Block 52 of 52, including the check that a namespace user cannot set an import approval; earlier revision: 51 of 51 on each |
+| Root disk storage with the PersistentVolume record check | import integrity change; earlier revision | E2E storage | import integrity change: lvm-local Block 36 of 36, ceph-rbd Filesystem 47 of 47; earlier revision: lvm-local Block 36 of 36, ceph-rbd Block 47 of 47, ceph-rbd Filesystem 47 of 47, lvm-local Filesystem 36 of 36 |
+| Regression of the other suites | import integrity change; earlier revision | E2E lifecycle, deletion, hostile disk, multi-node, skew | import integrity change: lifecycle 33 of 33, deletion 19 of 19; earlier revision: lifecycle 33 of 33, deletion 19 of 19, hostile disk 4 of 4, multi-node 69 of 69, skew 30 of 30 |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
 | Version skew, 1.1 cluster release (597b637) with mixed hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31; new anchors on 1.0 hosts took the UNIMPLEMENTED path of `Negotiate`; the node agent published `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones |
 | A 1.0 anchor reattached to a 1.1 baryon-virtd after a restart | c8e6c08 and 597b637 | E2E skew | passed |

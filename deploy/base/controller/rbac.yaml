@@ -21,12 +21,19 @@ rules:
   - apiGroups: ["virtualization.baryon.io"]
     resources: ["virtualmachineclasses"]
     verbs: ["get", "list", "watch"]
+  # patch: only the import approval annotation on Baryon pods
+  # (policy/controller-writes.yaml).
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "list", "watch", "create", "delete"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["get", "list", "watch", "create", "patch"]
+    verbs: ["get", "list", "watch", "create"]
+  # The import record on the bound volume (ADR 0006). patch is limited to
+  # adding that annotation once (policy/controller-writes.yaml).
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "patch"]
   - apiGroups: ["events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

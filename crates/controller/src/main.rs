@@ -3,6 +3,7 @@
 //! talks to baryon-virtd.
 
 mod anchor;
+mod disk_import;
 mod reconcile;
 mod resources;
 mod status;

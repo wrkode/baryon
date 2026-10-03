@@ -182,6 +182,11 @@ pub struct VirtualMachineStatus {
     /// Claim holding the root disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_disk_claim: Option<String>,
+    /// Set when the root disk claim held an imported or used disk. It only
+    /// prevents another import into the same claim; the record on the
+    /// claim's PersistentVolume is the authority (ADR 0006).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_disk_import: Option<RootDiskImportStatus>,
     /// Number of times the VM was restarted in the current Anchor Pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count: Option<i32>,
@@ -200,4 +205,13 @@ pub struct VmAddress {
     #[serde(rename = "type")]
     pub type_: String,
     pub address: String,
+}
+
+/// A completed import into the root disk claim.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RootDiskImportStatus {
+    /// UID of the claim the image was imported into.
+    #[serde(rename = "claimUID")]
+    pub claim_uid: String,
 }

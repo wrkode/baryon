@@ -38,7 +38,7 @@ by a CEL rule): it is the guest hostname and the value of the
 |---|---|---|
 | `className` | string, required | VirtualMachineClass name. |
 | `runPolicy` | `Running` (default) or `Stopped` | Whether the VM runs. |
-| `rootDisk.source.http.url` | string, at most 2048 characters | Raw disk image to import, `http://` or `https://`. A plain `http://` URL requires `sha256`. Must not carry secrets (tokens, credentials): the URL appears in the import Pod's arguments and in the VirtualMachine. |
+| `rootDisk.source.http.url` | string, at most 2048 characters | Raw disk image to import, `http://` or `https://`. A plain `http://` URL requires `sha256`. Must not carry secrets (tokens, credentials): the URL appears in the VirtualMachine, in the import Pod's arguments, and in the filesystem-mode import marker. Annotations and Events carry only `sha256:` and the hex SHA-256 of the URL. |
 | `rootDisk.source.http.sha256` | string, exactly 64 hex characters | Expected image SHA-256. Required when `url` is plain `http://`; recommended for `https://`. |
 | `rootDisk.source.persistentVolumeClaim.claimName` | string | Existing claim with a raw disk: `disk.img` at the volume root (filesystem mode) or the whole device (block mode). |
 | `rootDisk.size` | quantity | Virtual disk size. Required for `http`. |
@@ -77,20 +77,27 @@ keeps it off the nodes in `status.identityConflictNodes` (see
 The root disk claim layout is a stable format of v1alpha1: in filesystem
 mode, `disk.img` at the volume root, plus `.baryon-import.json` (the import
 marker) for imported disks. A claim prepared outside Baryon must follow it.
-In block mode the disk is the whole device. A block device has no room for
-a marker, so baryon-controller records a completed import in the
-`virtualization.baryon.io/imported-from` annotation of the claim it
-created, with the value `sha256:` followed by the hex SHA-256 of the source
-URL (not the URL). Claims recorded by commits c8e6c08 to 597b637 hold the
-URL itself; baryon-controller accepts a value equal to the current URL as a
-completed import and rewrites it to the digest. This annotation is internal state of a Baryon-owned
-object, not an API. It is trusted as written: anyone who can update claims
-in the namespace can set or remove it. Removing it makes the next
-replacement of the Anchor Pod import again, which overwrites a block device
-(see [security.md](security.md#data-handling)). Filesystem-mode claims from
-the previous release, which have the marker file and no annotation, get an
-import Pod that finds the marker, leaves the disk untouched, and records the
-digest (observed on the k0s cluster).
+In block mode the disk is the whole device.
+
+A completed import is recorded by baryon-controller in the annotation
+`virtualization.baryon.io/disk-import` on the claim's bound
+PersistentVolume, as JSON with `vmUID`, `claimUID`, and `source` (`sha256:`
+and the hex SHA-256 of the source URL). The record, and the freshness rule
+that decides whether Baryon imports into a volume at all, are described in
+[storage.md](storage.md#import-record) and ADR 0006. The annotation is
+internal state, not an API: do not write or remove it, and keep it when
+backing up or restoring volumes. The claim annotation
+`virtualization.baryon.io/imported-from` written by earlier releases is no
+longer written; baryon-controller reads it only to migrate VirtualMachines
+of earlier releases (see
+[compatibility.md](compatibility.md#version-skew)).
+
+To use existing data, such as a restored snapshot, a clone, or a claim
+from a deleted VirtualMachine, reference the claim with
+`rootDisk.source.persistentVolumeClaim` in a new VirtualMachine. A
+VirtualMachine with an `http` source imports only into a volume that was
+dynamically provisioned for the claim Baryon created, and refuses
+anything else (see the storage reasons below).
 
 To restart a running VM, set the `virtualization.baryon.io/restartedAt`
 annotation to a new value:
@@ -109,6 +116,7 @@ kubectl annotate virtualmachine debian --overwrite virtualization.baryon.io/rest
 | `addresses` | Guest addresses, the Anchor Pod IPs, type `InternalIP`. |
 | `macAddress` | Guest MAC address, stable for the life of the VM. |
 | `rootDiskClaim` | Claim holding the root disk. |
+| `rootDiskImport.claimUID` | Set by baryon-controller when the root disk claim with this UID held an imported or used disk; reset when the claim is recreated. A one-way marker that only prevents another import into the same claim. It is not an API guarantee and must not be relied on: the record on the PersistentVolume is the authority (ADR 0006). |
 | `restartCount` | Restarts of the current Anchor Pod's anchor container (each one restarts the VM). Resets to 0 when the Anchor Pod is replaced (stop and start, restart request, node reboot). |
 | `identityConflictNodes` | Nodes where this VM cannot run because another VM there has the same host identity (at most 16). New Anchor Pods avoid them. Cleared when the VM is stopped. |
 | `observedGeneration` | Generation the status was computed for. |
@@ -117,10 +125,10 @@ Conditions:
 
 | Type | True when | Typical reasons when False |
 |---|---|---|
-| `Scheduled` | The Anchor Pod is bound to a node. | `Pending`, `Unschedulable`, `Stopped`, `ClassNotFound`, `AnchorPodConflict`, `ClaimInUse`, and while the disk is not ready the `StorageReady` reason |
-| `StorageReady` | The claim is bound and the disk image is in place. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict` |
+| `Scheduled` | The Anchor Pod is bound to a node. | `Pending`, `Unschedulable`, `Stopped`, `ClassNotFound`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and while the disk is not ready the `StorageReady` reason |
+| `StorageReady` | The claim is bound and the disk is in place: for an `http` source, its import is recorded on the PersistentVolume. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict`, and the import refusals `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` |
 | `Running` | The Anchor container is running; it runs or starts the VMM (reason `AnchorRunning`). It does not by itself mean that the VMM runs. | `Starting`, `Stopping`, `Stopped`, `Pending`, and the failure reasons below |
-| `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `Pending`, `Unschedulable`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
+| `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
 | `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the spec or the class changed after the Anchor Pod was created) or `AnchorImageChanged` (baryon-controller now uses a different anchor image). | `UpToDate` |
 
 Precedence: an existing Anchor Pod decides `Running` and `Ready`. Class or
@@ -145,8 +153,36 @@ is Not supported.
 
 `AnchorPodConflict`: a pod named `<vm>-anchor` exists that this
 VirtualMachine does not control (no owner reference with the VM UID, kind
-VirtualMachine, and `controller: true`). baryon-controller leaves that pod
-alone and never reports it as the VM's; delete or rename it.
+VirtualMachine, and `controller: true`), or that does not request the
+`virtualization.baryon.io/vm` resource, which only baryon-controller can
+give a pod. baryon-controller leaves that pod alone and never reports it as
+the VM's; delete or rename it.
+
+`ImportPodConflict`: a pod named `<vm>-import` exists that this
+VirtualMachine does not control or that does not request the
+`virtualization.baryon.io/import` resource. baryon-controller never uses
+it as import evidence and creates neither an import Pod nor an Anchor Pod
+until it is gone; delete it.
+
+`ImportingDisk` with the message "the importer finished; recording the
+import": the importer exited 0 and baryon-controller has not yet written
+the record on the PersistentVolume. An importer's exit code alone never
+makes the disk ready.
+
+Import refusals. None of them imports or starts the VM, and their messages
+name the adoption path (`rootDisk.source.persistentVolumeClaim` in a new
+VirtualMachine) where it applies. baryon-controller does not watch
+PersistentVolumes; it looks at a refused VM again every 120 s, and at one
+in `DiskBindingPending` every 30 s.
+
+| Reason | Meaning |
+|---|---|
+| `DiskNotProvisionedForClaim` | The volume has no import record and was not dynamically provisioned for this claim (no `pv.kubernetes.io/provisioned-by`, bound to another claim UID, or older than the claim), or the claim has a `dataSource` or `dataSourceRef` (a restore, clone, or populator). |
+| `DiskInitializedForAnotherClaim` | The volume's record names another claim UID. |
+| `DiskSourceMismatch` | The volume's record names another source. |
+| `DiskImportRecordInvalid` | The volume's record cannot be read. |
+| `ImportStateUnknown` | A block-mode claim that held an imported or used disk (`status.rootDiskImport`, or a ready disk of an earlier release) has no record on its volume. Restoring the record lets the VM start on the existing disk. |
+| `DiskBindingPending` | A VirtualMachine of an earlier release is being migrated, and the record cannot be written until the claim and the volume are bound to each other. |
 
 Failure reasons come from baryon-virtd through the anchor container's
 termination message (`Reason: detail`). `AttachRefused` means baryon-virtd
@@ -278,3 +314,21 @@ With the `baryon-vm-resource` admission policy installed
 (`deploy/base/policy/vm-resource.yaml`), only baryon-controller may create
 pods that request either resource, in any container or init container; a
 pod created by any other user that requests one is denied.
+
+## Access for namespace users
+
+`deploy/base/tenant/roles.yaml`, part of `deploy/base`, defines two
+ClusterRoles that aggregate into the Kubernetes default user-facing roles:
+
+| ClusterRole | Aggregated into | Grants |
+|---|---|---|
+| `baryon-vm-edit` | `edit`, `admin` | virtualmachines: get, list, watch, create, update, patch, delete, deletecollection; virtualmachineclasses: get, list, watch |
+| `baryon-vm-view` | `view` | virtualmachines, virtualmachineclasses: get, list, watch |
+
+A user bound to `edit` or `admin` in a namespace can therefore manage
+VirtualMachines there. Neither role grants `virtualmachines/status`, which
+only baryon-controller writes, or anything on PersistentVolumes, where the
+import records live. Status: Tested by the import integrity E2E on the k0s
+cluster, which creates, starts, stops, and restarts its VirtualMachine as a
+service account bound to `edit` and checks that this account cannot write
+the VirtualMachine status or the PersistentVolume.
