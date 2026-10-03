@@ -65,18 +65,28 @@ async fn main() -> anyhow::Result<()> {
     let (health_tx, health_rx) = tokio::sync::watch::channel(false);
 
     deviceplugin::check_plugin_dir(&args.device_plugin_dir)?;
+    let vm_plugin = deviceplugin::PluginConfig {
+        plugin_dir: args.device_plugin_dir.clone(),
+        socket_name: "baryon-vm.sock".to_owned(),
+        resource_name: baryon_api::keys::VM_RESOURCE.to_owned(),
+        grants: true,
+        slots: args.vm_slots,
+        kvm_device: args.kvm_device.clone(),
+        anchor_socket_dir: args.anchor_socket_dir.clone(),
+        anchor_mount_path: "/run/baryon/anchor".to_owned(),
+    };
+    let import_plugin = deviceplugin::PluginConfig {
+        socket_name: "baryon-import.sock".to_owned(),
+        resource_name: baryon_api::keys::IMPORT_RESOURCE.to_owned(),
+        grants: false,
+        ..vm_plugin.clone()
+    };
     let plugin = tokio::spawn(deviceplugin::run(
-        deviceplugin::PluginConfig {
-            plugin_dir: args.device_plugin_dir.clone(),
-            resource_name: baryon_api::keys::VM_RESOURCE.to_owned(),
-            slots: args.vm_slots,
-            kvm_device: args.kvm_device.clone(),
-            anchor_socket_dir: args.anchor_socket_dir.clone(),
-            anchor_mount_path: "/run/baryon/anchor".to_owned(),
-        },
-        health_rx,
+        vm_plugin,
+        health_rx.clone(),
         cancel.clone(),
     ));
+    let import = tokio::spawn(deviceplugin::run(import_plugin, health_rx, cancel.clone()));
     let publisher = tokio::spawn(publisher::run(
         client,
         publisher::PublisherConfig {
@@ -95,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
     }
     cancel.cancel();
     let _ = plugin.await;
+    let _ = import.await;
     let _ = publisher.await;
     Ok(())
 }

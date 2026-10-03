@@ -17,12 +17,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::{
-    PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod, VolumeResourceRequirements,
+    ContainerStatus, PersistentVolumeClaim, PersistentVolumeClaimSpec, Pod,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{OwnerReference, Time};
 use k8s_openapi::jiff::Timestamp;
-use kube::api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions};
+use kube::api::{
+    Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams, Preconditions,
+};
 use kube::runtime::controller::Action;
 use kube::runtime::events::{Event, EventType, Recorder};
 use kube::runtime::finalizer::{self, finalizer};
@@ -320,7 +323,7 @@ async fn ensure_claim(
     let imported = claim
         .annotations()
         .get(keys::IMPORTED_ANNOTATION)
-        .is_some_and(|u| u == &http.url);
+        .is_some_and(|u| *u == anchor::source_digest(&http.url));
     Ok(Ok(Disk {
         claim_name: name,
         claim: Some(claim),
@@ -335,6 +338,11 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
     let vm_uid = vm.meta().uid.clone().unwrap_or_default();
     let pod_name = resources::anchor_pod_name(&vm_name);
     let mut pod = pods.get_opt(&pod_name).await?;
+    let import_name = resources::import_pod_name(&vm_name);
+    let mut import_pod = pods
+        .get_opt(&import_name)
+        .await?
+        .filter(|p| owned_by(&p.metadata, &vm_uid));
 
     let mut obs_blocked = None;
     let mut restart_reason = None;
@@ -360,6 +368,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
             claim_name: disk.as_ref().ok().map(|d| d.claim_name.clone()),
             claim: disk.as_ref().ok().and_then(|d| d.claim.as_ref()),
             pod: None,
+            import_pod: None,
             has_import: disk.as_ref().is_ok_and(|d| d.import.is_some()),
             restart_reason: None,
             mac_address: Some(resources::vm_mac(&vm_uid)),
@@ -376,23 +385,39 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         claim_name = Some(d.claim_name.clone());
         claim.clone_from(&d.claim);
         has_import = d.import.is_some();
-        // A completed import is recorded on the claim, so later Anchor Pods
-        // start without importing again (a raw block volume has nowhere else
-        // to keep that state).
-        if let (Some((url, _, _)), Some(p)) = (&d.import, pod.as_ref())
-            && import_succeeded(p)
-        {
-            let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
-            let patch = serde_json::json!({
-                "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: url}}
-            });
-            pvcs.patch(
-                &d.claim_name,
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            )
-            .await?;
-            has_import = false;
+        // A completed import is recorded on the claim before any Anchor Pod
+        // uses the disk, so no later pod imports again (a raw block volume
+        // has nowhere else to keep that state). Only an import of the
+        // current URL counts. Anchor Pods of earlier releases imported in an
+        // init container.
+        if let Some((url, _, _)) = &d.import {
+            let done = import_pod
+                .as_ref()
+                .is_some_and(|p| import_pod_succeeded(p, url))
+                || pod.as_ref().is_some_and(|p| {
+                    owned_by(&p.metadata, &vm_uid) && legacy_import_succeeded(p, url)
+                });
+            if done {
+                let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), ns);
+                let patch = serde_json::json!({
+                    "metadata": {"annotations": {keys::IMPORTED_ANNOTATION: anchor::source_digest(url)}}
+                });
+                pvcs.patch(
+                    &d.claim_name,
+                    &PatchParams::default(),
+                    &Patch::Merge(&patch),
+                )
+                .await?;
+                has_import = false;
+                event(
+                    ctx,
+                    vm,
+                    EventType::Normal,
+                    "DiskImported",
+                    format!("imported the disk image into claim {}", d.claim_name),
+                )
+                .await;
+            }
         }
     }
 
@@ -408,6 +433,73 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
     } else {
         Vec::new()
     };
+
+    // One running VM per claim: a pod of another VM that uses the claim
+    // blocks this VM from starting (the VMM's file lock does not exclude a
+    // second VMM on a block device, and a claim may be shared across nodes).
+    if should_run
+        && pod.is_none()
+        && import_pod.is_none()
+        && obs_blocked.is_none()
+        && let Ok(d) = &disk
+        && let Some(other) = claim_user(&pods, &d.claim_name, &vm_uid).await?
+    {
+        obs_blocked = Some((
+            "ClaimInUse".to_owned(),
+            format!(
+                "claim {} is used by pod {other} of another VirtualMachine",
+                d.claim_name
+            ),
+        ));
+    }
+
+    // The import Pod exists only while an import is pending and the VM
+    // should run. One that finished, or imports another URL, is replaced.
+    if let Some(ip) = &import_pod
+        && ip.metadata.deletion_timestamp.is_none()
+    {
+        let wanted = disk
+            .as_ref()
+            .ok()
+            .and_then(|d| d.import.as_ref())
+            .map(|i| anchor::source_digest(&i.0));
+        let stale = !should_run
+            || !has_import
+            || ip.annotations().get(anchor::IMPORT_SOURCE_ANNOTATION) != wanted.as_ref()
+            || ip.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Failed");
+        if stale {
+            // The Anchor Pod is created only once this pod is gone, so a
+            // VMM never runs while an importer may still write.
+            pods.delete(&import_name, &delete_this(ip)).await?;
+        }
+    } else if import_pod.is_some() {
+        // Terminating; wait for it to go.
+    } else if should_run
+        && has_import
+        && pod.is_none()
+        && obs_blocked.is_none()
+        && let (Ok(c), Ok(d)) = (&compute, &disk)
+    {
+        let input = anchor_input(vm, ctx, c, d, restarted_at.clone(), &conflict_nodes);
+        match pods
+            .create(&PostParams::default(), &anchor::build_import(&input)?)
+            .await
+        {
+            Ok(created) => {
+                event(
+                    ctx,
+                    vm,
+                    EventType::Normal,
+                    "Importing",
+                    format!("created import Pod {import_name}"),
+                )
+                .await;
+                import_pod = Some(created);
+            }
+            Err(kube::Error::Api(e)) if e.code == 409 => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     if let Some(p) = &pod {
         let terminating = p.metadata.deletion_timestamp.is_some();
@@ -476,7 +568,12 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
             }
         }
         pod = pods.get_opt(&pod_name).await?;
-    } else if should_run && let (Ok(c), Ok(d)) = (&compute, &disk) {
+    } else if should_run
+        && !has_import
+        && import_pod.is_none()
+        && obs_blocked.is_none()
+        && let (Ok(c), Ok(d)) = (&compute, &disk)
+    {
         let input = anchor_input(vm, ctx, c, d, restarted_at.clone(), &conflict_nodes);
         let p = anchor::build(&input)?;
         match pods.create(&PostParams::default(), &p).await {
@@ -506,6 +603,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         claim_name,
         claim: claim.as_ref(),
         pod: pod.as_ref(),
+        import_pod: import_pod.as_ref(),
         has_import,
         restart_reason,
         mac_address: Some(resources::vm_mac(&vm_uid)),
@@ -592,20 +690,74 @@ fn anchor_input(
     }
 }
 
-/// Whether the import init container of `pod` finished successfully.
-fn import_succeeded(pod: &Pod) -> bool {
-    pod.status
+/// A Baryon pod of another VM that mounts `claim`, if any.
+async fn claim_user(pods: &Api<Pod>, claim: &str, vm_uid: &str) -> Result<Option<String>, Error> {
+    let managed = format!("{}={}", keys::MANAGED_BY_LABEL, keys::MANAGED_BY);
+    let list = pods.list(&ListParams::default().labels(&managed)).await?;
+    Ok(list
+        .items
+        .iter()
+        .find(|p| !owned_by(&p.metadata, vm_uid) && uses_claim(p, claim))
+        .map(ResourceExt::name_any))
+}
+
+/// Whether `pod` has a volume backed by `claim`.
+fn uses_claim(pod: &Pod, claim: &str) -> bool {
+    pod.spec
         .as_ref()
-        .and_then(|s| s.init_container_statuses.as_ref())
-        .is_some_and(|statuses| {
-            statuses.iter().any(|c| {
-                c.name == "import"
-                    && c.state
-                        .as_ref()
-                        .and_then(|s| s.terminated.as_ref())
-                        .is_some_and(|t| t.exit_code == 0)
+        .and_then(|s| s.volumes.as_ref())
+        .is_some_and(|vs| {
+            vs.iter().any(|v| {
+                v.persistent_volume_claim
+                    .as_ref()
+                    .is_some_and(|c| c.claim_name == claim)
             })
         })
+}
+
+/// Whether an importer container in `statuses` exited 0.
+fn importer_exited_0(statuses: Option<&Vec<ContainerStatus>>) -> bool {
+    statuses.is_some_and(|statuses| {
+        statuses.iter().any(|c| {
+            c.name == anchor::IMPORT_CONTAINER
+                && c.state
+                    .as_ref()
+                    .and_then(|s| s.terminated.as_ref())
+                    .is_some_and(|t| t.exit_code == 0)
+        })
+    })
+}
+
+/// Whether the import Pod `pod` imported `url` successfully.
+fn import_pod_succeeded(pod: &Pod, url: &str) -> bool {
+    pod.annotations().get(anchor::IMPORT_SOURCE_ANNOTATION) == Some(&anchor::source_digest(url))
+        && importer_exited_0(
+            pod.status
+                .as_ref()
+                .and_then(|s| s.container_statuses.as_ref()),
+        )
+}
+
+/// Whether an Anchor Pod of an earlier release imported `url` successfully
+/// in its init container.
+fn legacy_import_succeeded(pod: &Pod, url: &str) -> bool {
+    let arg = format!("--url={url}");
+    let imports_url = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.init_containers.as_ref())
+        .is_some_and(|cs| {
+            cs.iter().any(|c| {
+                c.name == anchor::IMPORT_CONTAINER
+                    && c.args.as_ref().is_some_and(|a| a.contains(&arg))
+            })
+        });
+    imports_url
+        && importer_exited_0(
+            pod.status
+                .as_ref()
+                .and_then(|s| s.init_container_statuses.as_ref()),
+        )
 }
 
 /// Upper bound of `identityConflictNodes`.
@@ -743,5 +895,91 @@ mod tests {
         };
         let p = delete_this(&pod);
         assert_eq!(p.preconditions.and_then(|c| c.uid).as_deref(), Some("abc"));
+    }
+
+    fn exited(code: i32) -> ContainerStatus {
+        ContainerStatus {
+            name: "import".into(),
+            state: Some(k8s_openapi::api::core::v1::ContainerState {
+                terminated: Some(k8s_openapi::api::core::v1::ContainerStateTerminated {
+                    exit_code: code,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_import_counts_only_for_the_url_it_imported() {
+        let mut p = Pod {
+            metadata: ObjectMeta {
+                annotations: Some(
+                    [(
+                        anchor::IMPORT_SOURCE_ANNOTATION.to_owned(),
+                        anchor::source_digest("https://a/d.raw"),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                container_statuses: Some(vec![exited(0)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(import_pod_succeeded(&p, "https://a/d.raw"));
+        assert!(!import_pod_succeeded(&p, "https://b/d.raw"));
+        p.status = Some(k8s_openapi::api::core::v1::PodStatus {
+            container_statuses: Some(vec![exited(1)]),
+            ..Default::default()
+        });
+        assert!(!import_pod_succeeded(&p, "https://a/d.raw"));
+    }
+
+    #[test]
+    fn legacy_init_container_imports_are_matched_by_url() {
+        let p = Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                init_containers: Some(vec![k8s_openapi::api::core::v1::Container {
+                    name: "import".into(),
+                    args: Some(vec!["import".into(), "--url=https://a/d.raw".into()]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            status: Some(k8s_openapi::api::core::v1::PodStatus {
+                init_container_statuses: Some(vec![exited(0)]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(legacy_import_succeeded(&p, "https://a/d.raw"));
+        assert!(!legacy_import_succeeded(&p, "https://b/d.raw"));
+    }
+
+    #[test]
+    fn finds_pods_that_use_a_claim() {
+        let pod = |claim: &str| Pod {
+            spec: Some(k8s_openapi::api::core::v1::PodSpec {
+                volumes: Some(vec![k8s_openapi::api::core::v1::Volume {
+                    name: "root-disk".into(),
+                    persistent_volume_claim: Some(
+                        k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                            claim_name: claim.into(),
+                            read_only: None,
+                        },
+                    ),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(uses_claim(&pod("web-root"), "web-root"));
+        assert!(!uses_claim(&pod("db-root"), "web-root"));
+        assert!(!uses_claim(&Pod::default(), "web-root"));
     }
 }

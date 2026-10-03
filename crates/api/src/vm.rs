@@ -37,7 +37,9 @@ pub struct VirtualMachineSpec {
     #[serde(default)]
     pub run_policy: RunPolicy,
 
-    /// The disk the VM boots from.
+    /// The disk the VM boots from. Immutable: the disk's content and claim
+    /// are bound to it; create a new VirtualMachine for another disk.
+    #[x_kube(validation = kube::core::Rule::new("self == oldSelf").message("rootDisk is immutable; create a new VirtualMachine to use another disk"))]
     pub root_disk: RootDisk,
 
     /// Networks of the VM. v1alpha1 supports exactly one network, the pod

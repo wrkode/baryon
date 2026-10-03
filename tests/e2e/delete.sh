@@ -3,7 +3,7 @@
 # check that nothing is left in the cluster or on the node.
 #
 # Cases:
-#   import    delete while the root disk is being imported (init container)
+#   import    delete while the root disk is being imported (import Pod)
 #   booting   delete after the VMM started, before the guest showed boot
 #             evidence
 #   pending   delete while the Anchor Pod cannot be scheduled
@@ -29,12 +29,13 @@ trap cleanup EXIT
 
 pod_uid_of() { "${k[@]}" get pod "$1-anchor" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
 importing() {
-  [ -n "$("${k[@]}" get pod "$1-anchor" -o jsonpath='{.status.initContainerStatuses[0].state.running}' 2>/dev/null)" ]
+  [ -n "$("${k[@]}" get pod "$1-import" -o jsonpath='{.status.containerStatuses[0].state.running}' 2>/dev/null)" ]
 }
 reason_is() { [ "$(vm_reason "$1")" = "$2" ]; }
 gone() {
   ! "${k[@]}" get virtualmachine "$1" >/dev/null 2>&1 \
     && ! "${k[@]}" get pod "$1-anchor" >/dev/null 2>&1 \
+    && ! "${k[@]}" get pod "$1-import" >/dev/null 2>&1 \
     && ! "${k[@]}" get pvc "$1-root" >/dev/null 2>&1
 }
 
@@ -42,7 +43,7 @@ gone() {
 delete_and_check() {
   local name="$1" v="$2" uid="$3" node="${4:-}"
   "${k[@]}" delete virtualmachine "$v" --wait=false >/dev/null
-  wait_for "$name: VirtualMachine, Anchor Pod, and root disk claim removed" gone "$v"
+  wait_for "$name: VirtualMachine, its pods, and root disk claim removed" gone "$v"
   if [ -n "$uid" ]; then
     host_leftovers "$name" "$node=$uid"
   fi
@@ -51,8 +52,30 @@ delete_and_check() {
 log "case import: delete while the disk is imported"
 v="e2e-del-import-$run"; vms+=("$v")
 apply_vm "$v"
-wait_for "import: import init container running" importing "$v"
-delete_and_check import "$v" "$(pod_uid_of "$v")" "$(node_of_pod "$v-anchor")"
+wait_for "import: import Pod running" importing "$v"
+limits="$("${k[@]}" get pod "$v-import" -o jsonpath='{.spec.containers[0].resources.limits}')"
+case "$limits" in
+  *'virtualization.baryon.io/import'*) case "$limits" in
+    *'virtualization.baryon.io/vm'*) bad "import: import Pod requests a VM slot" ;;
+    *) ok "import: import Pod requests only the placement slot" ;;
+  esac ;;
+  *) bad "import: import Pod does not request the placement slot" ;;
+esac
+if [ -n "${NODE_SHELL:-}" ]; then
+  # The importer must see neither /dev/kvm nor the baryon-virtd anchor socket.
+  inode="$(node_of_pod "$v-import")"
+  seen="$(host "$inode" "for c in /proc/[0-9]*/cmdline; do case \"\$(tr '\\0' ' ' < \$c 2>/dev/null)\" in /baryon-anchor\ import*) r=\${c%/cmdline}/root; echo importer; ls -d \$r/dev/kvm \$r/run/baryon/anchor 2>/dev/null;; esac; done" || true)"
+  paths="$(printf '%s\n' "$seen" | grep -v '^importer$' | grep . || true)"
+  if ! printf '%s\n' "$seen" | grep -qx importer; then
+    bad "import: importer process not found on $inode"
+  elif [ -z "$paths" ]; then
+    ok "import: importer has no /dev/kvm and no anchor socket"
+  else
+    bad "import: importer sees $paths"
+  fi
+fi
+"${k[@]}" get pod "$v-anchor" >/dev/null 2>&1 && bad "import: an Anchor Pod exists before the import finished" || ok "import: no Anchor Pod while importing"
+delete_and_check import "$v" "$("${k[@]}" get pod "$v-import" -o jsonpath='{.metadata.uid}')" "$(node_of_pod "$v-import")"
 
 log "case booting: delete after the VMM started, before boot evidence"
 v="e2e-del-boot-$run"; vms+=("$v")

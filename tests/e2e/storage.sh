@@ -48,6 +48,7 @@ cloud_init_done() {
 init_containers() {
   "${k[@]}" get pod "$vm-anchor" -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null
 }
+import_pod_absent() { ! "${k[@]}" get pod "$vm-import" >/dev/null 2>&1; }
 # vmm_disk_types <node> <pod-uid>: counts of the file types the VMM of an
 # Anchor Pod has open.
 vmm_disk_types() {
@@ -61,16 +62,17 @@ check_persisted() {
   local n; n="$(host_keys_generated "$2" "$3")"
   if [ "${n:-0}" -eq 0 ]; then ok "$1: guest booted from the existing disk"; else bad "$1: guest generated SSH host keys again (fresh disk)"; fi
 }
-# check_no_import <label>: the Anchor Pod has no import init container.
+# check_no_import <label>: no import Pod, and no import init container.
 check_no_import() {
+  if ! import_pod_absent; then bad "$1: an import Pod runs again"; return; fi
   case " $(init_containers) " in
     *" import "*) bad "$1: Anchor Pod imports again" ;;
-    *) ok "$1: Anchor Pod does not import again" ;;
+    *) ok "$1: no import runs again" ;;
   esac
 }
 
 cleanup() {
-  "${k[@]}" delete virtualmachine "$vm" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  "${k[@]}" delete virtualmachine "$vm" "$vm-second" --ignore-not-found --wait=false >/dev/null 2>&1 || true
   [ -n "${cordoned:-}" ] && kubectl "${ctx[@]}" uncordon "$cordoned" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
@@ -107,8 +109,10 @@ if [ -n "$sc" ]; then
   [ "$(claim_field '{.spec.storageClassName}')" = "$sc" ] && ok "claim uses StorageClass $sc" || bad "claim StorageClass is $(claim_field '{.spec.storageClassName}')"
 fi
 [ "$(claim_field '{.status.phase}')" = Bound ] && ok "claim is bound" || bad "claim is not bound"
-recorded() { [ "$(claim_field '{.metadata.annotations.virtualization\.baryon\.io/imported-from}')" = "$url" ]; }
+source_digest="sha256:$(printf '%s' "$url" | sha256sum | cut -d' ' -f1)"
+recorded() { [ "$(claim_field '{.metadata.annotations.virtualization\.baryon\.io/imported-from}')" = "$source_digest" ]; }
 wait_for "completed import recorded on the claim" recorded
+wait_for "import Pod removed after the import" import_pod_absent
 pv="$(claim_field '{.spec.volumeName}')"
 
 if [ -n "${NODE_SHELL:-}" ]; then
@@ -122,6 +126,25 @@ if [ -n "${NODE_SHELL:-}" ]; then
     if printf '%s\n' "$types" | grep -q 'regular file'; then ok "VMM has the disk image open"; else bad "VMM has no regular file open: $types"; fi
   fi
 fi
+
+log "a second VM on the same claim is refused"
+other="$vm-second"
+"${k[@]}" apply -f - >/dev/null <<EOF
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: $other
+spec:
+  className: general-small
+  rootDisk:
+    source:
+      persistentVolumeClaim:
+        claimName: $vm-root
+EOF
+claim_in_use() { [ "$(vm_reason "$other")" = ClaimInUse ]; }
+wait_for "second VM reports ClaimInUse" claim_in_use
+if "${k[@]}" get pod "$other-anchor" >/dev/null 2>&1; then bad "second VM got an Anchor Pod"; else ok "second VM has no Anchor Pod"; fi
+"${k[@]}" delete virtualmachine "$other" --wait=true >/dev/null
 
 log "replacing the Anchor Pod (pod deleted)"
 "${k[@]}" delete pod "$vm-anchor" --wait=false >/dev/null

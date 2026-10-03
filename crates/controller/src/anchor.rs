@@ -6,6 +6,10 @@
 //! grants /dev/kvm and the baryon-virtd anchor socket through the device
 //! plugin. It needs no hostPath, no capabilities, and no API credentials, and
 //! satisfies the Pod Security "restricted" level.
+//!
+//! An imported disk is written by a separate import Pod before the first
+//! Anchor Pod exists (ADR 0006), so a guest never runs on a disk whose
+//! import baryon-controller has not recorded.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +34,23 @@ use baryon_runtime_api::identity::VmIdentity;
 pub(crate) const SPEC_HASH_ANNOTATION: &str = "virtualization.baryon.io/spec-hash";
 /// Name of the anchor container in the Anchor Pod.
 pub(crate) const ANCHOR_CONTAINER: &str = "anchor";
+/// Name of the importer container, in the import Pod and in Anchor Pods
+/// created by earlier releases (as an init container).
+pub(crate) const IMPORT_CONTAINER: &str = "import";
+/// Annotation on the import Pod with the source it imports, as
+/// [`source_digest`].
+pub(crate) const IMPORT_SOURCE_ANNOTATION: &str = "virtualization.baryon.io/import-source";
+
+/// `sha256:<hex>` of an image URL: identifies the source in annotations
+/// without copying the URL, which may carry a token.
+pub(crate) fn source_digest(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let d = Sha256::digest(url.as_bytes());
+    let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+    format!("sha256:{hex}")
+}
+/// Label on the import Pod with the VM's UID.
+pub(crate) const IMPORT_FOR_LABEL: &str = "virtualization.baryon.io/import-for";
 
 /// Everything needed to build an Anchor Pod.
 #[derive(Debug, Clone)]
@@ -42,7 +63,8 @@ pub(crate) struct AnchorInput {
     pub guest_memory_bytes: u64,
     pub claim_name: String,
     pub disk_mode: DiskMode,
-    /// Image import for a new claim: URL, optional SHA-256, disk size.
+    /// Image import into a new claim: URL, optional SHA-256, disk size.
+    /// Used by the import Pod only.
     pub import: Option<(String, Option<String>, u64)>,
     pub anchor_image: String,
     pub restarted_at: Option<String>,
@@ -54,8 +76,7 @@ pub(crate) struct AnchorInput {
 impl AnchorInput {
     /// Hash of what the VM's spec and class determine. The anchor image is
     /// not part of it: a newer runtime is reported separately.
-    /// Whether an import is still pending is not part of it: it changes when
-    /// the import completes, which is not a spec change.
+    /// The import is not part of it: it runs in its own pod.
     pub(crate) fn spec_hash(&self) -> String {
         resources::spec_hash(&[
             &self.vcpus.to_string(),
@@ -131,48 +152,30 @@ pub(crate) enum BuildError {
     Encode(#[from] serde_json::Error),
     #[error("VM identity: {0}")]
     Identity(#[from] baryon_runtime_api::identity::IdentityError),
+    #[error("the VM has no image to import")]
+    NoImport,
 }
 
-/// Build the Anchor Pod.
-pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
-    // The Anchor container, and with it the VMM, runs as the VM's identity.
-    // The pod-level fsGroup gives filesystem volumes that support ownership
-    // management to the same group.
-    let identity = VmIdentity::for_vm(&input.vm_uid)?;
-    let uid = i64::from(identity.uid());
-    let gid = i64::from(identity.gid());
+/// One slot of `slot_resource`, and the CPU and memory of the VM, as
+/// requests equal to limits.
+fn vm_resources(input: &AnchorInput, slot_resource: &str) -> ResourceRequirements {
     let memory = resources::pod_memory_bytes(input.guest_memory_bytes).to_string();
     let cpu = input.vcpus.to_string();
-
-    let mut labels = BTreeMap::new();
-    labels.insert(keys::VM_NAME_LABEL.to_owned(), input.vm_name.clone());
-    labels.insert(keys::VM_UID_LABEL.to_owned(), input.vm_uid.clone());
-    labels.insert(
-        keys::MANAGED_BY_LABEL.to_owned(),
-        keys::MANAGED_BY.to_owned(),
-    );
-
-    let mut annotations = BTreeMap::new();
-    annotations.insert(SPEC_HASH_ANNOTATION.to_owned(), input.spec_hash());
-    if let Some(r) = &input.restarted_at {
-        annotations.insert(keys::RESTARTED_AT_ANNOTATION.to_owned(), r.clone());
-    }
-
-    let resources = ResourceRequirements {
-        requests: Some(BTreeMap::from([
-            ("cpu".to_owned(), q(cpu.clone())),
-            ("memory".to_owned(), q(memory.clone())),
-            (keys::VM_RESOURCE.to_owned(), q("1")),
-        ])),
-        limits: Some(BTreeMap::from([
-            ("cpu".to_owned(), q(cpu)),
-            ("memory".to_owned(), q(memory)),
-            (keys::VM_RESOURCE.to_owned(), q("1")),
-        ])),
+    let list = BTreeMap::from([
+        ("cpu".to_owned(), q(cpu)),
+        ("memory".to_owned(), q(memory)),
+        (slot_resource.to_owned(), q("1")),
+    ]);
+    ResourceRequirements {
+        requests: Some(list.clone()),
+        limits: Some(list),
         ..Default::default()
-    };
+    }
+}
 
-    let (disk_mounts, disk_devices) = match input.disk_mode {
+/// How a container sees the root disk: a mount or a device.
+fn disk_access(mode: DiskMode) -> (Vec<VolumeMount>, Option<Vec<VolumeDevice>>) {
+    match mode {
         DiskMode::Filesystem => (
             vec![VolumeMount {
                 name: "root-disk".to_owned(),
@@ -188,10 +191,120 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
                 device_path: ROOT_DISK_DEVICE.to_owned(),
             }]),
         ),
+    }
+}
+
+/// The pod-level part shared by the Anchor Pod and the import Pod: the
+/// claim volume, the VM's identity, placement constraints.
+fn vm_pod_spec(
+    input: &AnchorInput,
+    containers: Vec<Container>,
+    restart: &str,
+) -> Result<PodSpec, BuildError> {
+    // Containers run as the VM's identity. The pod-level fsGroup gives
+    // filesystem volumes that support ownership management to the same
+    // group.
+    let identity = VmIdentity::for_vm(&input.vm_uid)?;
+    let uid = i64::from(identity.uid());
+    let gid = i64::from(identity.gid());
+    Ok(PodSpec {
+        containers,
+        volumes: Some(vec![Volume {
+            name: "root-disk".to_owned(),
+            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                claim_name: input.claim_name.clone(),
+                read_only: None,
+            }),
+            ..Default::default()
+        }]),
+        affinity: avoid_nodes_affinity(&input.avoid_nodes),
+        restart_policy: Some(restart.to_owned()),
+        automount_service_account_token: Some(false),
+        enable_service_links: Some(false),
+        security_context: Some(PodSecurityContext {
+            run_as_non_root: Some(true),
+            run_as_user: Some(uid),
+            run_as_group: Some(gid),
+            fs_group: Some(gid),
+            seccomp_profile: Some(SeccompProfile {
+                type_: "RuntimeDefault".to_owned(),
+                localhost_profile: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+/// Build the import Pod: it writes the image into the root disk claim and
+/// exits. It requests the VM's CPU and memory and one
+/// `virtualization.baryon.io/import` slot, which has the health of the
+/// node's VM slots but grants no device or socket, so a claim that binds on
+/// first use (WaitForFirstConsumer) binds on a node that can run the VM.
+pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
+    let (url, sha, size) = input.import.as_ref().ok_or(BuildError::NoImport)?;
+    let mut args = vec![
+        "import".to_owned(),
+        format!("--url={url}"),
+        format!("--size-bytes={size}"),
+    ];
+    if let Some(s) = sha {
+        args.push(format!("--sha256={s}"));
+    }
+    if input.disk_mode == DiskMode::Block {
+        args.push(format!("--device={ROOT_DISK_DEVICE}"));
+    }
+    let (mounts, devices) = disk_access(input.disk_mode);
+    let importer = Container {
+        name: IMPORT_CONTAINER.to_owned(),
+        image: Some(input.anchor_image.clone()),
+        args: Some(args),
+        resources: Some(vm_resources(input, keys::IMPORT_RESOURCE)),
+        volume_mounts: Some(mounts),
+        volume_devices: devices,
+        security_context: Some(restricted_container_security()),
+        termination_message_policy: Some("File".to_owned()),
+        ..Default::default()
     };
+    let labels = BTreeMap::from([
+        (IMPORT_FOR_LABEL.to_owned(), input.vm_uid.clone()),
+        (
+            keys::MANAGED_BY_LABEL.to_owned(),
+            keys::MANAGED_BY.to_owned(),
+        ),
+    ]);
+    let annotations = BTreeMap::from([(IMPORT_SOURCE_ANNOTATION.to_owned(), source_digest(url))]);
+    Ok(Pod {
+        metadata: ObjectMeta {
+            name: Some(resources::import_pod_name(&input.vm_name)),
+            namespace: Some(input.vm_namespace.clone()),
+            labels: Some(labels),
+            annotations: Some(annotations),
+            owner_references: Some(vec![input.owner.clone()]),
+            ..Default::default()
+        },
+        spec: Some(vm_pod_spec(input, vec![importer], "OnFailure")?),
+        status: None,
+    })
+}
 
-    let anchor_mounts = disk_mounts.clone();
+/// Build the Anchor Pod.
+pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
+    let mut labels = BTreeMap::new();
+    labels.insert(keys::VM_NAME_LABEL.to_owned(), input.vm_name.clone());
+    labels.insert(keys::VM_UID_LABEL.to_owned(), input.vm_uid.clone());
+    labels.insert(
+        keys::MANAGED_BY_LABEL.to_owned(),
+        keys::MANAGED_BY.to_owned(),
+    );
 
+    let mut annotations = BTreeMap::new();
+    annotations.insert(SPEC_HASH_ANNOTATION.to_owned(), input.spec_hash());
+    if let Some(r) = &input.restarted_at {
+        annotations.insert(keys::RESTARTED_AT_ANNOTATION.to_owned(), r.clone());
+    }
+
+    let (mounts, devices) = disk_access(input.disk_mode);
     let anchor = Container {
         name: ANCHOR_CONTAINER.to_owned(),
         image: Some(input.anchor_image.clone()),
@@ -201,7 +314,7 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
             value: Some(input.anchor_spec().to_json()?),
             value_from: None,
         }]),
-        resources: Some(resources),
+        resources: Some(vm_resources(input, keys::VM_RESOURCE)),
         readiness_probe: Some(Probe {
             exec: Some(ExecAction {
                 command: Some(vec!["/baryon-anchor".to_owned(), "probe".to_owned()]),
@@ -209,62 +322,17 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
             period_seconds: Some(2),
             ..Default::default()
         }),
-        volume_mounts: Some(anchor_mounts),
-        volume_devices: disk_devices.clone(),
+        volume_mounts: Some(mounts),
+        volume_devices: devices,
         security_context: Some(restricted_container_security()),
         termination_message_policy: Some("File".to_owned()),
         ..Default::default()
     };
 
-    let init_containers = input.import.as_ref().map(|(url, sha, size)| {
-        let mut args = vec![
-            "import".to_owned(),
-            format!("--url={url}"),
-            format!("--size-bytes={size}"),
-        ];
-        if let Some(s) = sha {
-            args.push(format!("--sha256={s}"));
-        }
-        if input.disk_mode == DiskMode::Block {
-            args.push(format!("--device={ROOT_DISK_DEVICE}"));
-        }
-        vec![Container {
-            name: "import".to_owned(),
-            image: Some(input.anchor_image.clone()),
-            args: Some(args),
-            // Every container needs limits, or the pod has no pod-level memory
-            // limit and the VMM would run unbounded. Init container requests
-            // do not add to the pod's scheduled resources when they are below
-            // the main container's.
-            resources: Some(ResourceRequirements {
-                requests: Some(BTreeMap::from([
-                    ("cpu".to_owned(), q("1")),
-                    ("memory".to_owned(), q("256Mi")),
-                ])),
-                limits: Some(BTreeMap::from([
-                    ("cpu".to_owned(), q("1")),
-                    ("memory".to_owned(), q("256Mi")),
-                ])),
-                ..Default::default()
-            }),
-            volume_mounts: Some(disk_mounts.clone()),
-            volume_devices: disk_devices.clone(),
-            security_context: Some(restricted_container_security()),
-            termination_message_policy: Some("File".to_owned()),
-            ..Default::default()
-        }]
-    });
-
-    let mut volumes = vec![Volume {
-        name: "root-disk".to_owned(),
-        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-            claim_name: input.claim_name.clone(),
-            read_only: None,
-        }),
-        ..Default::default()
-    }];
-    volumes.sort_by(|a, b| a.name.cmp(&b.name));
-
+    let mut spec = vm_pod_spec(input, vec![anchor], "Always")?;
+    spec.termination_grace_period_seconds = Some(i64::from(
+        resources::STOP_GRACE_SECONDS + resources::TERMINATION_MARGIN_SECONDS,
+    ));
     Ok(Pod {
         metadata: ObjectMeta {
             name: Some(resources::anchor_pod_name(&input.vm_name)),
@@ -274,30 +342,7 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
             owner_references: Some(vec![input.owner.clone()]),
             ..Default::default()
         },
-        spec: Some(PodSpec {
-            containers: vec![anchor],
-            init_containers,
-            volumes: Some(volumes),
-            affinity: avoid_nodes_affinity(&input.avoid_nodes),
-            restart_policy: Some("Always".to_owned()),
-            termination_grace_period_seconds: Some(i64::from(
-                resources::STOP_GRACE_SECONDS + resources::TERMINATION_MARGIN_SECONDS,
-            )),
-            automount_service_account_token: Some(false),
-            enable_service_links: Some(false),
-            security_context: Some(PodSecurityContext {
-                run_as_non_root: Some(true),
-                run_as_user: Some(uid),
-                run_as_group: Some(gid),
-                fs_group: Some(gid),
-                seccomp_profile: Some(SeccompProfile {
-                    type_: "RuntimeDefault".to_owned(),
-                    localhost_profile: None,
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        }),
+        spec: Some(spec),
         status: None,
     })
 }
@@ -338,11 +383,7 @@ mod tests {
         assert!(!json.contains("hostPath"));
         assert!(!json.contains("privileged"));
         assert_eq!(spec.automount_service_account_token, Some(false));
-        for c in spec
-            .containers
-            .iter()
-            .chain(spec.init_containers.iter().flatten())
-        {
+        for c in &spec.containers {
             let r = c.resources.as_ref().unwrap();
             assert_eq!(
                 r.requests, r.limits,
@@ -396,9 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn import_only_for_http_sources_and_block_mode_uses_devices() {
+    fn anchor_pod_never_imports_and_block_mode_uses_devices() {
         assert!(
-            build(&input(false))
+            build(&input(true))
                 .unwrap()
                 .spec
                 .unwrap()
@@ -423,27 +464,75 @@ mod tests {
     }
 
     #[test]
+    fn import_pod_runs_the_importer_like_the_anchor() {
+        assert!(matches!(
+            build_import(&input(false)),
+            Err(BuildError::NoImport)
+        ));
+        let mut i = input(true);
+        i.avoid_nodes = vec!["node2".into()];
+        let pod = build_import(&i).unwrap();
+        assert_eq!(pod.metadata.name.as_deref(), Some("web-import"));
+        let labels = pod.metadata.labels.as_ref().unwrap();
+        // Services select VMs by name; the import Pod must not match them.
+        assert!(!labels.contains_key(keys::VM_NAME_LABEL));
+        assert_eq!(labels[IMPORT_FOR_LABEL], i.vm_uid);
+        let source = &pod.metadata.annotations.as_ref().unwrap()[IMPORT_SOURCE_ANNOTATION];
+        assert_eq!(source, &source_digest("https://example.org/d.raw"));
+        assert!(source.starts_with("sha256:") && !source.contains("example.org"));
+        let spec = pod.spec.as_ref().unwrap();
+        let anchor = build(&i).unwrap().spec.unwrap();
+        assert_eq!(spec.restart_policy.as_deref(), Some("OnFailure"));
+        assert_eq!(spec.security_context, anchor.security_context);
+        assert_eq!(spec.affinity, anchor.affinity);
+        assert_eq!(spec.volumes, anchor.volumes);
+        assert_eq!(spec.automount_service_account_token, Some(false));
+        let c = &spec.containers[0];
+        // The VM's CPU and memory, but the placement-only slot: no /dev/kvm,
+        // no anchor socket.
+        let limits = c.resources.as_ref().unwrap().limits.as_ref().unwrap();
+        let anchor_limits = anchor.containers[0]
+            .resources
+            .as_ref()
+            .unwrap()
+            .limits
+            .as_ref()
+            .unwrap();
+        assert_eq!(limits["cpu"], anchor_limits["cpu"]);
+        assert_eq!(limits["memory"], anchor_limits["memory"]);
+        assert_eq!(limits[keys::IMPORT_RESOURCE].0, "1");
+        assert!(!limits.contains_key(keys::VM_RESOURCE));
+        assert_eq!(
+            c.resources.as_ref().unwrap().requests.as_ref(),
+            Some(limits)
+        );
+        let args = c.args.as_ref().unwrap();
+        assert_eq!(args[0], "import");
+        assert!(args.contains(&"--url=https://example.org/d.raw".to_owned()));
+        assert!(!args.iter().any(|a| a.starts_with("--device")));
+    }
+
+    #[test]
     fn block_import_writes_the_device() {
         let mut i = input(true);
         i.disk_mode = DiskMode::Block;
-        let pod = build(&i).unwrap();
-        let init = &pod.spec.unwrap().init_containers.unwrap()[0];
+        let pod = build_import(&i).unwrap();
+        let c = &pod.spec.unwrap().containers[0];
         assert!(
-            init.args
+            c.args
                 .as_ref()
                 .unwrap()
                 .contains(&format!("--device={ROOT_DISK_DEVICE}"))
         );
         assert_eq!(
-            init.volume_devices.as_ref().unwrap()[0].device_path,
+            c.volume_devices.as_ref().unwrap()[0].device_path,
             ROOT_DISK_DEVICE
         );
-        assert!(init.volume_mounts.as_ref().unwrap().is_empty());
+        assert!(c.volume_mounts.as_ref().unwrap().is_empty());
     }
 
     #[test]
-    fn hash_ignores_a_pending_import() {
-        // The import completing must not look like a spec change.
+    fn hash_ignores_the_import() {
         assert_eq!(input(true).spec_hash(), input(false).spec_hash());
     }
 

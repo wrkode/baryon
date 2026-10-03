@@ -82,7 +82,9 @@ spec:
                 - message: exactly one network with source pod is supported
                   rule: self.size() == 1 && has(self[0].pod)
               rootDisk:
-                description: The disk the VM boots from.
+                description: |-
+                  The disk the VM boots from. Immutable: the disk's content and claim
+                  are bound to it; create a new VirtualMachine for another disk.
                 properties:
                   size:
                     description: |-
@@ -160,6 +162,8 @@ spec:
                     volumeMode applies to claims Baryon creates; an existing claim is used with its
                     own volumeMode
                   rule: "!has(self.volumeMode) || has(self.source.http)"
+                - message: rootDisk is immutable; create a new VirtualMachine to use another disk
+                  rule: self == oldSelf
               runPolicy:
                 default: Running
                 description: Whether the VM should be running. Changing it starts or stops the VM.

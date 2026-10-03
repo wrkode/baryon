@@ -1,4 +1,5 @@
-//! Kubelet device plugin for the `virtualization.baryon.io/vm` resource.
+//! Kubelet device plugins for the `virtualization.baryon.io/vm` and
+//! `virtualization.baryon.io/import` resources.
 //!
 //! Every node with a healthy Baryon runtime advertises a fixed number of VM
 //! slots. Anchor Pods request one slot. This gives Baryon three things
@@ -10,6 +11,10 @@
 //!   container cgroup may use it
 //! - the baryon-virtd anchor socket mounted into the container without a
 //!   hostPath volume in the pod spec
+//!
+//! The import resource has the same slots and health but grants nothing: it
+//! only places the import Pod on a node that can run the VM, without
+//! /dev/kvm or the anchor socket.
 //!
 //! Protocol: k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1.
 
@@ -49,7 +54,6 @@ use api::{
 };
 
 const API_VERSION: &str = "v1beta1";
-const PLUGIN_SOCKET: &str = "baryon-vm.sock";
 const KUBELET_SOCKET: &str = "kubelet.sock";
 
 /// Device plugin settings.
@@ -59,7 +63,11 @@ pub(crate) struct PluginConfig {
     /// /var/lib/kubelet/device-plugins. The kubelet uses this fixed path whatever
     /// its root directory is (k0s included).
     pub plugin_dir: PathBuf,
+    /// Socket file name in `plugin_dir`.
+    pub socket_name: String,
     pub resource_name: String,
+    /// Whether an allocation grants /dev/kvm and the anchor socket.
+    pub grants: bool,
     pub slots: u32,
     pub kvm_device: PathBuf,
     /// Host directory holding the baryon-virtd anchor socket.
@@ -137,6 +145,11 @@ impl DevicePlugin for Plugin {
         req: Request<AllocateRequest>,
     ) -> Result<Response<AllocateResponse>, Status> {
         let n = req.into_inner().container_requests.len();
+        if !self.cfg.grants {
+            return Ok(Response::new(AllocateResponse {
+                container_responses: vec![ContainerAllocateResponse::default(); n],
+            }));
+        }
         let one = ContainerAllocateResponse {
             devices: vec![DeviceSpec {
                 container_path: "/dev/kvm".to_owned(),
@@ -171,7 +184,7 @@ pub(crate) async fn run(
     health: watch::Receiver<bool>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    let socket = cfg.plugin_dir.join(PLUGIN_SOCKET);
+    let socket = cfg.plugin_dir.join(&cfg.socket_name);
     while !cancel.is_cancelled() {
         let _ = std::fs::remove_file(&socket);
         let listener = match UnixListener::bind(&socket) {
@@ -231,7 +244,7 @@ async fn register(cfg: &PluginConfig) -> anyhow::Result<()> {
     RegistrationClient::new(channel)
         .register(RegisterRequest {
             version: API_VERSION.to_owned(),
-            endpoint: PLUGIN_SOCKET.to_owned(),
+            endpoint: cfg.socket_name.clone(),
             resource_name: cfg.resource_name.clone(),
             options: Some(DevicePluginOptions::default()),
         })
@@ -266,7 +279,9 @@ mod tests {
         Plugin {
             cfg: PluginConfig {
                 plugin_dir: "/var/lib/kubelet/device-plugins".into(),
+                socket_name: "baryon-vm.sock".into(),
                 resource_name: "virtualization.baryon.io/vm".into(),
+                grants: true,
                 slots: 3,
                 kvm_device: "/dev/kvm".into(),
                 anchor_socket_dir: "/run/baryon/anchor".into(),
@@ -303,5 +318,22 @@ mod tests {
         assert_eq!(c.devices[0].permissions, "rw");
         assert_eq!(c.mounts[0].host_path, "/run/baryon/anchor");
         assert!(c.mounts[0].read_only);
+    }
+
+    #[tokio::test]
+    async fn the_import_resource_grants_nothing() {
+        let mut p = plugin(true);
+        p.cfg.grants = false;
+        let resp = p
+            .allocate(Request::new(AllocateRequest {
+                container_requests: vec![Default::default(), Default::default()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.container_responses.len(), 2);
+        for c in &resp.container_responses {
+            assert!(c.devices.is_empty() && c.mounts.is_empty() && c.envs.is_empty());
+        }
     }
 }

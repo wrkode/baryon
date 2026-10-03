@@ -47,6 +47,26 @@ spec:
     source:
       http: {url: "https://example.org/d.raw"}
 YAML
+k apply -f - >/dev/null <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: immutable-disk, namespace: default}
+spec:
+  className: general-small
+  runPolicy: Stopped
+  rootDisk:
+    size: 4Gi
+    source:
+      http: {url: "https://example.org/a.raw"}
+YAML
+if k patch virtualmachine immutable-disk -n default --type merge \
+  -p '{"spec":{"rootDisk":{"source":{"http":{"url":"https://example.org/b.raw"}}}}}' >/dev/null 2>&1; then
+  echo "accepted but must be rejected: rootDisk change" >&2; exit 1
+fi
+echo "rejected as expected: rootDisk change"
+k patch virtualmachine immutable-disk -n default --type merge -p '{"spec":{"runPolicy":"Running"}}' >/dev/null
+echo "accepted as expected: runPolicy change"
+k delete virtualmachine immutable-disk -n default --wait=false >/dev/null
 cat deploy/base/namespace.yaml deploy/base/policy/*.yaml | k apply -f -
 vmpod='apiVersion: v1
 kind: Pod
@@ -64,5 +84,24 @@ for i in $(seq 1 30); do
 done
 echo "$out" | grep -q baryon-vm-resource || { echo "pod requesting the vm resource was not denied" >&2; exit 1; }
 echo "vm resource pod denied as expected"
+importpod="$(printf '%s\n' "$vmpod" | sed 's/name: vm-pod/name: import-pod/; s#virtualization.baryon.io/vm#virtualization.baryon.io/import#')"
+out="$(printf '%s\n' "$importpod" | k apply --dry-run=server -f - 2>&1 || true)"
+echo "$out" | grep -q baryon-vm-resource || { echo "pod requesting the import resource was not denied: $out" >&2; exit 1; }
+echo "import resource pod denied as expected"
+initpod='apiVersion: v1
+kind: Pod
+metadata: {name: init-pod, namespace: default}
+spec:
+  initContainers:
+    - name: i
+      image: busybox:1.36
+      resources:
+        limits: {virtualization.baryon.io/vm: "1"}
+  containers:
+    - name: c
+      image: busybox:1.36'
+out="$(printf '%s\n' "$initpod" | k apply --dry-run=server -f - 2>&1 || true)"
+echo "$out" | grep -q baryon-vm-resource || { echo "init container requesting the vm resource was not denied: $out" >&2; exit 1; }
+echo "init container vm resource pod denied as expected"
 k run plain --image=busybox:1.36 --dry-run=server -o name
 echo "all API server checks passed"

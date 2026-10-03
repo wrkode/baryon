@@ -30,6 +30,12 @@ pub(crate) fn anchor_pod_name(vm: &str) -> String {
     bounded_name(vm, "-anchor", 253)
 }
 
+/// Name of a VM's import Pod, which writes an imported image into the root
+/// disk claim before the first Anchor Pod exists.
+pub(crate) fn import_pod_name(vm: &str) -> String {
+    bounded_name(vm, "-import", 253)
+}
+
 /// Name of the root disk claim Baryon creates for imported disks.
 pub(crate) fn root_claim_name(vm: &str) -> String {
     bounded_name(vm, "-root", 253)

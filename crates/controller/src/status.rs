@@ -21,6 +21,8 @@ pub(crate) struct Observed<'a> {
     pub claim_name: Option<String>,
     pub claim: Option<&'a PersistentVolumeClaim>,
     pub pod: Option<&'a Pod>,
+    /// The import Pod, while an import is pending.
+    pub import_pod: Option<&'a Pod>,
     pub has_import: bool,
     pub restart_reason: Option<RestartReason>,
     pub mac_address: Option<String>,
@@ -67,6 +69,30 @@ fn split_reason(msg: &str) -> (String, String) {
     }
 }
 
+/// The PodScheduled reason and message of a pod that is not bound to a
+/// node, if the scheduler reported one.
+fn unscheduled(pod: &Pod) -> Option<(String, String)> {
+    if pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.node_name.as_ref())
+        .is_some()
+    {
+        return None;
+    }
+    let c = pod
+        .status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "PodScheduled" && c.status == "False")?;
+    Some((
+        c.reason.clone().unwrap_or_else(|| "Pending".to_owned()),
+        c.message.clone().unwrap_or_default(),
+    ))
+}
+
 pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> VirtualMachineStatus {
     let previous = vm.status.clone().unwrap_or_default();
     let generation = vm.metadata.generation;
@@ -85,14 +111,28 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
         .and_then(|c| c.status.as_ref())
         .and_then(|s| s.phase.as_deref())
         == Some("Bound");
-    let import = obs.pod.and_then(|p| {
-        container(
-            p.status
-                .as_ref()
-                .and_then(|s| s.init_container_statuses.as_ref()),
-            "import",
-        )
-    });
+    // The importer runs in the import Pod; Anchor Pods of earlier releases
+    // ran it as an init container.
+    let import = obs
+        .import_pod
+        .and_then(|p| {
+            container(
+                p.status
+                    .as_ref()
+                    .and_then(|s| s.container_statuses.as_ref()),
+                "import",
+            )
+        })
+        .or_else(|| {
+            obs.pod.and_then(|p| {
+                container(
+                    p.status
+                        .as_ref()
+                        .and_then(|s| s.init_container_statuses.as_ref()),
+                    "import",
+                )
+            })
+        });
     let storage = if obs.claim.is_none() {
         ConditionUpdate::new(
             vm::STORAGE_READY,
@@ -105,7 +145,7 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
             vm::STORAGE_READY,
             false,
             "ClaimPending",
-            "the root disk claim is not bound yet (WaitForFirstConsumer claims bind when the Anchor Pod is scheduled)",
+            "the root disk claim is not bound yet (WaitForFirstConsumer claims bind when the import or Anchor Pod is scheduled)",
         )
     } else if obs.has_import {
         match import {
@@ -129,17 +169,11 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
                     "importing the disk image",
                 ),
             },
-            None if obs.pod.is_some() => ConditionUpdate::new(
+            None => ConditionUpdate::new(
                 vm::STORAGE_READY,
                 false,
                 "ImportPending",
                 "waiting for the import to start",
-            ),
-            None => ConditionUpdate::new(
-                vm::STORAGE_READY,
-                true,
-                "DiskReady",
-                "root disk claim is bound",
             ),
         }
     } else {
@@ -305,6 +339,25 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
         ));
         updates.extend(not_ready("Stopped", "runPolicy is Stopped"));
     } else if let Some((reason, message)) = &obs.blocked {
+        updates.push(ConditionUpdate::new(
+            vm::SCHEDULED,
+            false,
+            reason.clone(),
+            message.clone(),
+        ));
+        updates.extend(not_ready(reason, message));
+    } else if let Some((reason, message)) = obs.import_pod.and_then(unscheduled) {
+        // The import Pod requests the VM's resources; if it cannot be
+        // placed, neither can the VM.
+        updates.push(ConditionUpdate::new(
+            vm::SCHEDULED,
+            false,
+            reason.clone(),
+            message.clone(),
+        ));
+        updates.extend(not_ready(&reason, &message));
+    } else if let Some((reason, message)) = &storage_blocker {
+        // The Anchor Pod is created once the disk is ready.
         updates.push(ConditionUpdate::new(
             vm::SCHEDULED,
             false,
@@ -599,5 +652,124 @@ mod tests {
         );
         assert!(!changed(Some(&s), &again));
         assert!(changed(None, &s));
+    }
+
+    fn import_pod(state: ContainerState, last: Option<ContainerState>) -> Pod {
+        Pod {
+            metadata: kube::api::ObjectMeta {
+                name: Some("web-import".into()),
+                ..Default::default()
+            },
+            spec: Some(PodSpec::default()),
+            status: Some(PodStatus {
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "import".into(),
+                    state: Some(state),
+                    last_state: last,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn import_pod_progress_is_the_vm_state() {
+        let claim = bound_claim();
+        let running = import_pod(
+            ContainerState {
+                running: Some(ContainerStateRunning::default()),
+                ..Default::default()
+            },
+            None,
+        );
+        let s = derive(
+            &vm(),
+            &Observed {
+                claim: Some(&claim),
+                claim_name: Some("web-root".into()),
+                import_pod: Some(&running),
+                has_import: true,
+                ..Default::default()
+            },
+            now(),
+        );
+        for t in [vm::STORAGE_READY, vm::SCHEDULED, vm::READY] {
+            assert_eq!(cond(&s, t).status, "False", "{t}");
+            assert_eq!(cond(&s, t).reason, "ImportingDisk", "{t}");
+        }
+        assert!(s.anchor_pod.is_none());
+
+        let failed = import_pod(
+            ContainerState::default(),
+            Some(ContainerState {
+                terminated: Some(ContainerStateTerminated {
+                    exit_code: 1,
+                    message: Some("ImportFailed: SHA-256 mismatch".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        );
+        let s = derive(
+            &vm(),
+            &Observed {
+                claim: Some(&claim),
+                claim_name: Some("web-root".into()),
+                import_pod: Some(&failed),
+                has_import: true,
+                ..Default::default()
+            },
+            now(),
+        );
+        assert_eq!(cond(&s, vm::READY).reason, "ImportFailed");
+        assert_eq!(cond(&s, vm::READY).message, "SHA-256 mismatch");
+    }
+
+    #[test]
+    fn a_pending_import_without_pods_is_not_ready() {
+        let claim = bound_claim();
+        let s = derive(
+            &vm(),
+            &Observed {
+                claim: Some(&claim),
+                claim_name: Some("web-root".into()),
+                has_import: true,
+                ..Default::default()
+            },
+            now(),
+        );
+        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ImportPending");
+        assert_eq!(cond(&s, vm::READY).reason, "ImportPending");
+    }
+
+    #[test]
+    fn an_unschedulable_import_pod_is_reported() {
+        let claim = PersistentVolumeClaim::default(); // WaitForFirstConsumer: not bound yet
+        let mut p = import_pod(ContainerState::default(), None);
+        p.status = Some(PodStatus {
+            conditions: Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                type_: "PodScheduled".into(),
+                status: "False".into(),
+                reason: Some("Unschedulable".into()),
+                message: Some("0/3 nodes are available: 3 Insufficient memory.".into()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let s = derive(
+            &vm(),
+            &Observed {
+                claim: Some(&claim),
+                claim_name: Some("web-root".into()),
+                import_pod: Some(&p),
+                has_import: true,
+                ..Default::default()
+            },
+            now(),
+        );
+        assert_eq!(cond(&s, vm::SCHEDULED).reason, "Unschedulable");
+        assert_eq!(cond(&s, vm::READY).reason, "Unschedulable");
+        assert!(cond(&s, vm::READY).message.contains("Insufficient memory"));
     }
 }

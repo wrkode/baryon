@@ -1,9 +1,11 @@
 # Only baryon-controller may create pods that request the
-# virtualization.baryon.io/vm extended resource.
+# virtualization.baryon.io/vm or virtualization.baryon.io/import extended
+# resources.
 #
 # The device plugin hands /dev/kvm and the baryon-virtd anchor socket to every
-# container allocated that resource, so the resource is the gate to the node
-# runtime. baryon-virtd additionally requires each anchor to run as the uid
+# container allocated the vm resource, so that resource is the gate to the
+# node runtime. The import resource grants nothing; it is restricted so that
+# other pods cannot use up the slots that place import Pods. baryon-virtd additionally requires each anchor to run as the uid
 # derived from its VM (see docs/security.md); this policy keeps arbitrary pods
 # from reaching the socket at all.
 #
@@ -28,19 +30,18 @@ spec:
         operations: ["CREATE"]
         resources: ["pods"]
   matchConditions:
-    - name: requests-vm-resource
+    - name: requests-baryon-resource
       expression: >-
-        object.spec.containers.exists(c, has(c.resources) &&
-          ((has(c.resources.limits) && 'virtualization.baryon.io/vm' in c.resources.limits) ||
-           (has(c.resources.requests) && 'virtualization.baryon.io/vm' in c.resources.requests)))
-        ||
-        (has(object.spec.initContainers) && object.spec.initContainers.exists(c, has(c.resources) &&
-          ((has(c.resources.limits) && 'virtualization.baryon.io/vm' in c.resources.limits) ||
-           (has(c.resources.requests) && 'virtualization.baryon.io/vm' in c.resources.requests))))
+        [object.spec.containers,
+         has(object.spec.initContainers) ? object.spec.initContainers : []].exists(cs,
+          cs.exists(c, has(c.resources) &&
+            ['virtualization.baryon.io/vm', 'virtualization.baryon.io/import'].exists(r,
+              (has(c.resources.limits) && r in c.resources.limits) ||
+              (has(c.resources.requests) && r in c.resources.requests))))
   validations:
     - expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-controller'"
       messageExpression: >-
-        'only baryon-controller may create pods that request virtualization.baryon.io/vm; requested by ' + request.userInfo.username
+        'only baryon-controller may create pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import; requested by ' + request.userInfo.username
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1
