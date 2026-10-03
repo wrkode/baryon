@@ -1,0 +1,37 @@
+[package]
+name = "baryon-node-agent"
+description = "Kubernetes-facing Baryon node agent: device plugin and VirtualizationNode publisher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+baryon-api = { workspace = true }
+baryon-host = { workspace = true }
+baryon-runtime-api = { workspace = true }
+baryon-version = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true, features = ["client", "rustls-tls", "ring", "runtime"] }
+prost = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+protox = { workspace = true }
+tonic-prost-build = { workspace = true }
+
+[lints]
+workspace = true

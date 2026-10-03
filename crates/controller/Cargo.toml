@@ -1,0 +1,30 @@
+[package]
+name = "baryon-controller"
+description = "Baryon VirtualMachine controller"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+baryon-api = { workspace = true }
+baryon-runtime-api = { workspace = true }
+baryon-version = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+futures = { workspace = true }
+k8s-openapi = { workspace = true }
+kube = { workspace = true, features = ["client", "rustls-tls", "ring", "runtime"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

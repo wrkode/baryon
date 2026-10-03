@@ -1,0 +1,166 @@
+syntax = "proto3";
+
+// Protocol between Baryon node components and baryon-virtd.
+//
+// Transport is gRPC over Unix domain sockets on the node. baryon-virtd never
+// listens on TCP. Callers of AnchorService are identified by kernel peer
+// credentials of the connection, never by fields in these messages.
+//
+// Compatibility: fields are only added, never renumbered or reused. Clients
+// compare RuntimeInfo.protocol with the package name they were built with.
+package baryon.runtime.v1alpha1;
+
+// Served on /run/baryon/anchor/virtd.sock to baryon-anchor processes.
+service AnchorService {
+  // Attach asks baryon-virtd to run the VM described by spec for the
+  // caller's pod and streams its status. If a VM for this pod already exists
+  // (for example after the anchor container restarted), the call reattaches
+  // to it and the spec must be identical. The stream ends after the VM has
+  // stopped.
+  rpc Attach(AttachRequest) returns (stream VmStatus);
+
+  // Stop shuts down the VM that belongs to the caller's pod and returns once
+  // it has stopped.
+  rpc Stop(StopRequest) returns (StopResponse);
+}
+
+// Served on /run/baryon/node/virtd.sock to baryon-node-agent. Read-only.
+service NodeService {
+  rpc GetRuntimeInfo(GetRuntimeInfoRequest) returns (RuntimeInfo);
+  rpc GetHost(GetHostRequest) returns (HostInfo);
+
+  // WatchVms sends the full list of VMs on this node immediately and again
+  // after every change.
+  rpc WatchVms(WatchVmsRequest) returns (stream VmList);
+}
+
+message AttachRequest {
+  VmSpec spec = 1;
+  // Protocol the anchor speaks, "baryon.runtime.v1alpha1". baryon-virtd
+  // refuses any other value with FAILED_PRECONDITION, so a version skew
+  // between the cluster release and the host image is reported instead of
+  // misread.
+  string protocol = 2;
+}
+
+message VmSpec {
+  // metadata.uid of the VirtualMachine. Presented to the guest as the SMBIOS
+  // system UUID, so it is stable across restarts of the VM.
+  string vm_uid = 1;
+  string vm_namespace = 2;
+  string vm_name = 3;
+  uint32 vcpus = 4;
+  uint64 memory_bytes = 5;
+  Boot boot = 6;
+  repeated Disk disks = 7;
+  repeated NetworkInterface interfaces = 8;
+}
+
+message Boot {
+  oneof payload {
+    FirmwareBoot firmware = 1;
+  }
+}
+
+// Boot the UEFI firmware shipped in the host image from the first disk.
+message FirmwareBoot {}
+
+message Disk {
+  string name = 1;
+  // Absolute path of the disk inside the anchor container: a regular file
+  // on a filesystem volume or a block device node.
+  string container_path = 2;
+  bool read_only = 3;
+}
+
+message NetworkInterface {
+  string name = 1;
+  // Interface in the pod network namespace that the guest takes over,
+  // normally eth0.
+  string pod_interface = 2;
+}
+
+message StopRequest {
+  // Seconds to wait for the guest to shut down after the ACPI power button
+  // before the VMM is stopped without a guest shutdown.
+  uint32 grace_period_seconds = 1;
+  // The pod is terminating. baryon-virtd does not keep the VM around for a
+  // reattach.
+  bool final = 2;
+}
+
+message StopResponse {
+  VmStatus status = 1;
+}
+
+enum VmPhase {
+  VM_PHASE_UNSPECIFIED = 0;
+  // Preparing storage and network handoff.
+  VM_PHASE_PREPARING = 1;
+  // The VMM process is running and the guest is booting.
+  VM_PHASE_STARTING = 2;
+  // The guest produced boot evidence (see GuestStatus).
+  VM_PHASE_RUNNING = 3;
+  VM_PHASE_STOPPING = 4;
+  VM_PHASE_STOPPED = 5;
+  VM_PHASE_FAILED = 6;
+}
+
+message VmStatus {
+  // UID of the anchor pod that owns this VM instance.
+  string pod_uid = 1;
+  string vm_uid = 2;
+  string vm_namespace = 3;
+  string vm_name = 4;
+  VmPhase phase = 5;
+  // Machine-readable CamelCase reason, for example GuestPoweredOff.
+  string reason = 6;
+  // Human-readable detail.
+  string message = 7;
+  int64 started_at_unix_ms = 8;
+  int64 stopped_at_unix_ms = 9;
+  GuestStatus guest = 10;
+  string hypervisor_version = 11;
+}
+
+message GuestStatus {
+  // The guest requested an address over DHCP and baryon-virtd acknowledged.
+  bool dhcp_lease_acknowledged = 1;
+  string ip_address = 2;
+  string mac_address = 3;
+  // A login prompt was observed on the serial console.
+  bool console_login_prompt = 4;
+  // First time boot evidence was observed.
+  int64 booted_at_unix_ms = 5;
+}
+
+message GetRuntimeInfoRequest {}
+
+message RuntimeInfo {
+  string virtd_version = 1;
+  string virtd_git_commit = 2;
+  // Protocol package implemented by the server: baryon.runtime.v1alpha1.
+  string protocol = 3;
+  // Always cloud-hypervisor.
+  string hypervisor = 4;
+  string hypervisor_version = 5;
+  // Component manifest of the host image as JSON, empty if absent.
+  string components_json = 6;
+}
+
+message GetHostRequest {}
+
+message HostInfo {
+  // Version of the JSON schema in report_json.
+  uint32 report_version = 1;
+  // JSON encoding of the baryon-host HostReport type. Both ends are built
+  // from the Baryon repository and share that type.
+  string report_json = 2;
+  RuntimeInfo runtime = 3;
+}
+
+message WatchVmsRequest {}
+
+message VmList {
+  repeated VmStatus vms = 1;
+}

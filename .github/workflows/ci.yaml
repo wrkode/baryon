@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Text style (ASCII only)
+        run: hack/check-text-style.sh
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: test-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - name: Unit and integration tests
+        run: cargo test --workspace --locked
+
+  crds:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (from rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: CRDs match the Rust types
+        run: hack/verify-crds.sh
+      - name: Start a single-node k0s API server
+        run: hack/ci/k0s.sh start
+      - name: CRD schema, CEL rules, and admission policies against the API server
+        run: hack/ci/apiserver-checks.sh
+      - name: Stop k0s
+        if: always()
+        run: hack/ci/k0s.sh stop
+
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Static musl binaries
+        run: hack/build-static.sh
+      - name: Images
+        run: |
+          for c in anchor node-agent controller; do
+            docker build -f "packaging/images/$c.Dockerfile" -t "baryon/$c:ci" .
+          done
+      - name: Host artifacts are fetchable and match pinned checksums
+        run: hack/fetch-artifacts.sh

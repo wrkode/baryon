@@ -1,0 +1,19 @@
+# Build output
+/target/
+
+# Local test and lab artifacts
+/_output/
+/hack/lab/.state/
+*.img
+*.raw
+*.qcow2
+*.iso
+*.fd
+*.log
+
+# Editor and OS files
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/

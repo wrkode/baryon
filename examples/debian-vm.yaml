@@ -1,0 +1,13 @@
+# A Debian 13 VM imported from the official cloud image. The raw image is
+# 3 GiB; the virtual disk is extended to 10 GiB.
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: debian
+spec:
+  className: general-small
+  rootDisk:
+    size: 10Gi
+    source:
+      http:
+        url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.raw

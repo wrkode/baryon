@@ -1,0 +1,49 @@
+[package]
+name = "baryon-virtd"
+description = "Baryon host virtualization runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "baryon-virtd"
+path = "src/main.rs"
+
+[dependencies]
+baryon-cloud-hypervisor = { workspace = true }
+baryon-host = { workspace = true }
+baryon-runtime-api = { workspace = true }
+baryon-version = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+dhcproto = { workspace = true }
+futures = { workspace = true }
+ipnet = { workspace = true }
+libc = { workspace = true }
+netlink-packet-core = { workspace = true }
+netlink-packet-route = { workspace = true }
+prost = { workspace = true }
+rtnetlink = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+# Baryon host virtualization runtime. Shipped in the Baryon-enabled Hadron
+# image under /usr/lib and enabled by a relative symlink in
+# multi-user.target.wants, so nothing is written to /etc/systemd (a
+# persistent, update-only bind mount on Kairos).
+[Unit]
+Description=Baryon host virtualization runtime
+Documentation=https://github.com/wrkode/baryon
+After=local-fs.target systemd-modules-load.service
+# Start before the kubelet so that Anchor Pods restarted after a reboot can
+# reach the runtime. Ordering against units that do not exist is ignored.
+Before=k3s.service k3s-agent.service k0scontroller.service k0sworker.service kubelet.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/baryon-virtd
+Restart=always
+RestartSec=2s
+# VMMs run in their Anchor Pod container cgroups, not in this unit's cgroup,
+# so stopping or restarting baryon-virtd leaves them running. Do not use
+# RuntimeDirectory=: /run/baryon holds the records used for recovery and must
+# survive restarts of this unit.
+KillMode=mixed
+LimitNOFILE=1048576

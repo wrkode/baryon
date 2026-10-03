@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: baryon-controller
+  namespace: baryon-system
+  labels:
+    app.kubernetes.io/name: baryon-controller
+    app.kubernetes.io/part-of: baryon
+spec:
+  # One replica and Recreate: there is no leader election yet, so two
+  # controllers must never run at once.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: baryon-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: baryon-controller
+        app.kubernetes.io/part-of: baryon
+    spec:
+      serviceAccountName: baryon-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: baryon/controller:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: BARYON_ANCHOR_IMAGE
+              value: baryon/anchor:dev
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

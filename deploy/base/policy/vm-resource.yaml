@@ -1,0 +1,54 @@
+# Only baryon-controller may create pods that request the
+# virtualization.baryon.io/vm extended resource.
+#
+# The device plugin hands /dev/kvm and the baryon-virtd anchor socket to every
+# container allocated that resource, so the resource is the gate to the node
+# runtime. baryon-virtd additionally requires each anchor to run as the uid
+# derived from its VM (see docs/security.md); this policy keeps arbitrary pods
+# from reaching the socket at all.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1,
+# Kubernetes 1.30 or later). The service account name must match
+# deploy/base/controller/rbac.yaml.
+#
+# Only CREATE is checked: container resources cannot be changed on an
+# existing pod (in-place resize covers CPU and memory only).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-vm-resource
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: requests-vm-resource
+      expression: >-
+        object.spec.containers.exists(c, has(c.resources) &&
+          ((has(c.resources.limits) && 'virtualization.baryon.io/vm' in c.resources.limits) ||
+           (has(c.resources.requests) && 'virtualization.baryon.io/vm' in c.resources.requests)))
+        ||
+        (has(object.spec.initContainers) && object.spec.initContainers.exists(c, has(c.resources) &&
+          ((has(c.resources.limits) && 'virtualization.baryon.io/vm' in c.resources.limits) ||
+           (has(c.resources.requests) && 'virtualization.baryon.io/vm' in c.resources.requests))))
+  validations:
+    - expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-controller'"
+      messageExpression: >-
+        'only baryon-controller may create pods that request virtualization.baryon.io/vm; requested by ' + request.userInfo.username
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-vm-resource
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-vm-resource
+  validationActions: [Deny]

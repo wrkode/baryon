@@ -1,0 +1,619 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualmachines.virtualization.baryon.io
+spec:
+  group: virtualization.baryon.io
+  names:
+    categories:
+    - baryon
+    kind: VirtualMachine
+    plural: virtualmachines
+    shortNames:
+    - bvm
+    singular: virtualmachine
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.conditions[?(@.type=="Ready")].reason
+      name: Reason
+      type: string
+    - jsonPath: .status.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.addresses[0].address
+      name: Address
+      type: string
+    - jsonPath: .spec.className
+      name: Class
+      priority: 1
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for VirtualMachineSpec via `CustomResource`
+        properties:
+          spec:
+            description: Desired state of a VirtualMachine.
+            properties:
+              className:
+                description: Name of the VirtualMachineClass that sets vCPUs and memory.
+                type: string
+                x-kubernetes-validations:
+                - message: className is required
+                  rule: self.size() > 0
+              networks:
+                default:
+                - name: default
+                  pod: {}
+                description: |-
+                  Networks of the VM. v1alpha1 supports exactly one network, the pod
+                  network of the VM's Anchor Pod. Defaults to that network.
+                items:
+                  properties:
+                    name:
+                      description: Name of the network within the VM, a DNS-1123 label.
+                      maxLength: 63
+                      minLength: 1
+                      type: string
+                      x-kubernetes-validations:
+                      - message: name must be a DNS-1123 label
+                        rule: self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+                    pod:
+                      description: The pod network of the VM's Anchor Pod.
+                      nullable: true
+                      type: object
+                  required:
+                  - name
+                  type: object
+                maxItems: 8
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+                x-kubernetes-validations:
+                - message: exactly one network with source pod is supported
+                  rule: self.size() == 1 && has(self[0].pod)
+              rootDisk:
+                description: The disk the VM boots from.
+                properties:
+                  size:
+                    description: |-
+                      Virtual disk size. Required for imported disks; the claim requests
+                      this size and the image is extended to it.
+                    nullable: true
+                    x-kubernetes-int-or-string: true
+                  source:
+                    description: Where the disk content comes from. Exactly one field must be set.
+                    properties:
+                      http:
+                        description: |-
+                          Import a raw disk image from an HTTP or HTTPS URL into a filesystem
+                          mode claim created and owned by the VM.
+                        nullable: true
+                        properties:
+                          sha256:
+                            description: |-
+                              Expected SHA-256 of the image, hex encoded. Required for plain HTTP;
+                              strongly recommended for HTTPS.
+                            maxLength: 64
+                            minLength: 64
+                            nullable: true
+                            type: string
+                            x-kubernetes-validations:
+                            - message: sha256 must be 64 hex characters
+                              rule: self.matches('^[0-9a-fA-F]{64}$')
+                          url:
+                            maxLength: 2048
+                            type: string
+                            x-kubernetes-validations:
+                            - message: url must be http or https
+                              rule: self.startsWith('https://') || self.startsWith('http://')
+                        required:
+                        - url
+                        type: object
+                        x-kubernetes-validations:
+                        - message: sha256 is required when the url is plain http
+                          rule: self.url.startsWith('https://') || has(self.sha256)
+                      persistentVolumeClaim:
+                        description: |-
+                          Use an existing claim that already contains a raw disk. In filesystem
+                          mode the image must be `disk.img` at the root of the volume.
+                        nullable: true
+                        properties:
+                          claimName:
+                            type: string
+                        required:
+                        - claimName
+                        type: object
+                    type: object
+                    x-kubernetes-validations:
+                    - message: exactly one of http or persistentVolumeClaim must be set
+                      rule: "(has(self.http) ? 1 : 0) + (has(self.persistentVolumeClaim) ? 1 : 0) == 1"
+                  storageClassName:
+                    description: |-
+                      StorageClass for claims created by Baryon. Defaults to the cluster
+                      default StorageClass.
+                    nullable: true
+                    type: string
+                required:
+                - source
+                type: object
+                x-kubernetes-validations:
+                - message: size is required when the source is http
+                  rule: "!has(self.source.http) || has(self.size)"
+              runPolicy:
+                default: Running
+                description: Whether the VM should be running. Changing it starts or stops the VM.
+                enum:
+                - Running
+                - Stopped
+                type: string
+            required:
+            - className
+            - rootDisk
+            type: object
+          status:
+            description: Observed state of a VirtualMachine. Written only by baryon-controller.
+            nullable: true
+            properties:
+              addresses:
+                description: Guest addresses. On the pod network these are the Anchor Pod IPs.
+                items:
+                  properties:
+                    address:
+                      type: string
+                    type:
+                      description: InternalIP for pod network addresses.
+                      type: string
+                  required:
+                  - address
+                  - type
+                  type: object
+                type: array
+              anchorPod:
+                description: Name of the current Anchor Pod.
+                nullable: true
+                type: string
+              conditions:
+                items:
+                  description: >-
+                    Condition contains details for one aspect of the current state of this API
+                    Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: >-
+                        lastTransitionTime is the last time the condition transitioned from one status
+                        to another. This should be when the underlying condition changed.  If that is not
+                        known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: >-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: >-
+                        observedGeneration represents the .metadata.generation that the condition was
+                        set based upon. For instance, if .metadata.generation is currently 12, but the
+                        .status.conditions[x].observedGeneration is 9, the condition is out of date with
+                        respect to the current state of the instance.
+                      type: integer
+                    reason:
+                      description: >-
+                        reason contains a programmatic identifier indicating the reason for the
+                        condition's last transition. Producers of specific condition types may define expected
+                        values and meanings for this field, and whether the values are considered a
+                        guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              identityConflictNodes:
+                description: |-
+                  Nodes where this VM cannot run because another VM there runs with
+                  the same host identity. New Anchor Pods avoid them. Cleared when the
+                  VM is stopped.
+                items:
+                  type: string
+                maxItems: 16
+                type: array
+              macAddress:
+                description: MAC address of the guest NIC. Stable for the life of the VM.
+                nullable: true
+                type: string
+              nodeName:
+                description: Node the VM runs on.
+                nullable: true
+                type: string
+              observedGeneration:
+                nullable: true
+                type: integer
+              restartCount:
+                description: Number of times the VM was restarted in the current Anchor Pod.
+                nullable: true
+                type: integer
+              rootDiskClaim:
+                description: Claim holding the root disk.
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: VirtualMachine
+        type: object
+        x-kubernetes-validations:
+        - message: "VirtualMachine names must be DNS-1123 labels: at most 63 characters, no dots"
+          rule: self.metadata.name.size() <= 63 && !self.metadata.name.contains('.')
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualmachineclasses.virtualization.baryon.io
+spec:
+  group: virtualization.baryon.io
+  names:
+    categories:
+    - baryon
+    kind: VirtualMachineClass
+    plural: virtualmachineclasses
+    shortNames:
+    - bvmclass
+    singular: virtualmachineclass
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.cpu.cores
+      name: Cores
+      type: integer
+    - jsonPath: .spec.memory.size
+      name: Memory
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for VirtualMachineClassSpec via `CustomResource`
+        properties:
+          spec:
+            description: vCPUs and memory shared by VMs that reference this class.
+            properties:
+              cpu:
+                properties:
+                  cores:
+                    description: Number of vCPUs.
+                    minimum: 0.0
+                    type: integer
+                    x-kubernetes-validations:
+                    - message: cores must be between 1 and 256
+                      rule: self >= 1 && self <= 256
+                required:
+                - cores
+                type: object
+              memory:
+                properties:
+                  size:
+                    description: |-
+                      Guest memory, for example 4Gi. Must be a whole number of MiB and at
+                      least 64Mi.
+                    x-kubernetes-int-or-string: true
+                required:
+                - size
+                type: object
+            required:
+            - cpu
+            - memory
+            type: object
+        required:
+        - spec
+        title: VirtualMachineClass
+        type: object
+    served: true
+    storage: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualizationnodes.virtualization.baryon.io
+spec:
+  group: virtualization.baryon.io
+  names:
+    categories:
+    - baryon
+    kind: VirtualizationNode
+    plural: virtualizationnodes
+    shortNames:
+    - vnode
+    singular: virtualizationnode
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
+    - jsonPath: .status.architecture
+      name: Arch
+      type: string
+    - jsonPath: .status.kvm.available
+      name: KVM
+      type: boolean
+    - jsonPath: .status.iommu.enabled
+      name: IOMMU
+      type: boolean
+    - jsonPath: .status.runtime.hypervisorVersion
+      name: Hypervisor
+      type: string
+    - jsonPath: .status.vmCount
+      name: VMs
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for VirtualizationNodeSpec via `CustomResource`
+        properties:
+          spec:
+            description: VirtualizationNode has no desired state in v1alpha1.
+            type: object
+          status:
+            nullable: true
+            properties:
+              architecture:
+                description: Kernel machine name, for example x86_64.
+                nullable: true
+                type: string
+              conditions:
+                items:
+                  description: >-
+                    Condition contains details for one aspect of the current state of this API
+                    Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: >-
+                        lastTransitionTime is the last time the condition transitioned from one status
+                        to another. This should be when the underlying condition changed.  If that is not
+                        known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: >-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: >-
+                        observedGeneration represents the .metadata.generation that the condition was
+                        set based upon. For instance, if .metadata.generation is currently 12, but the
+                        .status.conditions[x].observedGeneration is 9, the condition is out of date with
+                        respect to the current state of the instance.
+                      type: integer
+                    reason:
+                      description: >-
+                        reason contains a programmatic identifier indicating the reason for the
+                        condition's last transition. Producers of specific condition types may define expected
+                        values and meanings for this field, and whether the values are considered a
+                        guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              cpu:
+                nullable: true
+                properties:
+                  model:
+                    nullable: true
+                    type: string
+                  nestedVirtualization:
+                    nullable: true
+                    type: boolean
+                  online:
+                    minimum: 0.0
+                    type: integer
+                  virtualizationExtension:
+                    description: vmx or svm on x86_64.
+                    nullable: true
+                    type: string
+                required:
+                - online
+                type: object
+              heartbeatTime:
+                description: Last time the node agent refreshed this status.
+                format: date-time
+                nullable: true
+                type: string
+              hugepages:
+                items:
+                  properties:
+                    free:
+                      minimum: 0.0
+                      type: integer
+                    pageSizeBytes:
+                      minimum: 0.0
+                      type: integer
+                    total:
+                      minimum: 0.0
+                      type: integer
+                  required:
+                  - free
+                  - pageSizeBytes
+                  - total
+                  type: object
+                type: array
+              iommu:
+                nullable: true
+                properties:
+                  enabled:
+                    type: boolean
+                  groups:
+                    minimum: 0.0
+                    type: integer
+                  iommufd:
+                    description: /dev/iommu is present.
+                    type: boolean
+                required:
+                - enabled
+                - groups
+                - iommufd
+                type: object
+              kairosVersion:
+                description: Kairos release of the host, when it is a Kairos system.
+                nullable: true
+                type: string
+              kernelRelease:
+                nullable: true
+                type: string
+              kvm:
+                nullable: true
+                properties:
+                  apiVersion:
+                    nullable: true
+                    type: integer
+                  available:
+                    type: boolean
+                  reason:
+                    nullable: true
+                    type: string
+                required:
+                - available
+                type: object
+              memoryBytes:
+                minimum: 0.0
+                nullable: true
+                type: integer
+              numaNodes:
+                items:
+                  properties:
+                    cpus:
+                      type: string
+                    id:
+                      minimum: 0.0
+                      type: integer
+                    memoryBytes:
+                      minimum: 0.0
+                      type: integer
+                  required:
+                  - cpus
+                  - id
+                  - memoryBytes
+                  type: object
+                type: array
+              osImage:
+                nullable: true
+                type: string
+              pciDevices:
+                items:
+                  properties:
+                    address:
+                      type: string
+                    class:
+                      type: string
+                    deviceId:
+                      type: string
+                    driver:
+                      nullable: true
+                      type: string
+                    iommuGroup:
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    numaNode:
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    vendorId:
+                      type: string
+                  required:
+                  - address
+                  - class
+                  - deviceId
+                  - vendorId
+                  type: object
+                type: array
+              runtime:
+                nullable: true
+                properties:
+                  hypervisor:
+                    type: string
+                  hypervisorVersion:
+                    type: string
+                  protocol:
+                    type: string
+                  virtdVersion:
+                    type: string
+                required:
+                - hypervisor
+                - hypervisorVersion
+                - protocol
+                - virtdVersion
+                type: object
+              vfio:
+                nullable: true
+                properties:
+                  containerDevice:
+                    description: /dev/vfio/vfio is present.
+                    type: boolean
+                  pciDriver:
+                    description: The vfio-pci driver is registered.
+                    type: boolean
+                required:
+                - containerDevice
+                - pciDriver
+                type: object
+              vmCount:
+                description: VMs currently known to the host runtime.
+                minimum: 0.0
+                nullable: true
+                type: integer
+            type: object
+        required:
+        - spec
+        title: VirtualizationNode
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

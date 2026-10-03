@@ -1,0 +1,22 @@
+[package]
+name = "baryon-host"
+description = "Host virtualization capability discovery for Baryon nodes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,49 @@
+# Each baryon-node-agent may write only the VirtualizationNode of the node it
+# runs on.
+#
+# RBAC cannot scope a DaemonSet's service account to one object per node. The
+# API server adds the node name to the identity of a pod-bound service
+# account token (userInfo.extra "authentication.kubernetes.io/node-name",
+# Kubernetes 1.32 or later), which this policy compares with the object name.
+# Requests without that information are denied.
+#
+# The service account name must match deploy/base/node-agent/rbac.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-node-agent-own-node
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["virtualization.baryon.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["virtualizationnodes", "virtualizationnodes/status"]
+  matchConditions:
+    - name: is-node-agent
+      expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-node-agent'"
+  variables:
+    - name: nodeName
+      expression: >-
+        has(request.userInfo.extra) && 'authentication.kubernetes.io/node-name' in request.userInfo.extra
+          ? request.userInfo.extra['authentication.kubernetes.io/node-name'][0]
+          : ''
+  validations:
+    - expression: "variables.nodeName != '' && variables.nodeName == object.metadata.name"
+      messageExpression: >-
+        'baryon-node-agent on node ' + (variables.nodeName == '' ? '(unknown)' : variables.nodeName) +
+        ' may not write VirtualizationNode ' + object.metadata.name
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-node-agent-own-node
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-node-agent-own-node
+  validationActions: [Deny]

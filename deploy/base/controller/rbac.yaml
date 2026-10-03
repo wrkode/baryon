@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: baryon-controller
+  namespace: baryon-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: baryon-controller
+rules:
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachines"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachines/status"]
+    verbs: ["patch"]
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachines/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualmachineclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create"]
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: baryon-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: baryon-controller
+subjects:
+  - kind: ServiceAccount
+    name: baryon-controller
+    namespace: baryon-system

@@ -1,0 +1,19 @@
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachineClass
+metadata:
+  name: general-small
+spec:
+  cpu:
+    cores: 2
+  memory:
+    size: 2Gi
+---
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachineClass
+metadata:
+  name: general-medium
+spec:
+  cpu:
+    cores: 4
+  memory:
+    size: 8Gi
