@@ -11,11 +11,12 @@
 //!   all-zero blocks, and the rest of the device after the image, are
 //!   zeroed, because a new volume may hold old data: with write-zeroes that
 //!   may deallocate (`FALLOC_FL_PUNCH_HOLE`), else with `FALLOC_FL_ZERO_RANGE`,
-//!   else with written zeros. The first MiB of the device is zeroed before
-//!   the download and the first MiB of the image is written only after its
-//!   size and SHA-256 are verified, so a failed import leaves no partition
-//!   table or boot loader behind. There is no marker on the device;
-//!   baryon-controller records the completed import on the claim.
+//!   else with written zeros. The first and last MiB of the device are
+//!   zeroed before the download, and image data in them is written only
+//!   after the image's size and SHA-256 are verified, so a failed import
+//!   leaves no partition table, boot loader, or backup GPT behind. After a
+//!   successful import every byte of the device is the image's or zero. There is no marker on the device; baryon-controller records the
+//!   completed import on the claim's PersistentVolume.
 //!
 //! This is a convenience for importing a boot image, not an image management
 //! system.
@@ -36,7 +37,8 @@ use baryon_runtime_api::anchor_spec::DISK_IMAGE_NAME;
 
 const MARKER: &str = ".baryon-import.json";
 const BLOCK: usize = 4096;
-/// Leading part of a device image that is written only after verification.
+/// Size of the region at each end of a device that is zeroed before an
+/// import and receives image data only after verification.
 const HEAD: u64 = 1 << 20;
 const MAX_REDIRECTS: usize = 10;
 
@@ -82,6 +84,14 @@ async fn import_device(
     if !dev.metadata()?.file_type().is_block_device() {
         bail!("{} is not a block device", path.display());
     }
+    // Zeroing is aligned to BLOCK; larger logical blocks are not supported.
+    let lbs = rustix::fs::ioctl_blksszget(&dev).context("reading the logical block size")?;
+    if lbs == 0 || lbs as usize > BLOCK || !BLOCK.is_multiple_of(lbs as usize) {
+        bail!(
+            "{} has a logical block size of {lbs} bytes; at most {BLOCK} is supported",
+            path.display()
+        );
+    }
     let dev_size = dev
         .seek(SeekFrom::End(0))
         .context("reading the device size")?;
@@ -89,9 +99,10 @@ async fn import_device(
     if size_bytes > dev_size {
         bail!("the requested disk size {size_bytes} is larger than the device ({dev_size} bytes)");
     }
-    let mut sink = DeviceSink::new(dev, dev_size).context("clearing the start of the device")?;
-    let body = fetch(url).await?;
-    let (written, digest) = stream(body, &mut sink, size_bytes).await?;
+    let mut sink = DeviceSink::new(dev, dev_size).context("clearing both ends of the device")?;
+    let download = fetch(url).await?;
+    let (written, digest) = stream(download.body, &mut sink, size_bytes).await?;
+    check_length(written, download.length, sha256)?;
     if let Some(expected) = sha256
         && !expected.eq_ignore_ascii_case(&digest)
     {
@@ -132,9 +143,11 @@ async fn import_file(
         .open(&partial)
         .with_context(|| format!("creating {}", partial.display()))?;
 
-    let body = fetch(url).await?;
+    let download = fetch(url).await?;
     let mut sink = FileSink { file: &mut file };
-    let streamed = stream(body, &mut sink, size_bytes).await;
+    let streamed = stream(download.body, &mut sink, size_bytes)
+        .await
+        .and_then(|(w, d)| check_length(w, download.length, sha256).map(|()| (w, d)));
     let (written, digest) = match streamed {
         Ok(r) => r,
         Err(e) => {
@@ -163,7 +176,13 @@ async fn import_file(
 }
 
 /// GET `url`, following redirects, and return the response body.
-async fn fetch(url: &str) -> anyhow::Result<hyper::body::Incoming> {
+/// A response body and its announced length.
+struct Download {
+    body: hyper::body::Incoming,
+    length: Option<u64>,
+}
+
+async fn fetch(url: &str) -> anyhow::Result<Download> {
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_webpki_roots()
         .https_or_http()
@@ -189,9 +208,34 @@ async fn fetch(url: &str) -> anyhow::Result<hyper::body::Incoming> {
         if resp.status() != StatusCode::OK {
             bail!("GET {uri} returned {}", resp.status());
         }
-        return Ok(resp.into_body());
+        let length = resp
+            .headers()
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        return Ok(Download {
+            body: resp.into_body(),
+            length,
+        });
     }
     bail!("too many redirects")
+}
+
+/// Refuse an image whose length differs from the announced one, or, without
+/// a digest, an image of unknown length: a connection closed early would
+/// otherwise look like a complete image.
+fn check_length(written: u64, length: Option<u64>, sha256: Option<&str>) -> anyhow::Result<()> {
+    match length {
+        Some(l) if l != written => {
+            bail!("the download ended after {written} of {l} bytes")
+        }
+        None if sha256.is_none() => {
+            bail!(
+                "the server sent no Content-Length and no SHA-256 was given; a truncated download could not be detected"
+            )
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Stream `body` into `sink` in 4 KiB blocks, refusing to write past
@@ -271,48 +315,95 @@ impl Sink for FileSink<'_> {
     }
 }
 
-/// A block device: zero runs are zeroed explicitly, coalesced into one
-/// request per run. The first [`HEAD`] bytes of the image are kept in memory
-/// until [`DeviceSink::finish`].
+/// How a device range is zeroed: [`zero_range`] in production; tests
+/// substitute a method to exercise each fallback.
+type ZeroFn = fn(&std::fs::File, u64, u64) -> std::io::Result<()>;
+
+/// A block device. The import contract: after [`DeviceSink::finish`], every
+/// byte of the device is either the image's byte at that offset or zero.
+///
+/// Zero runs of the image and everything after it are zeroed explicitly,
+/// coalesced into one request per run; nothing relies on the device having
+/// been zero or on sparse writes leaving zeros. The first [`HEAD`] bytes of
+/// the image, and image bytes in the device's last [`HEAD`] bytes, are kept
+/// in memory and written only by [`DeviceSink::finish`], after the image is
+/// verified; both regions are zeroed before the download, so a failed
+/// import leaves neither a partition table, a boot loader, nor a backup
+/// GPT header from the image or from earlier use of the device.
 struct DeviceSink {
     dev: std::fs::File,
     size: u64,
     pos: u64,
     zero_from: Option<u64>,
     head: Vec<u8>,
+    /// Start of the protected region at the end of the device.
+    tail_start: u64,
+    tail: Vec<u8>,
+    zero: ZeroFn,
 }
 
 impl DeviceSink {
-    /// Zero the first [`HEAD`] bytes of the device, so a failed import
-    /// leaves nothing bootable there.
     fn new(dev: std::fs::File, size: u64) -> std::io::Result<Self> {
-        zero_range(&dev, 0, size.min(HEAD))?;
+        Self::with_zero(dev, size, zero_range)
+    }
+
+    /// Zero both protected regions, so a failed import leaves nothing
+    /// bootable at either end of the device.
+    fn with_zero(dev: std::fs::File, size: u64, zero: ZeroFn) -> std::io::Result<Self> {
+        let block = BLOCK as u64;
+        // BLOCK-aligned and never inside the head region.
+        let tail_start = (size.saturating_sub(HEAD) / block * block).max(HEAD.min(size));
+        zero(&dev, 0, size.min(HEAD))?;
+        zero(&dev, tail_start, size - tail_start)?;
+        // Durable before the download: an interrupted import must not leave
+        // the old ends on the device after a power loss.
+        dev.sync_all()?;
         Ok(Self {
             dev,
             size,
             pos: 0,
             zero_from: None,
             head: Vec::new(),
+            tail_start,
+            tail: Vec::new(),
+            zero,
         })
+    }
+
+    /// Whether the current position is in a region held until `finish`.
+    fn held(&self) -> bool {
+        self.pos < HEAD || self.pos >= self.tail_start
+    }
+
+    fn hold(&mut self, chunk: Option<&[u8]>, len: u64) {
+        let buf = if self.pos < HEAD {
+            &mut self.head
+        } else {
+            &mut self.tail
+        };
+        match chunk {
+            Some(c) => buf.extend_from_slice(c),
+            None => buf.resize(buf.len() + len as usize, 0),
+        }
+        self.pos += len;
     }
 
     fn flush_zeros(&mut self) -> std::io::Result<()> {
         if let Some(from) = self.zero_from.take() {
-            zero_range(&self.dev, from, self.pos - from)?;
+            (self.zero)(&self.dev, from, self.pos - from)?;
         }
         Ok(())
     }
 
-    /// Write the verified head, zero everything after the image, and make
-    /// the writes durable.
+    /// Zero everything after the image, write the verified head and tail,
+    /// and make the writes durable.
     fn finish(mut self) -> std::io::Result<()> {
         use std::os::unix::fs::FileExt;
-        let end = self.size;
-        if self.zero_from.is_none() && self.pos < end {
-            self.zero_from = Some(self.pos.max(self.head.len() as u64));
-        }
-        self.pos = end;
         self.flush_zeros()?;
+        if self.pos < self.size {
+            (self.zero)(&self.dev, self.pos, self.size - self.pos)?;
+        }
+        self.dev.write_all_at(&self.tail, self.tail_start)?;
         self.dev.write_all_at(&self.head, 0)?;
         self.dev.sync_all()
     }
@@ -320,11 +411,11 @@ impl DeviceSink {
 
 impl Sink for DeviceSink {
     fn data(&mut self, chunk: &[u8]) -> std::io::Result<()> {
-        if self.pos < HEAD {
-            // Chunks are BLOCK-aligned and HEAD is a multiple of BLOCK, so a
-            // chunk never straddles the boundary.
-            self.head.extend_from_slice(chunk);
-            self.pos += chunk.len() as u64;
+        // Chunks start BLOCK-aligned, and HEAD and tail_start are multiples
+        // of BLOCK, so a chunk never straddles a region boundary.
+        if self.held() {
+            self.flush_zeros()?;
+            self.hold(Some(chunk), chunk.len() as u64);
             return Ok(());
         }
         self.flush_zeros()?;
@@ -334,10 +425,10 @@ impl Sink for DeviceSink {
         Ok(())
     }
     fn zeros(&mut self, len: u64) -> std::io::Result<()> {
-        if self.pos < HEAD {
-            // Already zero on the device; keep the head contiguous.
-            self.head.resize(self.head.len() + len as usize, 0);
-            self.pos += len;
+        if self.held() {
+            // Already zero on the device; keep the buffer contiguous.
+            self.flush_zeros()?;
+            self.hold(None, len);
             return Ok(());
         }
         if self.zero_from.is_none() {
@@ -349,8 +440,9 @@ impl Sink for DeviceSink {
 }
 
 /// Zero `len` bytes at `offset` of a block device. Parts not aligned to
-/// [`BLOCK`] (a multiple of every logical block size in use) are written as
-/// zeros; the aligned middle is zeroed by [`zero_aligned`].
+/// [`BLOCK`] are written as zeros; the aligned middle is zeroed by
+/// [`zero_aligned`]. Devices whose logical block size does not divide
+/// [`BLOCK`] are refused before the import.
 fn zero_range(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let end = offset.saturating_add(len);
@@ -660,5 +752,140 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    /// A recognizable pattern standing in for an earlier user's data.
+    const STALE: &[u8] = b"BARYON-STALE-DATA-";
+
+    fn stale_device(bytes: usize) -> (tempfile::TempDir, std::path::PathBuf, std::fs::File) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dev");
+        let data: Vec<u8> = STALE.iter().copied().cycle().take(bytes).collect();
+        std::fs::write(&path, data).unwrap();
+        let dev = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        (dir, path, dev)
+    }
+
+    fn contains_stale(buf: &[u8]) -> bool {
+        buf.windows(STALE.len()).any(|w| w == STALE)
+    }
+
+    /// FALLOC_FL_ZERO_RANGE, then zero writes: a device on which
+    /// write-zeroes that may deallocate is not supported.
+    fn zero_range_only(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+        use rustix::fs::FallocateFlags;
+        match rustix::fs::fallocate(
+            dev,
+            FallocateFlags::ZERO_RANGE | FallocateFlags::KEEP_SIZE,
+            offset,
+            len,
+        ) {
+            Ok(()) => Ok(()),
+            Err(rustix::io::Errno::OPNOTSUPP) => write_zeros(dev, offset, len),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Only plain zero writes, as on a device without write-zeroes support.
+    fn zeros_only(dev: &std::fs::File, offset: u64, len: u64) -> std::io::Result<()> {
+        write_zeros(dev, offset, len)
+    }
+
+    /// A sparse image (data, a long zero run, data in the last MiB of the
+    /// device) imported onto a device full of stale data, with every
+    /// zeroing method: each device byte is the image's or zero.
+    #[test]
+    fn import_contract_holds_for_every_zeroing_method() {
+        let methods: [(&str, ZeroFn); 3] = [
+            ("default", zero_range),
+            ("zero writes only", zeros_only),
+            ("without write-zeroes with unmap", zero_range_only),
+        ];
+        for (name, zero) in methods {
+            // 6 MiB plus 512 bytes: unaligned end, like a device whose size
+            // is only a multiple of 512.
+            let size = 6 * HEAD as usize + 512;
+            let (_dir, path, dev) = stale_device(size);
+            let mut sink = DeviceSink::with_zero(dev, size as u64, zero).unwrap();
+            let mut image = vec![0u8; size - 1000];
+            image[..BLOCK].fill(1); // head data
+            image[2 * HEAD as usize..2 * HEAD as usize + BLOCK].fill(2); // middle
+            // zero run from there to the last MiB; data in the last MiB
+            let last = size - 2 * BLOCK;
+            image[last..last + 100].fill(3);
+            let mut written = 0;
+            write_blocks(&mut sink, &image, &mut written, size as u64).unwrap();
+            sink.finish().unwrap();
+            let out = std::fs::read(&path).unwrap();
+            assert_eq!(out.len(), size, "{name}");
+            assert_eq!(&out[..image.len()], &image[..], "{name}: image bytes");
+            assert!(
+                out[image.len()..].iter().all(|b| *b == 0),
+                "{name}: tail zero"
+            );
+            assert!(!contains_stale(&out), "{name}: no stale data");
+        }
+    }
+
+    /// A device much larger than the image: everything after the image is
+    /// zero.
+    #[test]
+    fn a_small_image_on_a_large_device() {
+        let size = 8 * HEAD as usize;
+        let (_dir, path, dev) = stale_device(size);
+        let mut sink = DeviceSink::new(dev, size as u64).unwrap();
+        let image = vec![7u8; 3 * BLOCK + 17];
+        let mut written = 0;
+        write_blocks(&mut sink, &image, &mut written, size as u64).unwrap();
+        sink.finish().unwrap();
+        let out = std::fs::read(&path).unwrap();
+        assert_eq!(&out[..image.len()], &image[..]);
+        assert!(out[image.len()..].iter().all(|b| *b == 0));
+    }
+
+    /// A failed import (verification failed, finish not called) leaves
+    /// zeros at both ends of the device, even where the image reached the
+    /// last MiB.
+    #[test]
+    fn a_failed_import_clears_both_ends() {
+        let size = 4 * HEAD as usize;
+        let (_dir, path, dev) = stale_device(size);
+        let mut sink = DeviceSink::new(dev, size as u64).unwrap();
+        let image = vec![9u8; size];
+        let mut written = 0;
+        write_blocks(&mut sink, &image, &mut written, size as u64).unwrap();
+        drop(sink);
+        let out = std::fs::read(&path).unwrap();
+        let tail_start = size - HEAD as usize;
+        assert!(out[..HEAD as usize].iter().all(|b| *b == 0), "head clear");
+        assert!(out[tail_start..].iter().all(|b| *b == 0), "tail clear");
+    }
+
+    /// Devices smaller than two protected regions.
+    #[test]
+    fn small_devices() {
+        for size in [BLOCK, HEAD as usize, HEAD as usize + 3 * BLOCK + 512] {
+            let (_dir, path, dev) = stale_device(size);
+            let mut sink = DeviceSink::new(dev, size as u64).unwrap();
+            let mut image = vec![0u8; size / 2];
+            image[0] = 5;
+            if let Some(b) = image.last_mut() {
+                *b = 6;
+            }
+            let mut written = 0;
+            write_blocks(&mut sink, &image, &mut written, size as u64).unwrap();
+            sink.finish().unwrap();
+            let out = std::fs::read(&path).unwrap();
+            assert_eq!(&out[..image.len()], &image[..], "size {size}");
+            assert!(out[image.len()..].iter().all(|b| *b == 0), "size {size}");
+        }
+    }
+
+    #[test]
+    fn truncated_or_unannounced_downloads_are_refused() {
+        assert!(check_length(10, Some(10), None).is_ok());
+        assert!(check_length(9, Some(10), Some("abc")).is_err());
+        assert!(check_length(10, None, Some("abc")).is_ok());
+        assert!(check_length(10, None, None).is_err());
     }
 }
