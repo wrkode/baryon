@@ -162,6 +162,10 @@ pub struct VmEntry {
     pub pod_uid: String,
     pub spec: VmSpec,
     pub vmm_uid: u32,
+    /// Device numbers of the block devices the VM's VMM uses. Two VMs on a
+    /// node never use the same block device: the VMM's file lock does not
+    /// exclude another container's node for the same device.
+    block_devices: Mutex<Vec<u64>>,
     status: watch::Sender<VmStatus>,
     cmd: mpsc::Sender<Command>,
 }
@@ -281,6 +285,7 @@ impl Manager {
             pod_uid: pod_uid.clone(),
             spec: spec.clone(),
             vmm_uid: anchor.uid,
+            block_devices: Mutex::new(Vec::new()),
             status: status_tx,
             cmd: cmd_tx.clone(),
         });
@@ -310,6 +315,33 @@ impl Manager {
             return Some(entry.status.borrow().clone());
         }
         rx.await.ok()
+    }
+
+    /// Record that the VM of `pod_uid` uses the block devices `devs`, unless
+    /// another VM on the node uses one of them.
+    fn claim_block_devices(&self, pod_uid: &str, devs: &[u64]) -> Result<(), String> {
+        let vms = self.lock();
+        for e in vms.values().filter(|e| e.pod_uid != pod_uid) {
+            let theirs = e
+                .block_devices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(d) = devs.iter().find(|d| theirs.contains(d)) {
+                return Err(format!(
+                    "block device {}:{} is used by the VM {}/{} on this node",
+                    rustix::fs::major(*d),
+                    rustix::fs::minor(*d),
+                    e.spec.vm_namespace,
+                    e.spec.vm_name
+                ));
+            }
+        }
+        if let Some(e) = vms.get(pod_uid) {
+            *e.block_devices
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = devs.to_vec();
+        }
+        Ok(())
     }
 
     fn remove(&self, pod_uid: &str) {
@@ -393,6 +425,7 @@ impl Manager {
             pod_uid: rec.pod_uid.clone(),
             spec,
             vmm_uid: rec.vmm_uid,
+            block_devices: Mutex::new(rec.block_devices.clone()),
             status: status_tx,
             cmd: cmd_tx,
         });
@@ -736,6 +769,15 @@ impl Supervisor {
             tracing::info!(pod = %self.entry.pod_uid, disk = %d.name, kind = ?resolved.kind, size = resolved.size_bytes, "disk resolved in anchor mount namespace");
             disks.push(resolved);
         }
+        let block_devices: Vec<u64> = disks
+            .iter()
+            .filter(|d| d.kind == storage::DiskKind::BlockDevice)
+            .map(|d| d.rdev)
+            .collect();
+        if let Some(m) = self.manager.upgrade() {
+            m.claim_block_devices(&self.entry.pod_uid, &block_devices)
+                .map_err(|e| StartFailure::new("DiskInUse", e))?;
+        }
         let resolv = read_container_file(root.as_fd(), "/etc/resolv.conf").unwrap_or_default();
 
         // Resources: the pod limits bound the VMM; refuse a spec that cannot fit.
@@ -918,6 +960,7 @@ impl Supervisor {
             started_at_unix_ms: started,
             guest_mac: pod.mac.to_string(),
             guest_booted_at_unix_ms: 0,
+            block_devices,
         };
         if let Err(e) = record.write(&dir) {
             tracing::warn!(error = %e, "cannot write runtime record; recovery after restart will not find this VM");
@@ -1723,6 +1766,38 @@ mod tests {
     }
 
     #[test]
+    fn a_block_device_serves_one_vm_per_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let entry = |pod: &str, devs: Vec<u64>| {
+            let (status, _) = watch::channel(VmStatus::default());
+            let (cmd, _cmd_rx) = mpsc::channel(1);
+            Arc::new(VmEntry {
+                pod_uid: pod.into(),
+                spec: spec(),
+                vmm_uid: 1,
+                block_devices: Mutex::new(devs),
+                status,
+                cmd,
+            })
+        };
+        let dev = rustix::fs::makedev(251, 0);
+        m.lock().insert("pod-a".into(), entry("pod-a", vec![dev]));
+        m.lock().insert("pod-b".into(), entry("pod-b", Vec::new()));
+        let err = m.claim_block_devices("pod-b", &[dev]).unwrap_err();
+        assert!(err.contains("251:0"), "{err}");
+        // Its own devices, and other devices, are fine.
+        assert!(m.claim_block_devices("pod-a", &[dev]).is_ok());
+        assert!(
+            m.claim_block_devices("pod-b", &[rustix::fs::makedev(251, 16)])
+                .is_ok()
+        );
+        // Released when the VM is gone.
+        m.remove("pod-a");
+        assert!(m.claim_block_devices("pod-b", &[dev]).is_ok());
+    }
+
+    #[test]
     fn identity_collision_on_a_node_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let m = test_manager(dir.path());
@@ -1739,6 +1814,7 @@ mod tests {
                 pod_uid: "pod-b".into(),
                 spec: other,
                 vmm_uid: id.uid(),
+                block_devices: Mutex::new(Vec::new()),
                 status,
                 cmd,
             }),

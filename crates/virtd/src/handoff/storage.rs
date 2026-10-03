@@ -12,7 +12,9 @@
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags, StatxFlags};
+
+use baryon_runtime_api::anchor_spec::{DISK_IMAGE_NAME, ROOT_DISK_DEVICE, ROOT_DISK_DIR};
 
 use crate::peer::pidfd_alive;
 
@@ -32,6 +34,8 @@ pub struct ResolvedDisk {
     pub kind: DiskKind,
     /// `O_PATH` descriptor of the disk.
     pub fd: OwnedFd,
+    /// Device number of a block device; 0 for a file.
+    pub rdev: u64,
     pub size_bytes: u64,
     pub read_only: bool,
 }
@@ -56,6 +60,19 @@ pub enum StorageError {
     },
     #[error("disk {name}: {path:?} is empty")]
     Empty { name: String, path: String },
+    #[error("disk {name}: {path:?} is not a disk path of the anchor container")]
+    UnknownPath { name: String, path: String },
+    #[error("disk {name}: {path:?} is a {found}, expected a {expected}")]
+    KindMismatch {
+        name: String,
+        path: String,
+        found: &'static str,
+        expected: &'static str,
+    },
+    #[error(
+        "disk {name}: the device node {path:?} is not on the container's /dev; block disks must be device nodes the container runtime created"
+    )]
+    DeviceOutsideDev { name: String, path: String },
     #[error(
         "disk {name}: the block device (owner {owner}:{group}, mode {mode:o}) is not {access} for the VM's host identity; the container runtime must give block volume devices the pod's runAsUser and runAsGroup (containerd: device_ownership_from_security_context = true)"
     )]
@@ -131,6 +148,59 @@ pub fn open_process_root(pid: i32, pidfd: BorrowedFd<'_>) -> io::Result<OwnedFd>
     Ok(root)
 }
 
+/// The disk kind the anchor container has at `path`, if it is one of its
+/// disk paths: the image file of a filesystem-mode volume, or the device
+/// node of a block-mode volume.
+pub fn expected_kind(path: &str) -> Option<DiskKind> {
+    if path == ROOT_DISK_DEVICE {
+        Some(DiskKind::BlockDevice)
+    } else if path
+        .strip_prefix(ROOT_DISK_DIR)
+        .and_then(|r| r.strip_prefix('/'))
+        == Some(DISK_IMAGE_NAME)
+    {
+        Some(DiskKind::File)
+    } else {
+        None
+    }
+}
+
+/// tmpfs magic number from statfs(2).
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+/// Check that a block device node is on the container's `/dev`, a tmpfs on
+/// which the container runtime creates the nodes it grants. A device node
+/// that a pod created on a volume (with CAP_MKNOD) is refused here, before
+/// the device cgroup would be the only control.
+fn check_on_container_dev(root: BorrowedFd<'_>, disk: BorrowedFd<'_>) -> io::Result<bool> {
+    let fs = rustix::fs::fstatfs(disk)?;
+    // f_type is i64 on x86_64 and narrower on some other architectures.
+    #[allow(clippy::unnecessary_cast)]
+    let f_type = fs.f_type as i64;
+    if f_type != TMPFS_MAGIC {
+        return Ok(false);
+    }
+    let dev = rustix::fs::openat2(
+        root,
+        "/dev",
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    )?;
+    // Fail closed on a kernel that does not report mount ids.
+    let mnt = |fd: BorrowedFd<'_>| -> io::Result<u64> {
+        let x = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+        if StatxFlags::from_bits_retain(x.stx_mask).contains(StatxFlags::MNT_ID) {
+            Ok(x.stx_mnt_id)
+        } else {
+            Err(io::Error::other(
+                "the kernel does not report mount ids (STATX_MNT_ID)",
+            ))
+        }
+    };
+    Ok(mnt(disk)? == mnt(dev.as_fd())?)
+}
+
 /// Resolve one disk inside a container root.
 pub fn resolve_disk(
     root: BorrowedFd<'_>,
@@ -148,6 +218,12 @@ pub fn resolve_disk(
         name: name.to_owned(),
         path: container_path.to_owned(),
         source,
+    };
+    let Some(expected) = expected_kind(container_path) else {
+        return Err(StorageError::UnknownPath {
+            name: name.to_owned(),
+            path: container_path.to_owned(),
+        });
     };
     let fd = rustix::fs::openat2(
         root,
@@ -170,16 +246,42 @@ pub fn resolve_disk(
             });
         }
     };
+    if kind != expected {
+        let what = |k: DiskKind| match k {
+            DiskKind::File => "regular file",
+            DiskKind::BlockDevice => "block device",
+        };
+        return Err(StorageError::KindMismatch {
+            name: name.to_owned(),
+            path: container_path.to_owned(),
+            found: what(kind),
+            expected: what(expected),
+        });
+    }
+    if kind == DiskKind::BlockDevice
+        && !check_on_container_dev(root, fd.as_fd()).map_err(resolve_err)?
+    {
+        return Err(StorageError::DeviceOutsideDev {
+            name: name.to_owned(),
+            path: container_path.to_owned(),
+        });
+    }
     if kind == DiskKind::File && size_bytes == 0 {
         return Err(StorageError::Empty {
             name: name.to_owned(),
             path: container_path.to_owned(),
         });
     }
+    let rdev = if kind == DiskKind::BlockDevice {
+        stat.st_rdev
+    } else {
+        0
+    };
     Ok(ResolvedDisk {
         name: name.to_owned(),
         kind,
         fd,
+        rdev,
         size_bytes,
         read_only,
     })
@@ -238,6 +340,7 @@ mod tests {
             name: "root".into(),
             kind: DiskKind::BlockDevice,
             fd: rustix::fs::open(&path, OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap(),
+            rdev: 0,
             size_bytes: 0,
             read_only: ro,
         };
@@ -274,67 +377,119 @@ mod tests {
         assert_eq!(d.size_bytes, 4096);
     }
 
+    const IMG: &str = "/var/lib/baryon/disks/root/disk.img";
+
+    /// Replace the image with a symlink to `target`.
+    fn image_link(dir: &std::path::Path, target: &std::path::Path) {
+        let img = dir.join("var/lib/baryon/disks/root/disk.img");
+        std::fs::remove_file(&img).unwrap();
+        symlink(target, img).unwrap();
+    }
+
     #[test]
     fn absolute_symlink_stays_inside_root() {
         let (dir, r) = setup();
         // A host file that must not be reachable.
         let outside = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(outside.path(), b"secret").unwrap();
-        symlink(
-            outside.path(),
-            dir.path().join("var/lib/baryon/disks/root/escape.img"),
-        )
-        .unwrap();
-        let err = resolve_disk(
-            r.as_fd(),
-            "root",
-            "/var/lib/baryon/disks/root/escape.img",
-            false,
-        )
-        .unwrap_err();
+        image_link(dir.path(), outside.path());
+        let err = resolve_disk(r.as_fd(), "root", IMG, false).unwrap_err();
         // Resolution happens inside the root, where the target does not exist.
         assert!(matches!(err, StorageError::Resolve { .. }), "{err}");
     }
 
     #[test]
     fn dotdot_cannot_escape() {
-        let (_dir, r) = setup();
-        let err = resolve_disk(r.as_fd(), "root", "/../../../../etc/passwd", false).unwrap_err();
+        let (dir, r) = setup();
+        image_link(
+            dir.path(),
+            std::path::Path::new("../../../../../../../../etc/passwd"),
+        );
+        let err = resolve_disk(r.as_fd(), "root", IMG, false).unwrap_err();
         assert!(matches!(err, StorageError::Resolve { .. }), "{err}");
     }
 
     #[test]
     fn relative_symlink_inside_root_is_followed() {
         let (dir, r) = setup();
-        symlink(
-            "disk.img",
-            dir.path().join("var/lib/baryon/disks/root/link.img"),
+        std::fs::write(
+            dir.path().join("var/lib/baryon/disks/root/real.img"),
+            [1u8; 512],
         )
         .unwrap();
-        let d = resolve_disk(
-            r.as_fd(),
-            "root",
-            "/var/lib/baryon/disks/root/link.img",
-            false,
-        )
-        .unwrap();
+        image_link(dir.path(), std::path::Path::new("real.img"));
+        let d = resolve_disk(r.as_fd(), "root", IMG, false).unwrap();
         assert_eq!(d.kind, DiskKind::File);
+        assert_eq!(d.size_bytes, 512);
+    }
+
+    #[test]
+    fn only_the_anchor_disk_paths_with_their_kind_are_accepted() {
+        assert_eq!(expected_kind(IMG), Some(DiskKind::File));
+        assert_eq!(
+            expected_kind("/dev/baryon/root"),
+            Some(DiskKind::BlockDevice)
+        );
+        for p in [
+            "/etc/passwd",
+            "/var/lib/baryon/disks/root/other.img",
+            "/dev/sda",
+            "/var/lib/baryon/disks/rootdisk.img",
+        ] {
+            assert_eq!(expected_kind(p), None, "{p}");
+        }
+        let (dir, r) = setup();
+        assert!(matches!(
+            resolve_disk(r.as_fd(), "root", "/etc/passwd", false),
+            Err(StorageError::UnknownPath { .. })
+        ));
+        // A regular file where the block device is expected.
+        std::fs::create_dir_all(dir.path().join("dev/baryon")).unwrap();
+        std::fs::write(dir.path().join("dev/baryon/root"), [0u8; 512]).unwrap();
+        assert!(matches!(
+            resolve_disk(r.as_fd(), "root", "/dev/baryon/root", false),
+            Err(StorageError::KindMismatch {
+                expected: "block device",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn device_nodes_must_be_on_the_containers_dev() {
+        // A node outside the root's /dev mount is refused even on a tmpfs.
+        let host_root = root(std::path::Path::new("/"));
+        let shm = tempfile::NamedTempFile::new_in("/dev/shm").unwrap();
+        let fd =
+            rustix::fs::open(shm.path(), OFlags::PATH | OFlags::CLOEXEC, Mode::empty()).unwrap();
+        assert!(!check_on_container_dev(host_root.as_fd(), fd.as_fd()).unwrap());
+        let (dir, _r) = setup();
+        let img = rustix::fs::open(
+            dir.path().join("var/lib/baryon/disks/root/disk.img"),
+            OFlags::PATH | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert!(!check_on_container_dev(host_root.as_fd(), img.as_fd()).unwrap());
     }
 
     #[test]
     fn rejects_directories_empty_files_and_relative_paths() {
         let (dir, r) = setup();
+        let img = dir.path().join("var/lib/baryon/disks/root/disk.img");
+        std::fs::write(&img, b"").unwrap();
         assert!(matches!(
-            resolve_disk(r.as_fd(), "root", "/var/lib/baryon/disks/root", false),
+            resolve_disk(r.as_fd(), "root", IMG, false),
+            Err(StorageError::Empty { .. })
+        ));
+        std::fs::remove_file(&img).unwrap();
+        std::fs::create_dir(&img).unwrap();
+        assert!(matches!(
+            resolve_disk(r.as_fd(), "root", IMG, false),
             Err(StorageError::WrongType {
                 found: "directory",
                 ..
             })
-        ));
-        std::fs::write(dir.path().join("empty.img"), b"").unwrap();
-        assert!(matches!(
-            resolve_disk(r.as_fd(), "root", "/empty.img", false),
-            Err(StorageError::Empty { .. })
         ));
         assert!(matches!(
             resolve_disk(r.as_fd(), "root", "var/lib/disk.img", false),
