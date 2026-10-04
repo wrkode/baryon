@@ -44,7 +44,7 @@ in the VM's namespace and owned by the VirtualMachine.
 - An imported root disk is written by a separate import Pod, `<vm>-import`,
   before the first Anchor Pod exists. It runs `baryon-anchor import` as the
   VM's host identity with the same restricted security context, claim
-  volume, and node affinity as the Anchor Pod, `restartPolicy: OnFailure`,
+  volume, and scheduling fields as the Anchor Pod, `restartPolicy: OnFailure`,
   and requests the VM's CPU and memory plus one
   `virtualization.baryon.io/import` slot. That resource has the same slot
   count and health as `virtualization.baryon.io/vm` but grants nothing, so
@@ -66,19 +66,44 @@ in the VM's namespace and owned by the VirtualMachine.
   baryon-controller replica (no leader election) and must be revisited
   before the controller runs highly available.
 
-Placement is completely determined by Kubernetes scheduling of this pod.
-The controller adds no placement fields except a required node affinity
-that keeps the pod off nodes where the VM hit a host identity conflict
-(ADR 0011).
-Baryon never picks a node.
+Placement is completely determined by Kubernetes scheduling of this pod
+and of the import Pod. The VirtualMachine's `spec.placement` carries
+Kubernetes scheduling constraints (`nodeSelector`, `affinity`,
+`tolerations`, `topologySpreadConstraints`, `priorityClassName`; ADR 0008),
+which the controller copies to both pods unchanged. The only requirement
+the controller adds is its own required node term, which keeps the pods off
+nodes where the VM hit a host identity conflict (ADR 0011); it is ANDed
+into every user node selector term. No `nodeName`, `schedulerName`, or
+other pod field is exposed. Baryon never picks a node and computes no node
+eligibility beside the scheduler: a pod that cannot be placed is reported
+with the scheduler's reason and message, and a pod the API server refuses
+at creation with `PodRejected`. Runtime health keeps gating placement
+through the device plugin resources.
+
+A placement change does not move a running VM. The Anchor Pod records a
+hash of the placement it was created with
+(`virtualization.baryon.io/placement-hash`); a difference is reported as
+`RestartRequired` with reason `PlacementChanged` and applies at the next
+start.
 
 ## Consequences
 
 - Scheduling, quotas, LimitRanges, and PodDisruptionBudgets apply to the
-  Anchor Pod like to any pod. The VirtualMachine API does not yet expose pod
-  placement (node selectors, tolerations, affinity, topology spread, priority
-  class) or Multus annotations, and the controller sets none; a curated
-  subset in the VM API is Planned.
+  Anchor Pod like to any pod. Namespace-scoped admission (PodNodeSelector,
+  PodTolerationRestriction, ResourceQuota scopes for PriorityClass and
+  cross-namespace pod affinity) judges the VM's pods by their namespace,
+  which is how administrators bound what VM placement may request. The
+  VirtualMachine API exposes no Multus annotations.
+- A preempted Anchor Pod stops its VM; the controller creates a new one,
+  which is scheduled like any pod.
+- A VM on a node-local volume stays on that volume's node whatever its
+  placement says; a placement that excludes the node keeps the VM
+  `Unschedulable`.
+- The import Pod carries the VM's labels and is never Ready by design. A
+  PodDisruptionBudget that selects VM labels counts it as unhealthy during
+  an import, which can block evictions of the other pods the budget
+  covers (for example `kubectl drain`). Deletions that bypass the Eviction
+  API, such as the Kairos Operator drain, are unaffected.
 - A stopped VM has no pod and holds no node resources. Its claim remains.
 - Stopping and starting a VM creates a new pod, so the VM may land on a
   different node and get a different pod IP. Its MAC address does not change
@@ -86,7 +111,11 @@ Baryon never picks a node.
 - If a node becomes unreachable, the Anchor Pod object stays until it is
   force-deleted or the node is marked out of service, exactly like a
   StatefulSet pod. The VM is not started elsewhere until then; this is the
-  fencing rule.
+  fencing rule. A VM that tolerates the `NoExecute` taints
+  `node.kubernetes.io/not-ready` or `node.kubernetes.io/unreachable` only
+  delays the eviction of its pod, and with it its own replacement; the
+  rule is unchanged. Tolerations of `node.kubernetes.io/out-of-service`
+  are refused, so the out-of-service taint applies to every VM pod.
 - `kubectl delete pod` on an Anchor Pod stops the VM. The controller creates
   a new one if the VM should run.
 - Capacity window: the import Pod does not reserve a
@@ -119,6 +148,10 @@ Baryon never picks a node.
   limited to labels, so the controller could change taints and
   schedulability of every node; and a label has no liveness. The device
   plugin's health is maintained by kubelet.
+- A controller-computed eligibility check with a `NoCompatibleNode` reason.
+  Rejected: a second eligibility computation beside the scheduler would
+  drift from it (taints, capacity, volume topology); the scheduler's own
+  message says which constraint excluded which nodes.
 
 ## Revisions
 
@@ -146,3 +179,13 @@ Baryon never picks a node.
   or vm resource (`ImportPodConflict`, `AnchorPodConflict`). The importer
   init container of Anchor Pods of earlier releases is no longer read as
   import evidence.
+- 2026-10-03: VM placement. The VirtualMachine gained `spec.placement`
+  (ADR 0008), which the controller copies to the import Pod and the Anchor
+  Pod; its identity-conflict term is ANDed into every user node selector
+  term; placement changes are `RestartRequired` (`PlacementChanged`), not
+  applied to a running VM; unschedulable pods report the scheduler's
+  reason, refused pods `PodRejected`. The Consequences no longer call
+  placement in the API Planned and record preemption, node-local volumes,
+  namespace admission, and the fencing effect of tolerations. After the
+  architecture review: a PodDisruptionBudget over VM labels counts the
+  never-Ready import Pod as unhealthy.

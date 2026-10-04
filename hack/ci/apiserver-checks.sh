@@ -36,6 +36,104 @@ spec:
     source:
       http: {url: "http://example.org/d.raw"}
 YAML
+reject "a toleration of every taint" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: tolerate-all, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    tolerations: [{operator: Exists}]
+YAML
+reject "a toleration of cordon" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: tolerate-cordon, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    tolerations: [{key: node.kubernetes.io/unschedulable, operator: Exists, effect: NoSchedule}]
+YAML
+reject "a toleration of control-plane nodes" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: tolerate-cp, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    tolerations: [{key: node-role.kubernetes.io/control-plane, operator: Exists}]
+YAML
+reject "a toleration of an out-of-service node" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: tolerate-oos, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    tolerations: [{key: node.kubernetes.io/out-of-service, operator: Exists, effect: NoExecute}]
+YAML
+reject "a system PriorityClass" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: system-priority, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    priorityClassName: system-node-critical
+YAML
+reject "cross-namespace pod anti-affinity" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: cross-ns, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    affinity:
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - {topologyKey: topology.kubernetes.io/zone, labelSelector: {matchLabels: {team: other}}, namespaceSelector: {}}
+YAML
+reject "cross-namespace preferred pod affinity" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: cross-ns-pref, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    affinity:
+      podAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - {weight: 10, podAffinityTerm: {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {a: b}}, namespaces: [other]}}
+YAML
+k apply --dry-run=server -f - >/dev/null <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: placed, namespace: default}
+spec:
+  className: general-small
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+  placement:
+    nodeSelector: {disk: ssd}
+    tolerations: [{key: dedicated, operator: Equal, value: vms, effect: NoSchedule}]
+    topologySpreadConstraints:
+      - {maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: DoNotSchedule, labelSelector: {matchLabels: {app: web}}}
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms: [{matchExpressions: [{key: zone, operator: In, values: [a]}]}]
+      podAntiAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          - {topologyKey: kubernetes.io/hostname, labelSelector: {matchLabels: {app: web}}}
+    priorityClassName: vm-high
+YAML
+echo "accepted as expected: placement with a selector, a toleration, a spread constraint, node affinity, same-namespace pod anti-affinity, and a PriorityClass"
 reject "dotted name" <<'YAML'
 apiVersion: virtualization.baryon.io/v1alpha1
 kind: VirtualMachine
@@ -174,7 +272,13 @@ denied "controller rewrites the import record" annotate pv ci-import-pv "${as_ct
 denied "controller removes the import record" annotate pv ci-import-pv "${as_ctl[@]}" virtualization.baryon.io/disk-import-
 k annotate pod ci-managed -n default "${as_ctl[@]}" virtualization.baryon.io/import-approved=claim-uid >/dev/null
 echo "allowed as expected: controller approves an import on a Baryon pod"
-denied "controller relabels a Baryon pod" label pod ci-managed -n default "${as_ctl[@]}" app=x
+k label pod ci-managed -n default "${as_ctl[@]}" app=x app.kubernetes.io/name=x >/dev/null
+k annotate pod ci-managed -n default "${as_ctl[@]}" virtualization.baryon.io/vm-label-keys=app,app.kubernetes.io/name >/dev/null
+echo "allowed as expected: controller copies VM labels (also app.kubernetes.io/name) and records their keys on a Baryon pod"
+denied "controller adds a node.kubernetes.io label to a Baryon pod" label pod ci-managed -n default "${as_ctl[@]}" node.kubernetes.io/x=y
+denied "controller changes a reserved label of a Baryon pod" label pod ci-managed -n default "${as_ctl[@]}" --overwrite app.kubernetes.io/managed-by=other
+denied "controller adds a reserved label to a Baryon pod" label pod ci-managed -n default "${as_ctl[@]}" virtualization.baryon.io/vm-name=x
+denied "controller relabels a pod it does not manage" label pod ci-unmanaged -n default "${as_ctl[@]}" app=x
 denied "controller annotates a pod it does not manage" annotate pod ci-unmanaged -n default "${as_ctl[@]}" virtualization.baryon.io/import-approved=x
 # Nobody but baryon-controller may set or change the import approval.
 denied_by() {

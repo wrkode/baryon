@@ -17,6 +17,7 @@ far. Other documents state a status label and link to
 | E2E storage | `tests/e2e/storage.sh` | one StorageClass and volume mode: import, boot, one VM per claim (`ClaimInUse`), Anchor Pod replacement and stop and start without a second import, a move to another node, deletion with claim, volume, and host cleanup | a cluster of Baryon nodes with the StorageClass | no |
 | E2E version skew | `tests/e2e/skew.sh` | one VM per node under whatever mix of cluster release and host image versions runs, reattach across versions after a baryon-virtd restart | a cluster of Baryon nodes during a rolling upgrade | no |
 | E2E import integrity | `tests/e2e/import-integrity.sh` | a block-mode imported disk: no stale backend data after the import, a namespace user's pods named like the Anchor Pod or the import Pod are not trusted, a namespace user cannot change the import record, the VM status, the disk source, or an import approval, exactly one import across start, Anchor Pod replacement, and a baryon-controller restart, `ImportStateUnknown` when an administrator removes the record | a cluster of Baryon nodes with a block-mode StorageClass, `NODE_SHELL`, and a namespace that admits root pods | no |
+| E2E placement | `tests/e2e/placement.sh` | `spec.placement` translated into the scheduling fields of the VM's pods: nodeSelector, node affinity, topology spread, tolerations, no eligible node, cordon, a pod refused by the API server (`PodRejected`), baryon-virtd stopped on the only eligible node, `PlacementChanged`; VM labels copied to and synced on the Anchor Pod | at least three Baryon nodes and `NODE_SHELL`; the script labels, taints, and cordons nodes and stops baryon-virtd on one node | no |
 | E2E hostile disk | `tests/e2e/hostile-disk.sh` | a claim whose `disk.img` is a block device node made by a pod is refused (`StorageFailed`) and no VMM starts | a cluster of Baryon nodes and a namespace that admits a root pod with the runtime's default capabilities | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
@@ -42,7 +43,7 @@ cargo test --workspace --locked
 | `baryon-anchor` | sparse writes, block device import (zero runs, tail zeroing, data past the first 1 MiB, unaligned device end, the size limit holds before writing), the block import contract on a device full of stale data with each of the three zeroing methods (every byte the image's or zero), a small image on a large device, a failed import leaves both the first and the last 1 MiB zero, devices smaller than the two protected regions, waiting for an approval that names the claim UID (empty and foreign values do not proceed), length checks (`Content-Length` mismatch refused, no length without a digest refused), redirect resolution (absolute, root-relative, path-relative; HTTPS to HTTP refused), import against a local HTTP server with checksum and marker handling, protocol negotiation results, termination messages |
 | `baryon-api` | CRD generation with CEL rules and list-map markers, defaults, conditions, quantities |
 | `baryon-node-agent` | device plugin slots and allocation, the import resource granting nothing, VirtualizationNode status translation including `ProtocolIncompatible` |
-| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access, no init container), import Pod shape (VM's CPU and memory, the import slot and no vm slot, no `vm-name` label, URL digest annotation, the approval file and no approval until the volume is checked, an approved import Pod carries its approval without changing the Anchor Pod hash), block mode, the import decision (`decide`: fresh volume, record for this claim, claim metadata not deciding, records for another claim or source, unreadable record, static, pre-bound, foreign, and cloned volumes, migration of earlier records and fail-closed `ImportStateUnknown`, the record's JSON field names), mutual binding of claim and volume before a record is written, completion only from the import Pod's spec (resource, claim, URL, claim UID, exit code; annotations ignored), an import Pod for another claim UID is stale, readiness of earlier releases only for the current claim, `status.rootDiskImport` kept for the same claim and reset for a recreated one, an exited importer alone does not make the disk ready, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, an init container of a pod with the Anchor Pod's name is no import evidence, pods that use a claim, status derivation for ready, failed, importing, pending import, unschedulable import Pod, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons, the watch trigger backoff |
+| `baryon-controller` | Anchor Pod shape (Guaranteed, restricted, no host access, no init container), import Pod shape (VM's CPU and memory, the import slot and no vm slot, no `vm-name` label, URL digest annotation, the approval file and no approval until the volume is checked, an approved import Pod carries its approval without changing the Anchor Pod hash), block mode, the import decision (`decide`: fresh volume, record for this claim, claim metadata not deciding, records for another claim or source, unreadable record, static, pre-bound, foreign, and cloned volumes, migration of earlier records and fail-closed `ImportStateUnknown`, the record's JSON field names), mutual binding of claim and volume before a record is written, completion only from the import Pod's spec (resource, claim, URL, claim UID, exit code; annotations ignored), an import Pod for another claim UID is stale, readiness of earlier releases only for the current claim, `status.rootDiskImport` kept for the same claim and reset for a recreated one, an exited importer alone does not make the disk ready, required node affinity away from `identityConflictNodes`, detection of an identity conflict from the anchor termination message, ownership of an existing Anchor Pod (controller owner reference with the VM UID), UID preconditions on deletes, an init container of a pod with the Anchor Pod's name is no import evidence, pods that use a claim, status derivation for ready, failed, importing, pending import, unschedulable import Pod, stopped, and blocked VMs, a running pod taking precedence over a blocked class, the two RestartRequired reasons, the watch trigger backoff, placement copied to both pods with Baryon's identity-conflict requirement ANDed into every user node selector term (user terms stay ORed), the reserved label keys and the VM labels on both pods, the `vm-label-keys` annotation and reserved keys dropped from it when it is read, the import Pod's readiness probe, a placement hash separate from the spec hash, scheduler messages cut to 1024 bytes |
 
 Kubernetes API behavior is covered by the API server checks and by the E2E
 tests. An envtest-based tier (kube-rs `envtest` crate) would need a Go
@@ -69,6 +70,14 @@ to confirm that:
 - a VirtualMachine name with a dot is rejected (DNS-1123 label rule)
 - a change of `rootDisk` is rejected and a change of `runPolicy` is
   accepted
+- `spec.placement`: a toleration of every taint, of a cordon
+  (`node.kubernetes.io/unschedulable`), of control-plane nodes, and of an
+  out-of-service node (`node.kubernetes.io/out-of-service`), a system
+  PriorityClass, required pod anti-affinity with a
+  `namespaceSelector`, and preferred pod affinity with `namespaces` are
+  rejected; a placement with a node selector, a toleration, a spread
+  constraint, node affinity, same-namespace pod anti-affinity, and a
+  PriorityClass is accepted
 - `baryon-vm-resource` denies a pod that requests `virtualization.baryon.io/vm`,
   a pod that requests `virtualization.baryon.io/import`, and a pod whose
   init container requests `virtualization.baryon.io/vm`
@@ -80,10 +89,15 @@ and an unmanaged pod, confirms that:
 
 - `baryon-controller-writes` denies a PersistentVolume spec change, another
   PersistentVolume annotation, an import record for another claim UID,
-  rewriting the record, removing it, relabeling a Baryon pod, and
-  annotating a pod that is not labeled `app.kubernetes.io/managed-by=baryon`
-- the controller may add the import record for the bound claim and set the
-  import approval on a Baryon pod
+  rewriting the record, removing it, adding a `node.kubernetes.io/` label,
+  changing `app.kubernetes.io/managed-by`, or adding
+  `virtualization.baryon.io/vm-name` on a Baryon pod, relabeling a pod that
+  is not labeled `app.kubernetes.io/managed-by=baryon`, and annotating such
+  a pod
+- the controller may add the import record for the bound claim, set the
+  import approval on a Baryon pod, and set VM labels (`app`,
+  `app.kubernetes.io/name`) and the `virtualization.baryon.io/vm-label-keys`
+  annotation on a Baryon pod
 - `baryon-import-approval` denies another user changing, removing, or
   setting the approval, and admits another user changing other annotations
   of a pod that has one
@@ -110,6 +124,7 @@ virtualization evidence.
 | `tests/e2e/skew.sh` | one VM per node under the current version mix; needs `NODE_SHELL` |
 | `tests/e2e/hostile-disk.sh` | a hostile `disk.img` is refused |
 | `tests/e2e/import-integrity.sh` | integrity of a block-mode import against stale data and namespace users; needs `NODE_SHELL`, `STORAGE_CLASS` (block volumes), and a namespace that admits root pods |
+| `tests/e2e/placement.sh` | VM placement and VM labels; needs `NODE_SHELL` and at least three Baryon nodes |
 | `tests/e2e/repeat.sh <count> <script> [args...]` | runs a script repeatedly, stops at the first failing run, and writes each run's output to `_output/e2e/<script>-<n>.log` in the current directory |
 
 The scripts are multi-node aware: each host check runs on the node that the
@@ -197,6 +212,28 @@ In order, it:
    boot the existing disk;
 8. deletes the VM and checks the node for leftovers.
 
+`placement.sh` steers placement only with node labels and taints it sets
+itself (administrator policy) and runtime health only by stopping
+baryon-virtd on one node; it removes the labels, taints, and cordons and
+starts baryon-virtd again on exit. It uses the first three nodes labeled
+`virtualization.baryon.io/host=true`, here called a, b, and c:
+
+| Case | What it does | Checks |
+|---|---|---|
+| selector | a VM with `nodeSelector` for a label set on a | Ready; on a |
+| labels | on the VM of the selector case: change and add labels on the VirtualMachine, set a label on the Anchor Pod as another actor, remove a VM label, set a reserved key on the VirtualMachine | VM label copied to the Anchor Pod; changed and added labels reach it; removed label leaves it; same Anchor Pod (no restart); the other actor's label stays; the reserved key is not copied |
+| affinity | required node affinity for a label set on b and c | Ready; on b or c |
+| spread | two VMs created together with the affinity of the previous case and a `topologySpreadConstraints` entry (`maxSkew: 1`, `kubernetes.io/hostname`, `DoNotSchedule`) over a shared label | both Ready; on different nodes |
+| tolerations | c tainted `NoSchedule`; a VM selecting c without and one with the toleration | the first is `Unschedulable` on `Scheduled` and `Ready`, with a scheduler message that names the taint; the second is Ready on c |
+| none | a VM whose `nodeSelector` matches no node, then the label is set on b | `Unschedulable`; Ready on b once the node is labeled |
+| cordon | a, the only eligible node, cordoned; uncordoned | `Unschedulable`; Ready after the uncordon |
+| rejected | a VM with an unknown `priorityClassName` | `Ready` reason `PodRejected` |
+| runtime | baryon-virtd stopped on a; a new VM selecting a; baryon-virtd started | a's VirtualizationNode not Ready; the new VM `Unschedulable` (the scheduler message is logged); the VM of the selector case keeps its Anchor Pod; after the start both VMs Ready with that Anchor Pod unchanged |
+| changed | `spec.placement` of the affinity case's VM changed | `RestartRequired` reason `PlacementChanged` |
+| deleting | delete every VM | all VirtualMachines gone; on the node of each of the eight Anchor Pods of the run, no runtime directory, VMM, DHCP responder, or mounts left |
+
+That is 65 checks: 33 for the cases and the deletion and 32 host checks.
+
 `hostile-disk.sh` creates a filesystem-mode claim, lets a root pod create a
 block device node as `disk.img` on it (`mknod`, which needs `CAP_MKNOD`),
 and starts a VM on that claim. It expects `StorageFailed` with a message
@@ -207,8 +244,8 @@ Anchor Pod.
 
 `lib.sh` reads the following; `lifecycle.sh` also reads `PROBE_IMAGE` and
 `SKIP_NETWORK`; `multinode.sh` and `hostile-disk.sh` read `PROBE_IMAGE`;
-`multinode.sh`, `storage.sh`, `skew.sh`, `hostile-disk.sh`, and
-`import-integrity.sh` read `STORAGE_CLASS` (required by
+`multinode.sh`, `storage.sh`, `skew.sh`, `hostile-disk.sh`,
+`import-integrity.sh`, and `placement.sh` read `STORAGE_CLASS` (required by
 `import-integrity.sh`); `import-integrity.sh` also reads `PROBE_IMAGE` and
 `SCAN_IMAGE`; `storage.sh` reads `VOLUME_MODE`; `skew.sh` reads
 `EXPECT_MIXED`.
@@ -257,6 +294,7 @@ NODE_SHELL=<path to your node-shell command> STORAGE_CLASS=<class> VOLUME_MODE=B
 NODE_SHELL=<path to your node-shell command> tests/e2e/hostile-disk.sh
 NODE_SHELL=<path to your node-shell command> STORAGE_CLASS=<block-capable class> tests/e2e/import-integrity.sh
 NODE_SHELL=<path to your node-shell command> EXPECT_MIXED=1 tests/e2e/skew.sh
+NODE_SHELL=<path to your node-shell command> tests/e2e/placement.sh
 ```
 
 To import from a server inside your network instead of the public Debian
@@ -341,6 +379,10 @@ An environment for the E2E tests and the manual procedures needs:
   true` ([compatibility.md](compatibility.md#csi-requirements)).
 - For `hostile-disk.sh`, a namespace that admits a pod running as root with
   the container runtime's default capabilities.
+- For `placement.sh`, at least three Baryon nodes on which the test may set
+  and remove labels, taints, and cordons and stop baryon-virtd on one node
+  for a while; run it on a cluster without other workloads that depend on
+  those nodes.
 - For `import-integrity.sh`, a StorageClass that provisions block volumes,
   a namespace that admits pods running as root (the filler and scanner
   read and write the raw device), and `deploy/base/tenant/roles.yaml`
@@ -406,7 +448,12 @@ top of 1835c0c that moved the import record to the PersistentVolume and
 added the import approval, the block import contract, and the tenant
 roles; "import integrity change, earlier revision" is the same change
 before the `baryon-import-approval` policy and the split of the requeue
-interval for refused VMs were added.
+interval for refused VMs were added. "placement change" is the change on
+top of 5f75b47 that added `spec.placement`, the VM labels on Baryon's pods,
+`PlacementChanged`, and `PodRejected`; "placement change, first build" is
+an earlier build of the same change, and "placement change, before the last
+four changes" is the build that differs from the final code only by the
+four changes named in its row.
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|
@@ -419,6 +466,8 @@ interval for refused VMs were added.
 | A block device node made by a pod as `disk.img` is refused | working tree | E2E hostile disk | 4 of 4 |
 | Import integrity on block volumes (stale data, a namespace user's pods and edits, one import across start, Anchor Pod replacement, and controller restart, `ImportStateUnknown` and recovery) | import integrity change; earlier revision | E2E import integrity | import integrity change: lvm-local Block 52 of 52 and ceph-rbd Block 52 of 52, including the check that a namespace user cannot set an import approval; earlier revision: 51 of 51 on each |
 | Root disk storage with the PersistentVolume record check | import integrity change; earlier revision | E2E storage | import integrity change: lvm-local Block 36 of 36, ceph-rbd Filesystem 47 of 47; earlier revision: lvm-local Block 36 of 36, ceph-rbd Block 47 of 47, ceph-rbd Filesystem 47 of 47, lvm-local Filesystem 36 of 36 |
+| VM placement and VM labels (lvm-local): selector, labels, affinity, spread, tolerations, no eligible node, cordon, `PodRejected`, baryon-virtd stopped on the only eligible node, `PlacementChanged` | placement change, before the last four changes | E2E placement | 65 of 65. In the runtime case the logged scheduler message was `Insufficient virtualization.baryon.io/import`. On the final code (reserved keys dropped from the recorded label keys, a 60 s requeue for `PodRejected`, the CI check for the out-of-service toleration, a code comment): 65 of 65, and lifecycle 33 of 33 |
+| Regression of the other suites with placement | placement change, first build | E2E lifecycle, deletion, storage, import integrity, multi-node, skew, hostile disk | lifecycle 33 of 33, deletion 19 of 19, storage ceph-rbd Block 47 of 47, import integrity lvm-local Block 52 of 52, multi-node 69 of 69, skew 30 of 30, hostile disk 4 of 4. With the review fixes (import Pod labels and probe, `PodRejected`, label-keys annotation, reserved-key rule), before the last four changes: the same suites passed with the same counts |
 | Regression of the other suites | import integrity change; earlier revision | E2E lifecycle, deletion, hostile disk, multi-node, skew | import integrity change: lifecycle 33 of 33, deletion 19 of 19; earlier revision: lifecycle 33 of 33, deletion 19 of 19, hostile disk 4 of 4, multi-node 69 of 69, skew 30 of 30 |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
 | Version skew, 1.1 cluster release (597b637) with mixed hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31; new anchors on 1.0 hosts took the UNIMPLEMENTED path of `Negotiate`; the node agent published `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones |

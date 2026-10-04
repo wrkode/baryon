@@ -38,9 +38,11 @@ pub(crate) struct Observed<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RestartReason {
     /// The VM spec or its class changed.
-    SpecChanged,
+    Spec,
     /// baryon-controller now uses a different anchor image.
-    AnchorImageChanged,
+    AnchorImage,
+    /// The VM's scheduling constraints changed.
+    Placement,
 }
 
 fn container<'a>(
@@ -73,6 +75,22 @@ fn split_reason(msg: &str) -> (String, String) {
     }
 }
 
+/// Longest scheduler message copied into a condition; the full message is
+/// on the pod.
+const SCHEDULER_MESSAGE_MAX: usize = 1024;
+
+/// `msg` cut to [`SCHEDULER_MESSAGE_MAX`] bytes at a character boundary.
+pub(crate) fn capped(msg: String) -> String {
+    if msg.len() <= SCHEDULER_MESSAGE_MAX {
+        return msg;
+    }
+    let mut end = SCHEDULER_MESSAGE_MAX;
+    while !msg.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} ...", &msg[..end])
+}
+
 /// The PodScheduled reason and message of a pod that is not bound to a
 /// node, if the scheduler reported one.
 fn unscheduled(pod: &Pod) -> Option<(String, String)> {
@@ -93,7 +111,7 @@ fn unscheduled(pod: &Pod) -> Option<(String, String)> {
         .find(|c| c.type_ == "PodScheduled" && c.status == "False")?;
     Some((
         c.reason.clone().unwrap_or_else(|| "Pending".to_owned()),
-        c.message.clone().unwrap_or_default(),
+        capped(c.message.clone().unwrap_or_default()),
     ))
 }
 
@@ -191,17 +209,23 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
     updates.push(storage);
 
     updates.push(match obs.restart_reason {
-        Some(RestartReason::SpecChanged) => ConditionUpdate::new(
+        Some(RestartReason::Spec) => ConditionUpdate::new(
             vm::RESTART_REQUIRED,
             true,
             "SpecChanged",
             "the spec or class changed; restart the VM to apply it",
         ),
-        Some(RestartReason::AnchorImageChanged) => ConditionUpdate::new(
+        Some(RestartReason::AnchorImage) => ConditionUpdate::new(
             vm::RESTART_REQUIRED,
             true,
             "AnchorImageChanged",
             "baryon-controller uses a different anchor image; restart the VM to use it",
+        ),
+        Some(RestartReason::Placement) => ConditionUpdate::new(
+            vm::RESTART_REQUIRED,
+            true,
+            "PlacementChanged",
+            "the scheduling constraints changed; they apply when the VM is restarted (a VM on a node-local volume stays on that volume's node)",
         ),
         None => ConditionUpdate::new(vm::RESTART_REQUIRED, false, "UpToDate", ""),
     });
@@ -247,7 +271,7 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
             let reason = sched
                 .and_then(|c| c.reason.clone())
                 .unwrap_or_else(|| "Pending".to_owned());
-            let message = sched.and_then(|c| c.message.clone()).unwrap_or_default();
+            let message = capped(sched.and_then(|c| c.message.clone()).unwrap_or_default());
             updates.push(ConditionUpdate::new(vm::SCHEDULED, false, reason, message));
         }
 
@@ -621,7 +645,7 @@ mod tests {
                 claim: Some(&claim),
                 pod: Some(&p),
                 has_import: true,
-                restart_reason: Some(RestartReason::AnchorImageChanged),
+                restart_reason: Some(RestartReason::AnchorImage),
                 ..Default::default()
             },
             now(),
@@ -637,7 +661,7 @@ mod tests {
             &Observed {
                 claim: Some(&claim),
                 pod: Some(&p),
-                restart_reason: Some(RestartReason::SpecChanged),
+                restart_reason: Some(RestartReason::Spec),
                 ..Default::default()
             },
             now(),
@@ -802,5 +826,14 @@ mod tests {
         );
         assert_eq!(cond(&s, vm::STORAGE_READY).status, "False");
         assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ImportingDisk");
+    }
+
+    #[test]
+    fn long_scheduler_messages_are_capped() {
+        assert_eq!(capped("short".into()), "short");
+        let long = "x".repeat(5000);
+        let c = capped(long);
+        assert!(c.len() <= SCHEDULER_MESSAGE_MAX + 4);
+        assert!(c.ends_with(" ..."));
     }
 }

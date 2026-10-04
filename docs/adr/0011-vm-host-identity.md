@@ -34,8 +34,11 @@ mapping would change the ownership model of every imported image.
   identity on a node (`IdentityConflict`): a collision is never tolerated.
 - On `IdentityConflict`, baryon-controller records the node in the VM's
   `status.identityConflictNodes`, replaces the Anchor Pod, and keeps the
-  new pod off the recorded nodes with required node affinity. The list is
-  cleared when the VM is stopped.
+  new pod off the recorded nodes with required node affinity: a
+  `matchFields` requirement `metadata.name NotIn <nodes>`, ANDed into every
+  required node selector term of the VM's own placement (ADR 0004), so no
+  user term can reach a recorded node. The list is cleared when the VM is
+  stopped.
 - Filesystem access: the pod's `fsGroup` is the VM's gid, and Baryon's
   importer writes images mode 0600 as the VM's uid. Raw block volumes are
   devices, not files: their access is governed by the device permissions
@@ -48,8 +51,14 @@ mapping would change the ownership model of every imported image.
 
 - A collision is visible (`Ready=False`, reason `IdentityConflict`, an
   event) and resolves itself by placing the VM on another node. It cannot
-  resolve on a single-node cluster; the VM then stays not ready until the
-  conflicting VM is gone and the VM is stopped and started.
+  resolve on a single-node cluster, or when the VM's placement allows no
+  other node; the VM then stays not ready (`Unschedulable` once every
+  allowed node is recorded) until the conflicting VM is gone and the VM is
+  stopped and started.
+- Tolerations in the VM's placement do not weaken this exclusion or the
+  fencing rule: the exclusion is a required node term, not a taint, and
+  tolerating `NoExecute` not-ready or unreachable taints only delays the
+  eviction of the VM's pod (ADR 0004).
 - The probability of a collision among n VMs on one node is about
   n^2 / 2^31, roughly one in 200000 for 100 VMs.
 - A VirtualMachine re-created under the same name has a new Kubernetes UID
@@ -90,3 +99,7 @@ mapping would change the ownership model of every imported image.
 - 2026-10-03: the containerd `device_ownership_from_security_context`
   requirement for block-mode disks and its effect on /dev/kvm in Anchor
   containers were recorded.
+- 2026-10-03: with VM placement (ADR 0004, ADR 0008) the identity-conflict
+  requirement is ANDed into every user node selector term; a placement that
+  allows only recorded nodes leaves the VM `Unschedulable`; tolerations do
+  not affect the exclusion or fencing.

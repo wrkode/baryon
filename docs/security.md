@@ -150,7 +150,7 @@ own VM, because a different spec for the same pod is refused.
 
 | Subject | Rights | Notes |
 |---|---|---|
-| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and to setting the import approval on Baryon pods; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
+| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and, on Baryon pods, to the import approval, the `vm-label-keys` annotation, and labels with keys that are not reserved; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
 | `baryon-vm-edit` (ClusterRole, aggregated into `edit` and `admin`) | virtualmachines: get, list, watch, create, update, patch, delete, deletecollection; virtualmachineclasses: get, list, watch | For namespace users (`deploy/base/tenant/roles.yaml`). No `virtualmachines/status`: baryon-controller is its only writer. Nothing on PersistentVolumes. |
 | `baryon-vm-view` (ClusterRole, aggregated into `view`) | virtualmachines, virtualmachineclasses: get, list, watch | Read access for namespace users. |
 | baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Narrowed per node by admission, below. |
@@ -174,7 +174,7 @@ user cannot set an import approval (see [testing.md](testing.md#results)).
 |---|---|
 | `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. |
 | `baryon-node-agent-own-node` | baryon-node-agent may create or update only the VirtualizationNode named after the node in its token (`userInfo.extra["authentication.kubernetes.io/node-name"]`). Requests without that information are denied. |
-| `baryon-controller-writes` | Updates of PersistentVolumes and pods by baryon-controller. A PersistentVolume may only gain the annotation `virtualization.baryon.io/disk-import` when it has none, with spec, labels, finalizers, owner references, and every other annotation unchanged; the volume must be Bound, and the record must have the form `{"vmUID":"<uuid>","claimUID":"<claimRef.uid>","source":"sha256:<64 hex>"}` with the volume's own `claimRef.uid`. A pod update may only change `virtualization.baryon.io/import-approved`, with everything else unchanged, and only on pods labeled `app.kubernetes.io/managed-by=baryon`. CI checks: a PV spec change, another PV annotation, a record for another claim, rewriting and removing the record, relabeling a Baryon pod, and annotating an unmanaged pod are denied; adding the record for the bound claim and approving a Baryon pod are allowed. |
+| `baryon-controller-writes` | Updates of PersistentVolumes and pods by baryon-controller. A PersistentVolume may only gain the annotation `virtualization.baryon.io/disk-import` when it has none, with spec, labels, finalizers, owner references, and every other annotation unchanged; the volume must be Bound, and the record must have the form `{"vmUID":"<uuid>","claimUID":"<claimRef.uid>","source":"sha256:<64 hex>"}` with the volume's own `claimRef.uid`. A pod update may change only the annotations `virtualization.baryon.io/import-approved` and `virtualization.baryon.io/vm-label-keys` and labels whose key is not reserved, with spec, finalizers, owner references, and every other annotation unchanged, and only on pods labeled `app.kubernetes.io/managed-by=baryon`. Reserved keys: `app.kubernetes.io/managed-by`, and keys whose prefix is `baryon.io`, `kubernetes.io`, `k8s.io`, or a subdomain of them other than `app.kubernetes.io` (the same rule as `reserved_label` in `crates/controller/src/anchor.rs`). CI checks: a PV spec change, another PV annotation, a record for another claim, rewriting and removing the record, and annotating an unmanaged pod are denied; adding the record for the bound claim and approving a Baryon pod are allowed. Copying `app` and `app.kubernetes.io/name` and recording their keys is allowed; adding `node.kubernetes.io/x`, changing `app.kubernetes.io/managed-by`, adding `virtualization.baryon.io/vm-name`, and relabeling an unmanaged pod are denied. |
 | `baryon-import-approval` | Nobody but baryon-controller may set, change, or remove the annotation `virtualization.baryon.io/import-approved` on any pod, at creation or by update. Namespace users can patch pods, so without this policy they could approve an import into a volume the controller would refuse. CI checks: another user changing, removing, or setting the approval is denied; another user changing other annotations of a pod with an approval is allowed. |
 
 The policies are part of the supported installation. Without them:
@@ -199,6 +199,40 @@ check through the kubelet pod resources API is Designed. Extended resources
 cannot be requested by ephemeral containers or through pod-level resources
 today, so neither is a current bypass; the policy checks containers and
 init containers.
+
+### VM placement
+
+A namespace user who can create VirtualMachines controls the scheduling
+fields of the pods baryon-controller creates for them (`spec.placement`,
+see [api.md](api.md#placement)). baryon-controller creates those pods in the
+VM's namespace, so they pass the same admission as the user's own pods.
+
+baryon-node-agent tolerates every taint (`deploy/base/node-agent/`), so the
+`virtualization.baryon.io/vm` and `virtualization.baryon.io/import`
+resources exist on every Baryon host, including tainted ones. Which tainted
+hosts a VM can reach is therefore decided by the VM's tolerations, within
+the limits below.
+
+| Control | Rule | Status |
+|---|---|---|
+| Tolerations | CRD validation refuses a toleration without a key (it would tolerate every taint) and tolerations of `node.kubernetes.io/unschedulable` (cordon), `node-role.kubernetes.io/control-plane`, and `node.kubernetes.io/out-of-service`. A VM cannot land on a cordoned or control-plane node by tolerating its taint, and the out-of-service taint applies to every VM pod. Custom isolation taints are the administrator's: restrict which namespaces may tolerate them with PodTolerationRestriction, and pin namespaces to nodes with PodNodeSelector. Tolerating the `NoExecute` not-ready and unreachable taints only delays the eviction of the VM's own pod; fencing is unchanged (ADR 0004). | Implemented; Tested by the CI API server checks (all four refused tolerations) and by the placement E2E on the k0s cluster (a tainted node takes only the VM that tolerates its taint; a cordoned node takes no new VM) |
+| `priorityClassName` | Names starting with `system-` are refused, so a VM cannot use `system-node-critical` or `system-cluster-critical` to preempt cluster components. Other PriorityClasses are limited with a ResourceQuota scoped to them. A preempted Anchor Pod stops its VM. | Implemented; Tested by the CI API server checks; an unknown PriorityClass gives `PodRejected` in the placement E2E on the k0s cluster |
+| Pod affinity and anti-affinity | Terms, required and preferred, may not set `namespaces` or `namespaceSelector`, so a VM's placement cannot observe or react to pods of other namespaces; terms apply within the VM's namespace. The ResourceQuota scope `CrossNamespacePodAffinity` also applies to VM pods. | Implemented; Tested by the CI API server checks |
+| VM labels | The VM's labels reach its pods, but reserved keys are never copied, so a namespace user cannot give a VM pod Baryon's own labels (`virtualization.baryon.io/vm-name`, `app.kubernetes.io/managed-by`) or labels under `kubernetes.io` or `k8s.io` through the VirtualMachine. The same rule bounds baryon-controller's pod updates in `baryon-controller-writes`. A label sync removes only keys recorded in the pod's `virtualization.baryon.io/vm-label-keys` annotation; users can edit that annotation, so baryon-controller drops reserved keys from it before acting on it. Labels set by other actors stay. Namespace users can still label pods in their namespace directly, as they could before. As with any pod, a VM whose labels match a Service selector in its namespace becomes a backend of that Service. | Implemented; Tested by the placement E2E on the k0s cluster (copy, sync, removal, another actor's label kept, reserved key not copied), the CI API server checks (controller label rights), and unit tests (reserved keys, recorded keys filtered) |
+
+Admission and quota apply by namespace: PodNodeSelector,
+PodTolerationRestriction, and ResourceQuota see the VM's pods in the VM's
+namespace, not their creator. These are Kubernetes mechanisms; Baryon has
+no test for them.
+
+Baryon components must not be selected by `app.kubernetes.io/*` labels
+across namespaces. Tenants can set, for example,
+`app.kubernetes.io/part-of=baryon` on their VMs, and the label reaches the
+VM's pods. No Baryon admission policy or cross-namespace selector depends
+on such labels; the baryon-controller Deployment and the baryon-node-agent
+DaemonSet select their own pods by `app.kubernetes.io/name` only within
+`baryon-system`. Do not create VirtualMachines in `baryon-system` or grant
+namespace users rights there; nothing in Baryon enforces this.
 
 ## VMM confinement
 
@@ -319,8 +353,10 @@ What it does not give:
   refused. Without a digest, an HTTPS source is trusted as served. What the
   importer can reach is what the import Pod can reach; constrain it with a
   NetworkPolicy that selects `virtualization.baryon.io/import-for` or
-  `app.kubernetes.io/managed-by=baryon` (policies that select VMs by
-  `vm-name` do not select the import Pod). Imported images are mode 0600,
+  `app.kubernetes.io/managed-by=baryon`. The import Pod carries the VM's
+  own labels, so a policy that selects the VM by those labels applies to it
+  too (an egress-deny policy for VMs also blocks their imports); a policy
+  that selects VMs by `vm-name` does not. Imported images are mode 0600,
   owned by the VM's identity.
 - Source URL exposure: annotations (the import Pod's `import-source`, the
   PersistentVolume record) and Events carry only a digest of the URL
@@ -487,7 +523,7 @@ and the disk handoff:
 | containerd `device_ownership_from_security_context` is a node-wide requirement and makes /dev/kvm openable in Anchor containers | Low | Documented (Host paths and devices) |
 | A stale import Pod was deleted and the Anchor Pod created in the same reconcile | Low | Fixed: the Anchor Pod is created only after the import Pod is gone |
 | The source URL was copied to annotations and events | Low | Partially fixed: annotations hold a digest and the event has no URL; the URL remains in the import Pod arguments, the VirtualMachine, and the filesystem import marker; URLs must not carry secrets |
-| NetworkPolicy for VM pods does not select the import Pod | Low | Documented (Data handling, [api.md](api.md#labels-on-objects-baryon-creates)) |
+| NetworkPolicy for VM pods does not select the import Pod | Low | Documented (Data handling, [api.md](api.md#labels-on-objects-baryon-creates)); since the placement change, a policy that selects the VM's own labels selects the import Pod too |
 | `check_device_access` is a diagnostic, not a control | Note | Documented (Who does what) |
 | The `/dev` mount check read the statx mount id without checking the returned mask, and does not fit user namespaces | Note | Partially fixed: the mask is checked and the check fails closed; Kubernetes user namespaces with bind-mounted device nodes would be refused (Planned item below) |
 | A reused device minor after a forced detach could point a reopen at another volume | Note | Open |
@@ -513,6 +549,14 @@ architecture review:
 | The readiness of earlier releases compares timestamps with one-second resolution | Note | Accepted: a StorageReady=True of an earlier claim with the same name that changed in the same second as the current claim's creation counts for the current claim; the effect is a refusal or a disk treated as already imported (the VM boots an empty volume), never an import over a used disk |
 | PersistentVolume `get` is cluster-wide and PersistentVolume `patch` depends on `baryon-controller-writes` | Low | Documented (RBAC) |
 
+Findings of the 2026-10-03 review of VM placement:
+
+| Finding | Severity | State |
+|---|---|---|
+| Placement allowed system PriorityClasses, cross-namespace pod affinity, and tolerations of control-plane and out-of-service taints | Medium | Fixed: CRD validation rules; Tested by the CI API server checks |
+| Label sync removed labels set by other actors | Low | Fixed: only recorded keys are removed; Tested by the placement E2E on the k0s cluster |
+| Recorded label keys were read from a user-writable annotation without the reserved-key filter | Low | Fixed: the keys are filtered with `reserved_label`; unit test |
+
 ## Future hardening
 
 | Item | Status |
@@ -525,7 +569,7 @@ architecture review:
 | `ReadWriteOncePod` for claims Baryon creates where the CSI driver supports it | Planned |
 | Admission policy limiting baryon-controller's PersistentVolume and pod updates (`baryon-controller-writes`) | Implemented, Tested (CI API server checks) |
 | Record and verify the block device identity across VMM recovery | Planned |
-| Feature-aware placement (one placement-only resource per runtime protocol feature, ADR 0012) | Planned |
+| Feature-aware and capability-aware placement (one placement-only resource per runtime protocol feature or consumed host capability, ADR 0012) | Planned; deferred until Baryon consumes a capability |
 | Dependency gate in CI (cargo-deny or cargo-audit) and a smaller parsing surface in baryon-virtd | Designed |
 | AppArmor or SELinux profiles for baryon-virtd and the VMM | Planned |
 

@@ -45,6 +45,11 @@ by a CEL rule): it is the guest hostname and the value of the
 | `rootDisk.storageClassName` | string | StorageClass of the claim Baryon creates. Default StorageClass when unset. |
 | `rootDisk.volumeMode` | `Filesystem` (default) or `Block` | Volume mode of the claim Baryon creates for an `http` source. Not allowed with `persistentVolumeClaim`: an existing claim is used in its own volume mode. |
 | `networks` | list-map keyed by `name`, at most 8 entries | `name` is a DNS-1123 label (1 to 63 characters). v1alpha1 accepts exactly one entry, with `pod: {}`. Defaults to `[{name: default, pod: {}}]`. |
+| `placement.nodeSelector` | map of strings | Node labels the node must have. See [Placement](#placement). |
+| `placement.affinity` | core/v1 `Affinity` | Node affinity, pod affinity, and pod anti-affinity. Pod affinity terms may not set `namespaces` or `namespaceSelector`. |
+| `placement.tolerations` | list of core/v1 `Toleration`, at most 32 | Tolerations of node taints. Each needs a non-empty `key`; some keys are refused. |
+| `placement.topologySpreadConstraints` | list of core/v1 `TopologySpreadConstraint`, at most 8 | Spread of VMs over topology domains. |
+| `placement.priorityClassName` | string, at most 253 characters | PriorityClass of the VM's pods. Names starting with `system-` are refused. |
 
 `rootDisk` is immutable after creation, including `size` (CEL rule
 `self == oldSelf`, message `rootDisk is immutable; create a new
@@ -59,7 +64,8 @@ network with CEL rules. The CI API server checks (a k0s API server, see
 [testing.md](testing.md#api-server-checks)) confirm that a VM with two disk
 sources, a plain-HTTP source without `sha256`, a name with a dot, and a
 change of `rootDisk` are rejected, and that a change of `runPolicy` is
-accepted.
+accepted. The placement rules and their checks are in
+[Placement](#placement).
 
 The import runs in a separate import Pod, `<vm>-import`, before the VM's
 first Anchor Pod exists (see [architecture.md](architecture.md#import-pod-implemented-tested-by-the-deletion-and-storage-e2e-on-the-k0s-cluster)).
@@ -67,12 +73,6 @@ The importer (`baryon-anchor import`, `crates/anchor/src/import.rs`) applies
 the same digest rule on its own, refuses a redirect from HTTPS to plain HTTP,
 and resolves relative redirect locations against the current URL path. It
 refuses an image larger than `rootDisk.size` before writing past it.
-
-VM placement controls (nodeSelector, tolerations, affinity, priority) are
-Planned; the API has no fields for them today. The only placement field
-baryon-controller sets on the Anchor Pod is a required node affinity that
-keeps it off the nodes in `status.identityConflictNodes` (see
-[Host identity](#host-identity)).
 
 The root disk claim layout is a stable format of v1alpha1: in filesystem
 mode, `disk.img` at the volume root, plus `.baryon-import.json` (the import
@@ -106,6 +106,130 @@ annotation to a new value:
 kubectl annotate virtualmachine debian --overwrite virtualization.baryon.io/restartedAt="$(date -u +%FT%TZ)"
 ```
 
+### Placement
+
+Status: Implemented; Tested by the placement E2E on the k0s cluster and by
+the CI API server checks (see [testing.md](testing.md#results)). Design:
+ADR 0004 and ADR 0008.
+
+`spec.placement` holds Kubernetes scheduling constraints, with the meaning
+they have on a pod. Kubernetes remains the scheduler: baryon-controller
+copies `nodeSelector`, `affinity`, `tolerations`,
+`topologySpreadConstraints`, and `priorityClassName` to the VM's import Pod
+and Anchor Pod, and the Kubernetes scheduler places those pods. Baryon never
+picks a node. Other pod fields, such as `nodeName` and `schedulerName`, are
+not part of the API.
+
+```yaml
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: web-1
+  labels:
+    app: web
+spec:
+  className: general-small
+  rootDisk:
+    size: 10Gi
+    source:
+      http:
+        url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.raw
+  placement:
+    nodeSelector:
+      disk: ssd
+    tolerations:
+      - {key: dedicated, operator: Equal, value: vms, effect: NoSchedule}
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: kubernetes.io/hostname
+        whenUnsatisfiable: DoNotSchedule
+        labelSelector: {matchLabels: {app: web}}
+```
+
+Baryon adds one required node requirement of its own: while
+`status.identityConflictNodes` is not empty, `metadata.name NotIn <those
+nodes>` (a `matchFields` requirement, see [Host identity](#host-identity)).
+It is ANDed into every term of
+`affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution`
+(Kubernetes ORs the terms and ANDs the requirements within a term), so no
+user term reaches a recorded node. Whether a node runs a healthy Baryon
+runtime is not a placement term: the pods request the
+`virtualization.baryon.io/vm` or `virtualization.baryon.io/import`
+resource (see [Extended resources](#extended-resources)).
+
+Validation, by CEL rules in the CRD:
+
+- Every toleration needs a non-empty `key`, so a toleration of every taint
+  (`operator: Exists` without a key) is refused.
+- Tolerations of `node.kubernetes.io/unschedulable` (a cordoned node),
+  `node-role.kubernetes.io/control-plane`, and
+  `node.kubernetes.io/out-of-service` are refused.
+- `priorityClassName` may not start with `system-`.
+- Pod affinity and pod anti-affinity terms, required and preferred, may not
+  set `namespaces` or `namespaceSelector`. They apply within the VM's
+  namespace.
+
+The CI API server checks confirm that a toleration of every taint, of a
+cordon, of control-plane nodes, and of an out-of-service node, a system
+PriorityClass, required pod anti-affinity with a `namespaceSelector`, and
+preferred pod affinity with `namespaces` are rejected, and that a placement
+with every field is accepted.
+
+Administrator policy: the VM's pods are created by baryon-controller in the
+VM's namespace, and Kubernetes admission judges a pod by its namespace, not
+by who created it. PodNodeSelector, PodTolerationRestriction, and
+ResourceQuota with the `PriorityClass` and `CrossNamespacePodAffinity`
+scopes therefore apply to VM pods like to other pods of the namespace. To
+keep namespaces off nodes reserved with a custom taint, restrict
+tolerations with PodTolerationRestriction; to limit high PriorityClasses,
+use a ResourceQuota scoped to them. These are Kubernetes mechanisms; Baryon
+has no test for them.
+
+Priority and node failure:
+
+- A preempted Anchor Pod stops its VM, like any deletion of the Anchor Pod.
+  baryon-controller then creates a new Anchor Pod, which the scheduler
+  places like any other pod.
+- Tolerating the `NoExecute` taints `node.kubernetes.io/not-ready` and
+  `node.kubernetes.io/unreachable` only delays the eviction of the VM's pod
+  from a failed node, and with it the VM's replacement. It does not change
+  fencing: the Anchor Pod object stays until it is deleted, and no new
+  Anchor Pod is created before (ADR 0004). Inferred from the fencing rule;
+  not tested.
+
+Changes: placement is not applied to a running VM. The Anchor Pod carries
+the annotation `virtualization.baryon.io/placement-hash`; when the VM's
+placement no longer matches it, `RestartRequired` is True with reason
+`PlacementChanged` and the message "the scheduling constraints changed;
+they apply when the VM is restarted (a VM on a node-local volume stays on
+that volume's node)". Restart the VM (`restartedAt`, or stop and start) to
+apply the change. An Anchor Pod of an earlier release has no placement hash
+and matches a VM without placement. An import Pod that already exists
+keeps the placement it was created with.
+
+When the import Pod or the Anchor Pod cannot be scheduled, `Scheduled` is
+False with the scheduler's reason (`Unschedulable`) and message, cut to
+1024 bytes; the full message is on the pod. `Running` and `Ready` carry the
+same reason. When the API server refuses to create the pod (HTTP 422 or
+403: an invalid placement, an unknown PriorityClass, a quota, an admission
+policy), `Scheduled`, `Running`, and `Ready` are False with reason
+`PodRejected` and the API server's message. Baryon computes no node
+eligibility of its own beside the scheduler, so there is no
+"no compatible node" reason: the scheduler's message says which
+constraint excluded which nodes. A node whose baryon-virtd is down or
+speaks an incompatible protocol has no free `virtualization.baryon.io/vm`
+or `virtualization.baryon.io/import` slot, and the scheduler reports it
+that way, for example `Insufficient virtualization.baryon.io/import`.
+
+Capability requirements (IOMMU, IOMMUFD, hugepages, NUMA, VFIO, Cloud
+Hypervisor features) are not part of placement. Baryon consumes none of
+them today: VFIO, hugepage-backed guest memory, and NUMA pinning are Not
+supported. KVM and runtime health are already enforced by the
+`virtualization.baryon.io/vm` slot. A capability gets a name in the API
+only when Baryon consumes it and it is tested; the Designed direction is
+recorded in ADR 0012. VirtualizationNode reports host capabilities for
+information only.
+
 ### Status
 
 | Field | Description |
@@ -125,11 +249,11 @@ Conditions:
 
 | Type | True when | Typical reasons when False |
 |---|---|---|
-| `Scheduled` | The Anchor Pod is bound to a node. | `Pending`, `Unschedulable`, `Stopped`, `ClassNotFound`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and while the disk is not ready the `StorageReady` reason |
+| `Scheduled` | The Anchor Pod is bound to a node. | `Pending`, `Unschedulable`, `PodRejected`, `Stopped`, `ClassNotFound`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and while the disk is not ready the `StorageReady` reason |
 | `StorageReady` | The claim is bound and the disk is in place: for an `http` source, its import is recorded on the PersistentVolume. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict`, and the import refusals `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` |
 | `Running` | The Anchor container is running; it runs or starts the VMM (reason `AnchorRunning`). It does not by itself mean that the VMM runs. | `Starting`, `Stopping`, `Stopped`, `Pending`, and the failure reasons below |
-| `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
-| `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the spec or the class changed after the Anchor Pod was created) or `AnchorImageChanged` (baryon-controller now uses a different anchor image). | `UpToDate` |
+| `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `PodRejected`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
+| `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (`spec.placement` changed, see [Placement](#placement)), or `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` |
 
 Precedence: an existing Anchor Pod decides `Running` and `Ready`. Class or
 spec problems such as `ClassNotFound` are shown only when there is no Anchor
@@ -163,6 +287,13 @@ VirtualMachine does not control or that does not request the
 `virtualization.baryon.io/import` resource. baryon-controller never uses
 it as import evidence and creates neither an import Pod nor an Anchor Pod
 until it is gone; delete it.
+
+`PodRejected`: the API server refused to create the import Pod or the
+Anchor Pod (HTTP 422 or 403), for example for an unknown PriorityClass, an
+exceeded quota, or an admission policy. The message is the API server's,
+cut to 1024 bytes. baryon-controller looks at such a VM again every 60 s,
+because a quota that frees up or a PriorityClass created later can make the
+pod acceptable; otherwise fix the placement or the namespace policy.
 
 `ImportingDisk` with the message "the importer finished; recording the
 import": the importer exited 0 and baryon-controller has not yet written
@@ -243,11 +374,43 @@ spec:
 | `virtualization.baryon.io/vm-uid` | Anchor Pods | VirtualMachine UID |
 | `virtualization.baryon.io/import-for` | import Pods | VirtualMachine UID |
 | `app.kubernetes.io/managed-by` | objects created by Baryon | `baryon` |
+| the VM's own labels, except reserved keys | Anchor Pods, import Pods | the VirtualMachine's `metadata.labels` |
 
-The import Pod has no `vm-name` label, so Services that select VMs do not
-select it. A NetworkPolicy that should apply to the importer's downloads
-must select `virtualization.baryon.io/import-for` or
-`app.kubernetes.io/managed-by=baryon`.
+| Annotation | On | Value |
+|---|---|---|
+| `virtualization.baryon.io/vm-label-keys` | Anchor Pods | comma-separated keys of the VM labels Baryon copied |
+| `virtualization.baryon.io/placement-hash` | Anchor Pods | hash of the placement the pod was created with |
+
+VM labels: baryon-controller copies the VirtualMachine's labels to the
+Anchor Pod and the import Pod when it creates them, and keeps them in sync
+on the running Anchor Pod without a restart. Services, NetworkPolicies, pod
+affinity and anti-affinity, and topology spread constraints can therefore
+select VMs by their own labels, and recommended labels such as
+`app.kubernetes.io/name` propagate. Reserved keys are not copied:
+`app.kubernetes.io/managed-by`, keys whose prefix is `baryon.io` or a
+subdomain of it, and keys whose prefix is `kubernetes.io`, `k8s.io`, or a
+subdomain of either, other than `app.kubernetes.io`. A sync removes only
+labels listed in `virtualization.baryon.io/vm-label-keys`; labels that
+others set on the pod stay. Users can edit that annotation, so
+baryon-controller ignores reserved keys in it and never removes a reserved
+label. Status: Tested by the placement E2E on the k0s
+cluster (copied, changed without a restart, removed, another actor's label
+kept, a reserved key not copied).
+
+The import Pod's labels are set when it is created and are not synced
+while the import runs; a label change reaches the Anchor Pod. The import
+Pod carries the VM's labels so that the scheduler counts it in
+the VM's spread constraints and pod anti-affinity; with node-local storage
+that binds on first use, the import Pod decides the VM's node. It has a
+readiness probe that never passes, so a Service that selects the VM's
+labels never sends traffic to it. It has no `vm-name` label, so Services
+that select `virtualization.baryon.io/vm-name` do not select it. A
+NetworkPolicy that selects the VM's own labels also applies to the
+importer's downloads, so an egress-deny policy for VMs also blocks HTTP
+imports; one that should apply only to the importer must select
+`virtualization.baryon.io/import-for`. A PodDisruptionBudget that selects
+the VM's labels counts the import Pod, which is never Ready, as unhealthy
+during an import (see ADR 0004).
 
 The `vm-name` label replaced an earlier label key that was the same string as
 the extended resource `virtualization.baryon.io/vm`.
@@ -309,6 +472,15 @@ visible in the Node's `status.allocatable`:
 |---|---|---|---|
 | `virtualization.baryon.io/vm` | 64 by default | each Anchor Pod, once | /dev/kvm and the baryon-virtd anchor socket |
 | `virtualization.baryon.io/import` | the same as `vm`, with the same health | each import Pod, once | nothing; it only places the import Pod on a node that can run the VM |
+
+While baryon-virtd on a node is unreachable or speaks an incompatible
+runtime protocol, the node agent reports both resources unhealthy and
+kubelet sets their allocatable to zero. A VM whose placement allows only
+such nodes stays `Unschedulable`, with a scheduler message such as
+`Insufficient virtualization.baryon.io/import`, and starts once the runtime
+is back; a VM already running on the node keeps its Anchor Pod. Tested by
+the placement E2E on the k0s cluster (baryon-virtd stopped on the only
+eligible node).
 
 With the `baryon-vm-resource` admission policy installed
 (`deploy/base/policy/vm-resource.yaml`), only baryon-controller may create

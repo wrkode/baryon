@@ -105,7 +105,15 @@ UID.
 - When the claim binds on first use (`WaitForFirstConsumer`), the import
   Pod is created without approval, the claim binds when the pod is
   scheduled, and baryon-controller sets the approval once the volume
-  passes the freshness check.
+  passes the freshness check. The import Pod carries the VM's `spec.placement`
+  and labels, so the VM's placement, including its spread constraints and
+  pod anti-affinity, decides the node the volume binds on (see
+  [api.md](api.md#placement)). A node-local volume then keeps the VM on
+  that node; a later placement change does not move it. Because the import
+  Pod carries the VM's labels, a NetworkPolicy that denies egress to pods
+  with those labels also blocks the download; allow the image server for
+  pods labeled `virtualization.baryon.io/import-for` (see
+  [networking.md](networking.md#selecting-vms-by-their-labels)).
 - When the decision refuses, baryon-controller deletes the import Pod.
 - After 30 minutes without approval the importer fails and kubelet restarts
   it (`restartPolicy: OnFailure`).

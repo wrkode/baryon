@@ -15,10 +15,9 @@ use std::collections::BTreeMap;
 
 use k8s_openapi::api::core::v1::{
     Affinity, Capabilities, Container, DownwardAPIVolumeFile, DownwardAPIVolumeSource, EnvVar,
-    ExecAction, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    ObjectFieldSelector, PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec,
-    Probe, ResourceRequirements, SeccompProfile, SecurityContext, Volume, VolumeDevice,
-    VolumeMount,
+    ExecAction, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm, ObjectFieldSelector,
+    PersistentVolumeClaimVolumeSource, Pod, PodSecurityContext, PodSpec, Probe,
+    ResourceRequirements, SeccompProfile, SecurityContext, Volume, VolumeDevice, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -33,6 +32,33 @@ use baryon_runtime_api::identity::VmIdentity;
 
 /// Annotation on the Anchor Pod with the hash of its inputs.
 pub(crate) const SPEC_HASH_ANNOTATION: &str = "virtualization.baryon.io/spec-hash";
+/// Annotation on the Anchor Pod with the hash of its scheduling constraints.
+pub(crate) const PLACEMENT_HASH_ANNOTATION: &str = "virtualization.baryon.io/placement-hash";
+/// Annotation on the Anchor Pod listing the VM label keys Baryon copied,
+/// comma-separated, so that a label sync removes only those.
+pub(crate) const LABEL_KEYS_ANNOTATION: &str = "virtualization.baryon.io/vm-label-keys";
+
+/// The value of [`LABEL_KEYS_ANNOTATION`] for `labels`.
+pub(crate) fn label_keys_value(labels: &BTreeMap<String, String>) -> String {
+    labels.keys().cloned().collect::<Vec<_>>().join(",")
+}
+
+/// The VM label keys Baryon copied to `pod`.
+pub(crate) fn copied_label_keys(pod: &Pod) -> std::collections::BTreeSet<&str> {
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(LABEL_KEYS_ANNOTATION))
+        // Users can edit the annotation; never treat a reserved key as one
+        // Baryon may remove.
+        .map(|v| {
+            v.split(',')
+                .filter(|k| !k.is_empty() && !reserved_label(k))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Name of the anchor container in the Anchor Pod.
 pub(crate) const ANCHOR_CONTAINER: &str = "anchor";
 /// Name of the importer container, in the import Pod and in Anchor Pods
@@ -86,12 +112,23 @@ pub(crate) struct AnchorInput {
     /// Nodes the Anchor Pod must not be scheduled to (host identity
     /// conflicts).
     pub avoid_nodes: Vec<String>,
+    /// The VM's scheduling constraints.
+    pub placement: Option<baryon_api::vm::Placement>,
+    /// The VM's own labels for its Anchor Pod (see [`vm_labels`]).
+    pub labels: BTreeMap<String, String>,
 }
 
 impl AnchorInput {
+    /// Hash of the VM's scheduling constraints; a change is reported, not
+    /// applied to a running VM.
+    pub(crate) fn placement_hash(&self) -> String {
+        resources::spec_hash(&[&serde_json::to_string(&self.placement).unwrap_or_default()])
+    }
+
     /// Hash of what the VM's spec and class determine. The anchor image is
-    /// not part of it: a newer runtime is reported separately.
-    /// The import is not part of it: it runs in its own pod.
+    /// not part of it: a newer runtime is reported separately. The import
+    /// is not part of it: it runs in its own pod. Placement has its own
+    /// hash.
     pub(crate) fn spec_hash(&self) -> String {
         resources::spec_hash(&[
             &self.vcpus.to_string(),
@@ -136,28 +173,63 @@ fn restricted_container_security() -> SecurityContext {
     }
 }
 
-/// Required node affinity that keeps the pod off `nodes` (matched by node
-/// name, not by label, so it holds whatever labels the nodes carry).
-fn avoid_nodes_affinity(nodes: &[String]) -> Option<Affinity> {
-    if nodes.is_empty() {
-        return None;
+/// The affinity of a VM's pods: the user's affinity with Baryon's own
+/// required node terms ANDed into every user node selector term (terms are
+/// ORed, requirements within a term ANDed). Today Baryon's only own term
+/// keeps the pod off `avoid` nodes (host identity conflicts), matched by
+/// node name so it holds whatever labels the nodes carry.
+fn pod_affinity(user: Option<&Affinity>, avoid: &[String]) -> Option<Affinity> {
+    let mut affinity = user.cloned().unwrap_or_default();
+    if !avoid.is_empty() {
+        let own = NodeSelectorRequirement {
+            key: "metadata.name".to_owned(),
+            operator: "NotIn".to_owned(),
+            values: Some(avoid.to_vec()),
+        };
+        let node = affinity.node_affinity.get_or_insert_default();
+        let required = node
+            .required_during_scheduling_ignored_during_execution
+            .get_or_insert_with(|| NodeSelector {
+                node_selector_terms: Vec::new(),
+            });
+        if required.node_selector_terms.is_empty() {
+            required
+                .node_selector_terms
+                .push(NodeSelectorTerm::default());
+        }
+        for term in &mut required.node_selector_terms {
+            term.match_fields.get_or_insert_default().push(own.clone());
+        }
     }
-    Some(Affinity {
-        node_affinity: Some(NodeAffinity {
-            required_during_scheduling_ignored_during_execution: Some(NodeSelector {
-                node_selector_terms: vec![NodeSelectorTerm {
-                    match_fields: Some(vec![NodeSelectorRequirement {
-                        key: "metadata.name".to_owned(),
-                        operator: "NotIn".to_owned(),
-                        values: Some(nodes.to_vec()),
-                    }]),
-                    ..Default::default()
-                }],
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
+    (affinity != Affinity::default()).then_some(affinity)
+}
+
+/// Whether a label key is reserved: its prefix is baryon.io or a subdomain,
+/// kubernetes.io or k8s.io or a subdomain other than app.kubernetes.io, or
+/// it is app.kubernetes.io/managed-by, which Baryon sets. VM labels with
+/// such keys are not copied to the VM's pods; the recommended
+/// app.kubernetes.io/ labels are. The same rule is in the admission policy
+/// baryon-controller-writes.
+pub(crate) fn reserved_label(key: &str) -> bool {
+    if key == keys::MANAGED_BY_LABEL {
+        return true;
+    }
+    let Some((prefix, _)) = key.split_once('/') else {
+        return false;
+    };
+    let under = |domain: &str| prefix == domain || prefix.ends_with(&format!(".{domain}"));
+    under("baryon.io")
+        || ((under("kubernetes.io") || under("k8s.io")) && prefix != "app.kubernetes.io")
+}
+
+/// The VM's own labels that its Anchor Pod carries, so Services, pod
+/// affinity, and spread constraints can select VMs by them.
+pub(crate) fn vm_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    labels
+        .iter()
+        .filter(|(k, _)| !reserved_label(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Errors building an Anchor Pod.
@@ -232,7 +304,29 @@ fn vm_pod_spec(
             }),
             ..Default::default()
         }]),
-        affinity: avoid_nodes_affinity(&input.avoid_nodes),
+        affinity: pod_affinity(
+            input.placement.as_ref().and_then(|p| p.affinity.as_ref()),
+            &input.avoid_nodes,
+        ),
+        node_selector: input
+            .placement
+            .as_ref()
+            .filter(|p| !p.node_selector.is_empty())
+            .map(|p| p.node_selector.clone()),
+        tolerations: input
+            .placement
+            .as_ref()
+            .filter(|p| !p.tolerations.is_empty())
+            .map(|p| p.tolerations.clone()),
+        topology_spread_constraints: input
+            .placement
+            .as_ref()
+            .filter(|p| !p.topology_spread_constraints.is_empty())
+            .map(|p| p.topology_spread_constraints.clone()),
+        priority_class_name: input
+            .placement
+            .as_ref()
+            .and_then(|p| p.priority_class_name.clone()),
         restart_policy: Some(restart.to_owned()),
         automount_service_account_token: Some(false),
         enable_service_links: Some(false),
@@ -285,6 +379,15 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
         name: IMPORT_CONTAINER.to_owned(),
         image: Some(input.anchor_image.clone()),
         args: Some(args),
+        // Never ready, so Services that select the VM's labels never send
+        // traffic to the import Pod.
+        readiness_probe: Some(Probe {
+            exec: Some(ExecAction {
+                command: Some(vec!["/baryon-anchor".to_owned(), "probe".to_owned()]),
+            }),
+            period_seconds: Some(60),
+            ..Default::default()
+        }),
         resources: Some(vm_resources(input, keys::IMPORT_RESOURCE)),
         volume_mounts: Some(mounts),
         volume_devices: devices,
@@ -292,13 +395,14 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
         termination_message_policy: Some("File".to_owned()),
         ..Default::default()
     };
-    let labels = BTreeMap::from([
-        (IMPORT_FOR_LABEL.to_owned(), input.vm_uid.clone()),
-        (
-            keys::MANAGED_BY_LABEL.to_owned(),
-            keys::MANAGED_BY.to_owned(),
-        ),
-    ]);
+    // The VM's labels let the scheduler count the import Pod in the VM's
+    // spread and anti-affinity: with node-local storage it decides the node.
+    let mut labels = input.labels.clone();
+    labels.insert(IMPORT_FOR_LABEL.to_owned(), input.vm_uid.clone());
+    labels.insert(
+        keys::MANAGED_BY_LABEL.to_owned(),
+        keys::MANAGED_BY.to_owned(),
+    );
     let mut annotations =
         BTreeMap::from([(IMPORT_SOURCE_ANNOTATION.to_owned(), source_digest(url))]);
     if let Some(uid) = &input.import_approval {
@@ -338,7 +442,7 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
 
 /// Build the Anchor Pod.
 pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
-    let mut labels = BTreeMap::new();
+    let mut labels = input.labels.clone();
     labels.insert(keys::VM_NAME_LABEL.to_owned(), input.vm_name.clone());
     labels.insert(keys::VM_UID_LABEL.to_owned(), input.vm_uid.clone());
     labels.insert(
@@ -348,6 +452,11 @@ pub(crate) fn build(input: &AnchorInput) -> Result<Pod, BuildError> {
 
     let mut annotations = BTreeMap::new();
     annotations.insert(SPEC_HASH_ANNOTATION.to_owned(), input.spec_hash());
+    annotations.insert(PLACEMENT_HASH_ANNOTATION.to_owned(), input.placement_hash());
+    annotations.insert(
+        LABEL_KEYS_ANNOTATION.to_owned(),
+        label_keys_value(&input.labels),
+    );
     if let Some(r) = &input.restarted_at {
         annotations.insert(keys::RESTARTED_AT_ANNOTATION.to_owned(), r.clone());
     }
@@ -422,6 +531,8 @@ mod tests {
             anchor_image: "baryon/anchor:dev".into(),
             restarted_at: None,
             avoid_nodes: Vec::new(),
+            placement: None,
+            labels: BTreeMap::new(),
         }
     }
 
@@ -646,5 +757,140 @@ mod tests {
         let mut i = input(true);
         i.restarted_at = Some("2026-10-03T00:00:00Z".into());
         assert_ne!(a, i.spec_hash());
+    }
+
+    #[test]
+    fn reserved_labels_are_not_copied() {
+        for k in [
+            "virtualization.baryon.io/vm-name",
+            "baryon.io/x",
+            "app.kubernetes.io/managed-by",
+            "kubernetes.io/hostname",
+            "node.k8s.io/x",
+        ] {
+            assert!(reserved_label(k), "{k}");
+        }
+        for k in [
+            "app",
+            "tier",
+            "example.org/team",
+            "notkubernetes.io/x",
+            "app.kubernetes.io/name",
+            "app.kubernetes.io/instance",
+        ] {
+            assert!(!reserved_label(k), "{k}");
+        }
+        assert!(reserved_label("app.kubernetes.io/managed-by"));
+        let labels: BTreeMap<String, String> = [
+            ("app".into(), "web".into()),
+            ("app.kubernetes.io/name".into(), "x".into()),
+            ("node.kubernetes.io/x".into(), "y".into()),
+        ]
+        .into();
+        assert_eq!(
+            vm_labels(&labels).keys().collect::<Vec<_>>(),
+            ["app", "app.kubernetes.io/name"]
+        );
+    }
+
+    #[test]
+    fn placement_reaches_both_pods_and_baryon_terms_are_anded() {
+        use baryon_api::vm::Placement;
+        use k8s_openapi::api::core::v1::{NodeAffinity, Toleration};
+        let user_term = |v: &str| NodeSelectorTerm {
+            match_expressions: Some(vec![NodeSelectorRequirement {
+                key: "zone".into(),
+                operator: "In".into(),
+                values: Some(vec![v.into()]),
+            }]),
+            ..Default::default()
+        };
+        let mut i = input(true);
+        i.avoid_nodes = vec!["node2".into()];
+        i.placement = Some(Placement {
+            node_selector: [("disk".into(), "ssd".into())].into(),
+            affinity: Some(Affinity {
+                node_affinity: Some(NodeAffinity {
+                    required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+                        node_selector_terms: vec![user_term("a"), user_term("b")],
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            tolerations: vec![Toleration {
+                key: Some("dedicated".into()),
+                operator: Some("Equal".into()),
+                value: Some("vms".into()),
+                effect: Some("NoSchedule".into()),
+                ..Default::default()
+            }],
+            topology_spread_constraints: Vec::new(),
+            priority_class_name: Some("vm-high".into()),
+        });
+        i.labels = [("app".into(), "web".into())].into();
+        for pod in [build(&i).unwrap(), build_import(&i).unwrap()] {
+            let spec = pod.spec.unwrap();
+            assert_eq!(spec.node_selector.unwrap()["disk"], "ssd");
+            assert_eq!(
+                spec.tolerations.unwrap()[0].key.as_deref(),
+                Some("dedicated")
+            );
+            assert_eq!(spec.priority_class_name.as_deref(), Some("vm-high"));
+            let terms = spec
+                .affinity
+                .unwrap()
+                .node_affinity
+                .unwrap()
+                .required_during_scheduling_ignored_during_execution
+                .unwrap()
+                .node_selector_terms;
+            assert_eq!(terms.len(), 2, "user terms stay ORed");
+            for t in &terms {
+                assert_eq!(t.match_expressions.as_ref().unwrap().len(), 1);
+                let f = &t.match_fields.as_ref().unwrap()[0];
+                assert_eq!(
+                    (f.key.as_str(), f.operator.as_str()),
+                    ("metadata.name", "NotIn")
+                );
+            }
+        }
+        // Labels go to both pods, so the import Pod counts in spread and
+        // anti-affinity; the import Pod is never ready, so Services skip it.
+        assert_eq!(build(&i).unwrap().metadata.labels.unwrap()["app"], "web");
+        let import = build_import(&i).unwrap();
+        assert_eq!(import.metadata.labels.unwrap()["app"], "web");
+        assert!(import.spec.unwrap().containers[0].readiness_probe.is_some());
+        assert_eq!(
+            build(&i).unwrap().metadata.annotations.unwrap()[LABEL_KEYS_ANNOTATION],
+            "app"
+        );
+        // Placement is not part of the spec hash; it has its own.
+        let mut j = i.clone();
+        j.placement = None;
+        assert_eq!(i.spec_hash(), j.spec_hash());
+        assert_ne!(i.placement_hash(), j.placement_hash());
+    }
+
+    #[test]
+    fn recorded_label_keys_exclude_reserved_keys() {
+        let pod = Pod {
+            metadata: ObjectMeta {
+                annotations: Some(
+                    [(
+                        LABEL_KEYS_ANNOTATION.to_owned(),
+                        "app,virtualization.baryon.io/vm-name,app.kubernetes.io/managed-by,,tier"
+                            .to_owned(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            copied_label_keys(&pod).into_iter().collect::<Vec<_>>(),
+            ["app", "tier"]
+        );
     }
 }

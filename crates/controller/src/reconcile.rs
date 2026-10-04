@@ -676,6 +676,11 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 import_pod = Some(created);
             }
             Err(kube::Error::Api(e)) if e.code == 409 => {}
+            // The API server refused the pod (invalid placement, an unknown
+            // PriorityClass, quota, admission): report it on the VM.
+            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 403 => {
+                obs_blocked = Some(("PodRejected".to_owned(), status::capped(e.message.clone())));
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -735,15 +740,22 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 )
                 .await;
             } else if let (Ok(c), Ok(d)) = (&compute, &disk) {
-                let want =
-                    anchor_input(vm, ctx, c, d, restarted_at.clone(), &conflict_nodes).spec_hash();
-                restart_reason = if p.annotations().get(SPEC_HASH_ANNOTATION) != Some(&want) {
-                    Some(status::RestartReason::SpecChanged)
-                } else if anchor_image_of(p) != Some(ctx.anchor_image.as_str()) {
-                    Some(status::RestartReason::AnchorImageChanged)
-                } else {
-                    None
-                };
+                let input = anchor_input(vm, ctx, c, d, restarted_at.clone(), &conflict_nodes);
+                // The VM's labels follow it to the running Anchor Pod; they
+                // select it for Services and for other VMs' placement.
+                if let Err(e) = sync_labels(&pods, p, &input.labels).await {
+                    tracing::warn!(vm = %vm_name, error = %e, "cannot copy the VM's labels to its Anchor Pod");
+                }
+                restart_reason =
+                    if p.annotations().get(SPEC_HASH_ANNOTATION) != Some(&input.spec_hash()) {
+                        Some(status::RestartReason::Spec)
+                    } else if placement_changed(p, &input) {
+                        Some(status::RestartReason::Placement)
+                    } else if anchor_image_of(p) != Some(ctx.anchor_image.as_str()) {
+                        Some(status::RestartReason::AnchorImage)
+                    } else {
+                        None
+                    };
             }
         }
         pod = pods.get_opt(&pod_name).await?;
@@ -773,6 +785,11 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
             }
             // Another reconcile or a terminating predecessor holds the name.
             Err(kube::Error::Api(e)) if e.code == 409 => {}
+            // The API server refused the pod (invalid placement, an unknown
+            // PriorityClass, quota, admission): report it on the VM.
+            Err(kube::Error::Api(e)) if e.code == 422 || e.code == 403 => {
+                obs_blocked = Some(("PodRejected".to_owned(), status::capped(e.message.clone())));
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -797,6 +814,15 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         Some("DiskBindingPending") => 30,
         // Refusals that wait for an administrator.
         Some(_) => 120,
+        // A refused pod may be accepted later (quota, a PriorityClass
+        // created afterwards).
+        None if observed
+            .blocked
+            .as_ref()
+            .is_some_and(|(r, _)| r == "PodRejected") =>
+        {
+            60
+        }
         None => 300,
     };
     Ok(Action::requeue(Duration::from_secs(requeue)))
@@ -885,7 +911,63 @@ fn anchor_input(
         anchor_image: ctx.anchor_image.clone(),
         restarted_at,
         avoid_nodes: avoid_nodes.to_vec(),
+        placement: vm.spec.placement.clone(),
+        labels: anchor::vm_labels(&vm.labels().clone()),
     }
+}
+
+/// Whether the VM's placement differs from the one its Anchor Pod was
+/// created with. An Anchor Pod of an earlier release has no placement hash;
+/// it matches a VM without placement.
+fn placement_changed(pod: &Pod, input: &AnchorInput) -> bool {
+    match pod.annotations().get(anchor::PLACEMENT_HASH_ANNOTATION) {
+        Some(h) => h != &input.placement_hash(),
+        None => input.placement.is_some(),
+    }
+}
+
+/// Make the VM labels on its Anchor Pod equal to `wanted`. Only labels
+/// Baryon copied (listed in the pod's label-keys annotation) are removed;
+/// labels that others set on the pod are left alone.
+async fn sync_labels(
+    pods: &Api<Pod>,
+    pod: &Pod,
+    wanted: &BTreeMap<String, String>,
+) -> Result<(), Error> {
+    let copied = anchor::copied_label_keys(pod);
+    let current: BTreeMap<String, String> = pod
+        .labels()
+        .iter()
+        .filter(|(k, _)| copied.contains(k.as_str()) || wanted.contains_key(*k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let wanted_keys = anchor::label_keys_value(wanted);
+    let keys_current = pod
+        .annotations()
+        .get(anchor::LABEL_KEYS_ANNOTATION)
+        .cloned()
+        .unwrap_or_default();
+    if &current == wanted && keys_current == wanted_keys {
+        return Ok(());
+    }
+    let mut changes = serde_json::Map::new();
+    for k in copied.iter().filter(|k| !wanted.contains_key(**k)) {
+        changes.insert((*k).to_owned(), serde_json::Value::Null);
+    }
+    for (k, v) in wanted {
+        changes.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    let patch = serde_json::json!({"metadata": {
+        "labels": changes,
+        "annotations": {anchor::LABEL_KEYS_ANNOTATION: wanted_keys},
+    }});
+    pods.patch(
+        &pod.name_any(),
+        &PatchParams::default(),
+        &Patch::Merge(&patch),
+    )
+    .await?;
+    Ok(())
 }
 
 /// A Baryon pod of another VM that mounts `claim`, if any.

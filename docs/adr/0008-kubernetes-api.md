@@ -22,13 +22,28 @@ Group `virtualization.baryon.io`, version `v1alpha1`, three kinds:
 
 VirtualMachine spec contains only fields with an implementation:
 `className`, `runPolicy` (`Running` or `Stopped`), `rootDisk` (an HTTP
-source imported into a claim Baryon creates, or an existing claim), and
+source imported into a claim Baryon creates, or an existing claim),
 `networks` (a list-map keyed by a DNS-1123 label name; exactly one, the pod
-network). CEL rules enforce one disk source, a size for imported disks, an
+network), and `placement`. CEL rules enforce one disk source, a size for imported disks, an
 `http` or `https` URL, a SHA-256 digest when the URL is plain `http`, the
 single pod network, and an immutable `rootDisk` (`self == oldSelf`,
 including `size`): the disk's content and claim are bound to it, so another
-disk means a new VirtualMachine. Restart is requested
+disk means a new VirtualMachine.
+
+`placement` uses the Kubernetes core/v1 types with their pod meaning:
+`nodeSelector`, `affinity` (`Affinity`), `tolerations` (at most 32),
+`topologySpreadConstraints` (at most 8), and `priorityClassName` (at most
+253 characters). It is copied to the VM's pods (ADR 0004); `nodeName`,
+`schedulerName`, and other PodSpec fields are not exposed. CEL rules refuse
+a toleration without a key and tolerations of
+`node.kubernetes.io/unschedulable`, `node-role.kubernetes.io/control-plane`,
+and `node.kubernetes.io/out-of-service`; a `priorityClassName` starting
+with `system-`; and `namespaces` or `namespaceSelector` in pod affinity and
+anti-affinity terms, required and preferred, which therefore apply within
+the VM's namespace. A placement change is not applied to a running VM: it
+is reported through `RestartRequired`.
+
+Restart is requested
 with the `virtualization.baryon.io/restartedAt` annotation, following the
 `kubectl rollout restart` convention.
 
@@ -64,13 +79,24 @@ list-map keyed by `type`. There is no phase field; `kubectl get` shows Ready
 and its reason. An existing Anchor Pod decides `Running` and `Ready`; class
 or spec problems show only when there is no pod. `Running` means the Anchor
 container runs (it runs or starts the VMM); the controller cannot see the
-VMM itself. `RestartRequired` distinguishes `SpecChanged` (spec or class)
-from `AnchorImageChanged` (a newer runtime from a controller upgrade).
+VMM itself. `RestartRequired` distinguishes `SpecChanged` (spec other than placement, or class),
+`PlacementChanged` (`spec.placement`, compared through the Anchor Pod's
+`virtualization.baryon.io/placement-hash`; an Anchor Pod without the
+annotation matches a VM without placement), and `AnchorImageChanged` (a
+newer runtime from a controller upgrade). When the import Pod or the Anchor
+Pod cannot be scheduled, `Scheduled` and `Ready` are False with the
+scheduler's reason and message (cut to 1024 bytes); when the API server
+refuses to create one (HTTP 422 or 403), the reason is `PodRejected` with
+the API server's message.
 
 Anchor Pods carry the labels `virtualization.baryon.io/vm-name`,
 `virtualization.baryon.io/vm-uid`, and `app.kubernetes.io/managed-by=baryon`;
 root disk claims Baryon creates carry `virtualization.baryon.io/vm-name` and
-`app.kubernetes.io/managed-by=baryon`.
+`app.kubernetes.io/managed-by=baryon`. The VM's own labels, except reserved
+keys, are copied to its Anchor Pod and import Pod (ADR 0007): reserved are
+`app.kubernetes.io/managed-by` and keys whose prefix is `baryon.io`,
+`kubernetes.io`, or `k8s.io`, or a subdomain of one of them other than
+`app.kubernetes.io`.
 Each VM executes as a distinct unprivileged host identity, stable for the
 life of the VirtualMachine object (ADR 0011); how it is allocated is not
 part of the API. The guest MAC, SMBIOS UUID, and NoCloud instance-id derive
@@ -105,6 +131,12 @@ PersistentVolumes.
 - New fields require an implementation. Direct kernel boot, additional
   disks, Multus networks, CPU pinning, hugepages, and VFIO are Designed or
   Planned and are not in the schema.
+- Host capability requirements (IOMMU, hugepages, NUMA, VFIO, runtime
+  protocol features) are not in the schema; when one ships, the requirement
+  belongs on VirtualMachineClass, not in `placement` (ADR 0012).
+- `placement` is bounded by the cluster's own controls: namespace admission
+  (PodNodeSelector, PodTolerationRestriction) and ResourceQuota scopes see
+  the VM's pods in the VM's namespace.
 - `runPolicy: Stopped` deletes the Anchor Pod. A stopped VM consumes no node
   resources.
 
@@ -139,3 +171,9 @@ PersistentVolumes.
 - 2026-10-03: `status.rootDiskImport` (ADR 0006), the tenant roles
   `baryon-vm-edit` and `baryon-vm-view`, and the removal of the import
   state read from Anchor Pod init containers of earlier releases.
+- 2026-10-03: `spec.placement` with the Kubernetes types `nodeSelector`,
+  `Affinity`, `Toleration`, `TopologySpreadConstraint`, and
+  `priorityClassName`, its CEL rules, the `PlacementChanged` restart
+  reason, the scheduler's reason and message on `Scheduled` and `Ready`,
+  `PodRejected`, the copy of the VM's labels to its pods, and the rule that
+  capability requirements, when they ship, belong on VirtualMachineClass.

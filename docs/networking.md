@@ -13,7 +13,7 @@ reached.
 | Guest network path | Status |
 |---|---|
 | From another pod to the pod IP (SSH banner, ping) | Tested on the k0s cluster, the Hadron node, and the kind host |
-| Through a ClusterIP Service, by DNS name, also after the VM moved to a new Anchor Pod | Tested on the k0s cluster, the Hadron node, and the kind host |
+| Through a ClusterIP Service, by DNS name, also after the VM moved to a new Anchor Pod | Tested on the k0s cluster, the Hadron node, and the kind host, with a Service that selects `virtualization.baryon.io/vm-name`; a Service that selects the VM's own labels is Inferred (see [Selecting VMs by their labels](#selecting-vms-by-their-labels)) |
 | Cross-node traffic | Tested on the k0s cluster (kube-router): one probe pod reached VMs on all three nodes; observed on the kind host (kindnet) in Experiment B; not tested with flannel |
 | NetworkPolicy applying to the guest as to the pod | Inferred from the design (the guest traffic is the pod's traffic), not tested |
 | Guest-initiated egress (to other pods, Services, outside the cluster) | Inferred, not tested |
@@ -23,6 +23,48 @@ Baryon has no SDN. A VM uses the network of its Anchor Pod, configured by the
 cluster's CNI. The guest takes over the pod's IP address, so a Service that
 selects the Anchor Pod (label `virtualization.baryon.io/vm-name=<vm>`)
 reaches the guest, and cluster DNS names resolve to it.
+
+## Selecting VMs by their labels
+
+baryon-controller copies the VirtualMachine's labels, except reserved keys,
+to its Anchor Pod and import Pod, and keeps them in sync on the running
+Anchor Pod without a restart (ADR 0007). A Service, a NetworkPolicy, pod
+affinity, or a spread constraint can therefore select VMs by their own
+labels:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+spec:
+  selector:
+    app: web          # a label on the VirtualMachines
+  ports:
+    - port: 22
+```
+
+- Reserved keys are not copied: `app.kubernetes.io/managed-by`, and keys
+  whose prefix is `baryon.io`, `kubernetes.io`, or `k8s.io`, or a
+  subdomain of one of them other than `app.kubernetes.io`.
+  `app.kubernetes.io/name` and the other recommended labels are copied.
+- A sync removes only the labels Baryon copied (listed in the Anchor Pod's
+  annotation `virtualization.baryon.io/vm-label-keys`); labels that others
+  set on the pod stay.
+- The import Pod carries the same labels, set when it is created and not
+  synced during the import. Its readiness probe never passes, so a Service
+  does not route to it, except a Service with
+  `publishNotReadyAddresses: true`, which also publishes the importer.
+- A NetworkPolicy that selects the VM's labels also applies to the import
+  Pod and so to the image download: an egress-deny policy for VMs also
+  blocks HTTP imports. NetworkPolicies add up, so a second policy that
+  selects `virtualization.baryon.io/import-for` and allows egress to the
+  image server lets the import run.
+- A user who edits the `vm-label-keys` annotation cannot make a sync remove
+  a reserved label: baryon-controller ignores reserved keys in it.
+- The label copy, sync, and removal are Tested by the placement E2E on the
+  k0s cluster. Guest reachability through a Service that selects VM labels
+  is Inferred; the tested Service path selects `vm-name`.
 
 ## Data path
 

@@ -72,6 +72,20 @@ express a breaking change except changing the package.
   only on hosts that implement the feature, like the
   `virtualization.baryon.io/import` resource that grants nothing (ADR
   0004).
+- Host capability requirements (IOMMU, IOMMUFD, hugepages, NUMA, VFIO,
+  Cloud Hypervisor features) are deferred. Baryon consumes none of them
+  today (VFIO, hugepage-backed guest memory, and NUMA pinning are Not
+  supported), and KVM and runtime health are already enforced by the
+  `virtualization.baryon.io/vm` slot. Entry criterion: a capability gets a
+  name when Baryon consumes it and it is tested. When one is needed, the
+  mechanism is the one planned above for features: a per-capability
+  placement-only extended resource served by the node agent, not Node
+  labels written by a Baryon component (writer identity, staleness, and
+  RBAC: `nodes/patch` cannot be limited to labels, ADR 0004). The
+  requirement then belongs on VirtualMachineClass, not in the VM's
+  `spec.placement` (ADR 0008). Consumable devices (VFIO, GPUs) go to DRA,
+  never to this mechanism. NUMA stays with the node's Topology Manager;
+  there is no NUMA field.
 - Major transitions: a host of major N+1 keeps serving major N's
   `AnchorService.Negotiate` and `NodeService.GetHost` and `GetRuntimeInfo`
   (`RuntimeInfo` only) for at least one release, answering with its own
@@ -129,7 +143,9 @@ express a breaking change except changing the package.
 - Feature labels on Node objects, set by the node agent, with node affinity
   on Anchor Pods. Deferred to the placement work: it needs write access to
   Node labels for the node agent or a controller that computes affinity
-  from VirtualizationNode status.
+  from VirtualizationNode status. The placement work (2026-10-03) did not
+  adopt it: capability placement, when needed, uses placement-only
+  extended resources (Decision above).
 - gRPC server reflection to detect RPCs. Rejected: it says which methods
   exist, not which VM capabilities work, and it would expose more of the
   socket's surface.
@@ -148,3 +164,10 @@ express a breaking change except changing the package.
   longer read as import evidence (ADR 0006); disks imported by earlier
   releases are recognized by the claim annotation and the earlier
   controller's StorageReady=True instead.
+- 2026-10-03: host capability requirements were deferred with the VM
+  placement work: the entry criterion for a capability name, the mechanism
+  (placement-only extended resources, not Node labels), requirements on
+  VirtualMachineClass, DRA for consumable devices, and no NUMA field.
+  Anchor Pods of an earlier release have no
+  `virtualization.baryon.io/placement-hash` annotation; the controller
+  treats one as matching a VM without placement.

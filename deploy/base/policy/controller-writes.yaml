@@ -5,9 +5,14 @@
 #   to a PersistentVolume that has none, changing nothing else, for the
 #   claim the volume is bound to (the PV is Bound and the record's
 #   claimUID is its claimRef.uid);
-# - set the approval annotation virtualization.baryon.io/import-approved on
-#   a pod labeled app.kubernetes.io/managed-by=baryon, changing nothing
-#   else.
+# - on a pod labeled app.kubernetes.io/managed-by=baryon, set the approval
+#   annotation virtualization.baryon.io/import-approved, the annotation
+#   virtualization.baryon.io/vm-label-keys, and labels whose key is not
+#   reserved: the VM's own labels, which follow it to its Anchor Pod.
+#   Reserved keys are app.kubernetes.io/managed-by and keys whose prefix is
+#   baryon.io, kubernetes.io, k8s.io, or a subdomain of them other than
+#   app.kubernetes.io (the same rule as reserved_label in
+#   crates/controller/src/anchor.rs). Nothing else may change.
 #
 # RBAC grants the controller patch on all PersistentVolumes and pods; this
 # policy narrows it, so a compromised controller cannot rebind volumes,
@@ -44,18 +49,40 @@ spec:
       expression: "has(oldObject.metadata.annotations) ? oldObject.metadata.annotations : {}"
     - name: newAnn
       expression: "has(object.metadata.annotations) ? object.metadata.annotations : {}"
+    - name: mayChange
+      expression: >-
+        request.resource.resource == 'persistentvolumes'
+          ? ['virtualization.baryon.io/disk-import']
+          : ['virtualization.baryon.io/import-approved', 'virtualization.baryon.io/vm-label-keys']
     - name: othersUnchanged
       expression: >-
-        variables.oldAnn.all(k, k == variables.key || (k in variables.newAnn && variables.newAnn[k] == variables.oldAnn[k])) &&
-        variables.newAnn.all(k, k == variables.key || k in variables.oldAnn)
+        variables.oldAnn.all(k, k in variables.mayChange || (k in variables.newAnn && variables.newAnn[k] == variables.oldAnn[k])) &&
+        variables.newAnn.all(k, k in variables.mayChange || k in variables.oldAnn)
+    - name: oldLabels
+      expression: "has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}"
+    - name: newLabels
+      expression: "has(object.metadata.labels) ? object.metadata.labels : {}"
+    - name: reservedLabelsUnchanged
+      expression: >-
+        variables.oldLabels.all(k, !(k == 'app.kubernetes.io/managed-by' ||
+            k.matches('^([^/]*[.])?baryon[.]io/') ||
+            (k.matches('^([^/]*[.])?(kubernetes[.]io|k8s[.]io)/') && !k.startsWith('app.kubernetes.io/'))) ||
+          (k in variables.newLabels && variables.newLabels[k] == variables.oldLabels[k])) &&
+        variables.newLabels.all(k, !(k == 'app.kubernetes.io/managed-by' ||
+            k.matches('^([^/]*[.])?baryon[.]io/') ||
+            (k.matches('^([^/]*[.])?(kubernetes[.]io|k8s[.]io)/') && !k.startsWith('app.kubernetes.io/'))) ||
+          k in variables.oldLabels)
+    - name: labelsOk
+      expression: >-
+        request.resource.resource == 'pods' ? variables.reservedLabelsUnchanged : variables.newLabels == variables.oldLabels
     - name: metaUnchanged
       expression: >-
-        (has(object.metadata.labels) ? object.metadata.labels : {}) == (has(oldObject.metadata.labels) ? oldObject.metadata.labels : {}) &&
+        variables.labelsOk &&
         (has(object.metadata.finalizers) ? object.metadata.finalizers : []) == (has(oldObject.metadata.finalizers) ? oldObject.metadata.finalizers : []) &&
         (has(object.metadata.ownerReferences) ? object.metadata.ownerReferences : []) == (has(oldObject.metadata.ownerReferences) ? oldObject.metadata.ownerReferences : [])
   validations:
     - expression: "object.spec == oldObject.spec && variables.metaUnchanged && variables.othersUnchanged"
-      message: "baryon-controller may change only its import annotation"
+      message: "baryon-controller may change only its import annotations and the VM labels of its pods"
       reason: Forbidden
     - expression: >-
         request.resource.resource != 'persistentvolumes' ||

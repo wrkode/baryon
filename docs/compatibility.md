@@ -202,6 +202,16 @@ Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
 - The node agent published `protocolVersion` 1.0 for old hosts and 1.1 with
   features for new ones.
 
+VM placement across releases: Anchor Pods of an earlier release have no
+`virtualization.baryon.io/placement-hash` annotation; baryon-controller
+treats one as matching a VM without placement, so an upgrade alone does not
+report `PlacementChanged`. They also have no
+`virtualization.baryon.io/vm-label-keys` annotation: the first label sync
+adds the VM's labels and removes none. The label sync needs the
+`baryon-controller-writes` policy of the same release; with the earlier
+policy the API server denies it, baryon-controller logs a warning, and the
+VM is not affected.
+
 Import records across releases: since this change, the authoritative
 record of a completed import is the annotation
 `virtualization.baryon.io/disk-import` on the bound PersistentVolume (ADR

@@ -53,6 +53,20 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   which enables cloud-init's NoCloud datasource and its fallback DHCP
   configuration in cloud images without a metadata server.
 - When the VM stops, baryon-virtd removes the qdiscs it added.
+- VMs are selected by their own labels. baryon-controller copies the
+  VirtualMachine's `metadata.labels`, except reserved keys, to the Anchor
+  Pod and the import Pod when it creates them, and keeps them in sync on
+  the running Anchor Pod without a restart. Reserved keys are
+  `app.kubernetes.io/managed-by` and keys whose prefix is `baryon.io`,
+  `kubernetes.io`, or `k8s.io`, or a subdomain of one of them other than
+  `app.kubernetes.io`, so recommended labels such as
+  `app.kubernetes.io/name` propagate. The Anchor Pod's annotation
+  `virtualization.baryon.io/vm-label-keys` lists the copied keys, and a
+  sync removes only those, never a reserved key (users can edit the
+  annotation); labels that others set on the pod stay. The import Pod's
+  labels are set at creation and not synced. It has a readiness probe that
+  never passes, so Services that select the VM's labels never route to it,
+  unless a Service sets `publishNotReadyAddresses: true`.
 
 ## Consequences
 
@@ -81,6 +95,23 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
 - Kubelet HTTP and TCP probes against the pod IP reach the guest; Anchor
   readiness uses exec probes.
 - The VM IP changes when the Anchor Pod is recreated; the MAC does not.
+- Services, NetworkPolicies, pod affinity and anti-affinity, and topology
+  spread constraints select a VM by the labels on its VirtualMachine, like
+  pods of a workload controller. The label copy, sync, and removal are
+  Tested by the placement E2E on the k0s cluster, and spread constraints
+  over VM labels by the same E2E. Reaching a guest through a Service that
+  selects VM labels is Inferred: the tested Service path selects
+  `virtualization.baryon.io/vm-name`.
+- A NetworkPolicy that selects a VM's labels also selects its import Pod,
+  so it applies to the importer's downloads: an egress-deny policy for VMs
+  also blocks their HTTP imports. NetworkPolicies add up, so a second
+  policy that selects `virtualization.baryon.io/import-for` and allows
+  egress to the image server lets the import run.
+- A Service with `publishNotReadyAddresses: true` that selects VM labels
+  also routes to the import Pod while an import runs.
+- Migration note: during a future migration two pods of one VM would carry
+  the same labels. The rule then is that only the active pod carries the
+  VM's labels, and they move at switchover.
 - CNI compatibility requirements: the pod interface is an Ethernet device
   supporting live MAC change; the CNI tolerates the MAC change after ADD and
   learns guest MACs by ARP; it does not need the pod's own kernel to answer on
@@ -118,3 +149,11 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   review; after the architecture gate, the Service path was tested,
   NetworkPolicy and egress were marked Inferred, and the responder's
   lifetime consequences were recorded.
+- 2026-10-03: VM labels are copied to the Anchor Pod and the import Pod
+  and kept in sync, so Services and policies select VMs by their own labels
+  (reserved keys excepted, removal limited to the keys Baryon copied); the
+  import Pod's never-passing readiness probe and the migration rule for
+  labels were recorded. After the architecture review: reserved keys in the
+  user-writable label-keys annotation are ignored, the import Pod's labels
+  are not synced, an egress-deny NetworkPolicy on VM labels blocks imports,
+  and `publishNotReadyAddresses` Services reach the importer.

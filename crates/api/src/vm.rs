@@ -51,6 +51,49 @@ pub struct VirtualMachineSpec {
     )]
     #[schemars(length(max = 8))]
     pub networks: Vec<Network>,
+
+    /// Kubernetes scheduling constraints for the VM. Baryon copies them to
+    /// the pods that run and import the VM; the Kubernetes scheduler places
+    /// them. Changing them takes effect at the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<Placement>,
+}
+
+/// Kubernetes scheduling constraints, with the meaning they have on a pod.
+/// Baryon adds its own requirements (a node that runs the Baryon runtime,
+/// nodes to avoid) to them.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, KubeSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Placement {
+    /// Node labels the node must have.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub node_selector: std::collections::BTreeMap<String, String>,
+    /// Node affinity and pod (anti-)affinity. Pod affinity terms see the
+    /// VM's labels, which Baryon copies to the VM's pods. Pod affinity terms
+    /// apply within the VM's namespace only: `namespaces` and
+    /// `namespaceSelector` are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[x_kube(validation = kube::core::Rule::new("!has(self.podAffinity) || ((!has(self.podAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.podAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, !has(t.namespaces) && !has(t.namespaceSelector))) && (!has(self.podAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.podAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, !has(w.podAffinityTerm.namespaces) && !has(w.podAffinityTerm.namespaceSelector))))").message("pod affinity terms may not set namespaces or namespaceSelector; they apply within the VM's namespace"))]
+    #[x_kube(validation = kube::core::Rule::new("!has(self.podAntiAffinity) || ((!has(self.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution) || self.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution.all(t, !has(t.namespaces) && !has(t.namespaceSelector))) && (!has(self.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution) || self.podAntiAffinity.preferredDuringSchedulingIgnoredDuringExecution.all(w, !has(w.podAffinityTerm.namespaces) && !has(w.podAffinityTerm.namespaceSelector))))").message("pod affinity terms may not set namespaces or namespaceSelector; they apply within the VM's namespace"))]
+    pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
+    /// Tolerations of node taints. A toleration of every taint, of a cordon
+    /// (node.kubernetes.io/unschedulable), of control-plane nodes, or of a
+    /// node shut down out of service is refused.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[x_kube(validation = kube::core::Rule::new("self.all(t, has(t.key) && t.key != '' && !(t.key in ['node.kubernetes.io/unschedulable', 'node-role.kubernetes.io/control-plane', 'node.kubernetes.io/out-of-service']))").message("tolerations must name a taint key and must not tolerate node.kubernetes.io/unschedulable, node-role.kubernetes.io/control-plane, or node.kubernetes.io/out-of-service"))]
+    #[schemars(length(max = 32))]
+    pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+    /// How VMs spread across topology domains; label selectors see the VM's
+    /// labels.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 8))]
+    pub topology_spread_constraints: Vec<k8s_openapi::api::core::v1::TopologySpreadConstraint>,
+    /// PriorityClass of the VM's pods. A preempted Anchor Pod stops its VM.
+    /// The system classes (system-*) are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[x_kube(validation = kube::core::Rule::new("!self.startsWith('system-')").message("system PriorityClasses are not allowed for VMs"))]
+    #[schemars(length(max = 253))]
+    pub priority_class_name: Option<String>,
 }
 
 fn default_networks() -> Vec<Network> {

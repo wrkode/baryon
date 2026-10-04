@@ -77,7 +77,7 @@ depend on AuroraBoot, Kairos Operator, or Cluster API. See
 
 | Responsibility | Owner | Notes |
 |---|---|---|
-| VM scheduling, placement, priority, taints, affinity | Kubernetes scheduler, through the VM Anchor Pod | Baryon never chooses a node. It only excludes nodes where the VM hit a host identity conflict (`status.identityConflictNodes`, ADR 0011). |
+| VM scheduling, placement, priority, taints, affinity | Kubernetes scheduler, through the VM Anchor Pod and the import Pod | Baryon never chooses a node. baryon-controller copies the VM's `spec.placement` to both pods and adds only a required node term that excludes nodes where the VM hit a host identity conflict (`status.identityConflictNodes`, ADR 0011). |
 | Which nodes can run VMs | kubelet, through the `virtualization.baryon.io/vm` device plugin resource | Healthy only while baryon-virtd answers and KVM is usable. The import Pod requests the placement-only `virtualization.baryon.io/import` resource, which has the same health. |
 | Resource reservation and limits | Kubernetes, through the Anchor container's requests and limits | The VMM runs in the Anchor container's cgroup (ADR 0005). |
 | Volume attach, mount, and lifecycle | Kubernetes and CSI, through the Anchor Pod | Baryon resolves the result inside the pod (ADR 0006). |
@@ -120,9 +120,10 @@ installation (see [security.md](security.md#admission-policies)):
   service account token.
 - `controller-writes.yaml` (`baryon-controller-writes`): baryon-controller
   may update an existing PersistentVolume only by adding the import record
-  once, for the claim the volume is bound to, and a pod only by setting the
-  import approval on pods labeled `app.kubernetes.io/managed-by=baryon`
-  (Tested by the CI API server checks).
+  once, for the claim the volume is bound to, and, on pods labeled
+  `app.kubernetes.io/managed-by=baryon`, only the import approval, the
+  annotation `virtualization.baryon.io/vm-label-keys`, and labels whose
+  keys are not reserved (Tested by the CI API server checks).
 - `import-approval.yaml` (`baryon-import-approval`): nobody but
   baryon-controller may set, change, or remove the import approval
   annotation on any pod (Tested by the CI API server checks).
@@ -135,7 +136,7 @@ They need Kubernetes 1.30 or later, and 1.32 or later for the node name in
 the token. Deployment is described in
 [development.md](development.md#deploying-to-a-cluster-of-hadron-nodes).
 
-### baryon-controller (Implemented; Tested by the lifecycle and deletion E2E on the k0s cluster, the Hadron node, and the kind host, and by the multi-node, storage, and import integrity E2E on the k0s cluster)
+### baryon-controller (Implemented; Tested by the lifecycle and deletion E2E on the k0s cluster, the Hadron node, and the kind host, and by the multi-node, storage, import integrity, and placement E2E on the k0s cluster)
 
 A Deployment in `baryon-system`, one replica, non-root, no capabilities, no
 host access. For each VirtualMachine it:
@@ -165,13 +166,26 @@ host access. For each VirtualMachine it:
   election) and must be revisited before the controller runs highly
   available.
 - does not watch PersistentVolumes: a VM whose disk is refused is looked at
-  again every 120 s, one in `DiskBindingPending` every 30 s, others every
+  again every 120 s, one in `DiskBindingPending` every 30 s, one whose pod
+  the API server refused (`PodRejected`) every 60 s, others every
   300 s and on every change of the VM or of the pods and claims Baryon
   created for it
 - before it creates an import Pod or an Anchor Pod, refuses to start the VM
   while a Baryon pod of another VM in the namespace mounts the same claim
   (reason `ClaimInUse`). Two concurrent reconciles can both pass this check;
   baryon-virtd's `DiskInUse` registry is a second layer on one node.
+- translates the VM's `spec.placement` into the scheduling fields of the
+  import Pod and the Anchor Pod (`nodeSelector`, `affinity`, `tolerations`,
+  `topologySpreadConstraints`, `priorityClassName`), ANDs its own
+  identity-conflict requirement into every required node selector term,
+  and copies the VM's labels, except reserved keys, to both pods
+  (`crates/controller/src/anchor.rs`; see
+  [api.md](api.md#placement)). A placement change on a running VM is
+  reported as `RestartRequired` (`PlacementChanged`), not applied; a label
+  change is patched onto the running Anchor Pod, removing only the labels
+  that the pod's `virtualization.baryon.io/vm-label-keys` annotation lists.
+  A pod the API server refuses at creation is reported as `PodRejected`
+  (Tested by the placement E2E on the k0s cluster)
 - creates the Anchor Pod when `runPolicy` is `Running` and deletes it when
   `Stopped`, on deletion, or on a restart request. It acts on an existing pod
   named `<vm>-anchor` only if this VirtualMachine is its controller owner
@@ -218,7 +232,13 @@ One pod per running VM, named `<vm>-anchor`, in the VM namespace (ADR 0004):
   VM, stable for the life of the VirtualMachine object (ADR 0011); the pod's
   `fsGroup` is the VM's gid
 - labels `virtualization.baryon.io/vm-name`, `virtualization.baryon.io/vm-uid`,
-  and `app.kubernetes.io/managed-by=baryon`
+  and `app.kubernetes.io/managed-by=baryon`, plus the VM's own labels
+  except reserved keys, kept in sync while the pod runs
+- annotations `virtualization.baryon.io/spec-hash`,
+  `virtualization.baryon.io/placement-hash`, and
+  `virtualization.baryon.io/vm-label-keys`
+- the scheduling fields of the VM's `spec.placement`, and a required node
+  term that keeps it off the nodes in `status.identityConflictNodes`
 - no emptyDir: the readiness status file is in `/dev/shm/baryon-anchor`, so
   `kubectl drain` should not need `--delete-emptydir-data` (Inferred from
   kubectl's drain filter, not tested)
@@ -246,8 +266,9 @@ One pod per VM while an HTTP import is pending, named `<vm>-import`, in the
 VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
 
 - runs `baryon-anchor import` as the VM's host identity, with the same
-  restricted pod and container security context, claim volume, and node
-  affinity as the Anchor Pod; `restartPolicy: OnFailure`. The importer's
+  restricted pod and container security context, claim volume, and
+  scheduling fields (the VM's placement and Baryon's identity-conflict
+  term) as the Anchor Pod; `restartPolicy: OnFailure`. The importer's
   arguments carry `--url=`, `--size-bytes=`, `--claim-uid=`, and
   `--approval-file=`, plus `--sha256=` and, in block mode, `--device=`
 - mounts a downward API volume at `/etc/baryon/import` whose file
@@ -262,9 +283,15 @@ VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
   use (WaitForFirstConsumer) binds on a node that can run the VM. That
   resource grants nothing: the importer gets neither /dev/kvm nor the
   anchor socket
-- labels `virtualization.baryon.io/import-for=<vm uid>` and
-  `app.kubernetes.io/managed-by=baryon`, and no `vm-name` label, so a
-  Service that selects a VM does not select its import Pod
+- labels `virtualization.baryon.io/import-for=<vm uid>`,
+  `app.kubernetes.io/managed-by=baryon`, and the VM's own labels except
+  reserved keys, set at creation, so that the scheduler counts the import
+  Pod in the VM's spread constraints and pod anti-affinity (with storage
+  that binds on first use, the import Pod decides the VM's node); no
+  `vm-name` label
+- a readiness probe (`baryon-anchor probe`) that never passes, because the
+  importer never writes the status file it reads, so a Service that
+  selects the VM's labels never sends traffic to the import Pod
 - annotation `virtualization.baryon.io/import-source`: `sha256:` and the hex
   SHA-256 of the source URL. An import Pod whose digest differs from the
   current URL's, or whose `--claim-uid=` names another claim, is stale and
@@ -362,8 +389,8 @@ baryon-controller --> root disk claim
         |
         v  (http source, no import record, fresh volume)
 import Pod: scheduled on a node with a free virtualization.baryon.io/import
-            slot; waits for the approval from baryon-controller, writes
-            the image into the claim, exits
+            slot that satisfies the VM's placement; waits for the approval
+            from baryon-controller, writes the image into the claim, exits
         |
         v
 baryon-controller: records the import on the bound PersistentVolume,
@@ -371,7 +398,8 @@ baryon-controller: records the import on the bound PersistentVolume,
                    the import Pod is gone
         |
         v
-kube-scheduler: node with a free virtualization.baryon.io/vm slot
+kube-scheduler: node with a free virtualization.baryon.io/vm slot that
+                satisfies the VM's placement
         |
         v
 kubelet: CSI mounts the claim, CNI sets up the pod netns,
@@ -413,6 +441,7 @@ claim is garbage collected.
 | State | Source of truth | Location |
 |---|---|---|
 | Desired VM state | Kubernetes API (VirtualMachine) | etcd |
+| Placement constraints | Kubernetes API (VirtualMachine `spec.placement`) | etcd |
 | Placement | Kubernetes (Anchor Pod `spec.nodeName`) | etcd |
 | VM disk content | the claim | CSI backend |
 | Completed root disk import | the annotation `virtualization.baryon.io/disk-import` on the bound PersistentVolume, written by baryon-controller | etcd |
@@ -480,5 +509,8 @@ baryon-virtd -------> baryon-runtime-api, baryon-host, baryon-cloud-hypervisor
 - The root disk is fixed for the life of a VirtualMachine (`rootDisk` is
   immutable, including `size`); disk growth needs an explicit flow
   (Planned).
-- No VM placement controls (nodeSelector, tolerations, affinity, priority)
-  in the API; Planned.
+- VM placement takes only `nodeSelector`, `affinity`, `tolerations`,
+  `topologySpreadConstraints`, and `priorityClassName`, and applies them at
+  the next start. Placement by host capability (IOMMU, hugepages, NUMA,
+  VFIO, runtime protocol features) does not exist; Baryon consumes none of
+  these capabilities today (ADR 0012).

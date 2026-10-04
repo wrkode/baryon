@@ -422,6 +422,17 @@ Limits:
   must hold.
 - An administrator who cordoned or drained the node before the
   `NodeOpUpgrade` must uncordon it by hand.
+- VM placement cannot tolerate the cordon taint
+  (`node.kubernetes.io/unschedulable`) or the out-of-service taint (CEL
+  rules, see [api.md](api.md#placement)), so a cordoned node takes no new
+  import Pod or Anchor Pod during an upgrade, whatever a VM's tolerations.
+  A drain removes Anchor Pods regardless of tolerations. A VM whose
+  placement allows only the node being upgraded stays `Unschedulable`
+  until the node is schedulable again, like a VM on node-local storage.
+- A PodDisruptionBudget that selects VM labels counts a running import Pod
+  as unhealthy (it is never Ready), so the kubectl drain in step 1 can be
+  blocked while an import runs. The `NodeOpUpgrade` drain of v0.2.2 deletes
+  pods and is unaffected.
 - With v0.2.2, `concurrency` does not bound simultaneous node outages,
   because reboot completion is counted before the node is back. To upgrade
   one node at a time, run one `NodeOpUpgrade` per node as in the runbook.
