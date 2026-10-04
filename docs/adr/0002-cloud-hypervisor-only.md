@@ -1,7 +1,7 @@
 # 0002: Cloud Hypervisor is the only VMM
 
 Status: Accepted
-Date: 2026-10-02
+Date: 2026-10-02, revised 2026-10-04
 
 ## Context
 
@@ -36,9 +36,11 @@ Baryon-enabled Hadron image and recorded in the version manifest.
 - Features that Cloud Hypervisor lacks are not available in Baryon, and
   Baryon does not work around them with another VMM.
 - Cloud Hypervisor upgrades arrive with OS image upgrades, which interacts
-  with migration compatibility (Cloud Hypervisor guarantees migration from at
-  most the two previous major versions starting with v54). Baryon must check
-  versions before attempting migration.
+  with migration compatibility (Cloud Hypervisor documents migration from at
+  most the two previous major versions starting with v54, which is not
+  released as of 2026-10-04). Live migration is Not supported (ADR 0013);
+  a future migration design must check versions before attempting a
+  migration, and ADR 0013 lists that version gate as an entry criterion.
 - Test nodes that are themselves VMs run under another hypervisor with
   nested virtualization; that hypervisor is not a Baryon backend.
 
@@ -50,3 +52,9 @@ Baryon-enabled Hadron image and recorded in the version manifest.
 - A general-purpose VMM with broad device emulation. Rejected: larger device
   model and attack surface, and the project thesis is a Cloud Hypervisor
   platform.
+
+## Revisions
+
+- 2026-10-04: the migration compatibility consequence now links ADR 0013
+  (live migration Not supported; the version check is one of its entry
+  criteria) and says that v54 is not released. The decision is unchanged.

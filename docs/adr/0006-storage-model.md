@@ -11,7 +11,7 @@ attach, and NodeStage (see [testing.md](../testing.md#results)). The
 import record on the PersistentVolume and the import approval are Tested by
 the import integrity E2E with OpenEBS LVM LocalPV and Ceph RBD block volumes
 on the k0s cluster.
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
 
 ## Context
 
@@ -186,8 +186,11 @@ so neither can hold trusted import state.
   ordinary stop, move, and delete paths are Tested with Ceph RBD; the
   ordering argument above does not depend on the driver.
 - Migration requires the disk to be reachable from the destination VMM.
-  Concurrent access during migration needs a shared access mode and is future
-  work.
+  Live migration is Not supported (ADR 0013). A migration design would need
+  a shared access mode (`ReadWriteMany` block volumes), fencing enforced on
+  the data path, and a way to give the destination VMM its disks: Cloud
+  Hypervisor reopens disks by the source's path string, and matching
+  `/proc/self/fd/N` numbers alone is not an acceptable trust basis.
 - The importer runs in the import Pod only when the decision above allows
   an import. Kubernetes volume populators remain the natural long-term home
   for image import.
@@ -294,3 +297,5 @@ so neither can hold trusted import state.
   zeroed before the download) and the thin storage residual were recorded.
   The earlier Consequence that the import record is trusted as written no
   longer applies.
+- 2026-10-04: the migration consequence now links ADR 0013 and lists what
+  migration storage would need. The decision is unchanged.

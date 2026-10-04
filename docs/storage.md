@@ -228,7 +228,8 @@ setting and its side effects are in
   Not supported in the API (the runtime protocol accepts up to eight).
 - One running VM per claim. A `ReadWriteMany` block claim used as a root
   disk by VMs on different nodes is Not supported.
-- Live migration and snapshots are Not supported.
+- Live migration and snapshots are Not supported (live migration:
+  [ADR 0013](adr/0013-live-migration.md)).
 - Block mode requires a container runtime that creates granted device nodes
   on the container's `/dev` tmpfs and gives them the pod's `runAsUser` and
   `runAsGroup`. Verified with runc under containerd; CRI-O and crun are not

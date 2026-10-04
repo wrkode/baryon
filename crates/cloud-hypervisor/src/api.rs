@@ -149,7 +149,10 @@ impl ApiClient {
     }
 
     /// Perform one request and return the response body for 2xx statuses.
-    pub async fn call(
+    /// Private: Baryon calls only the endpoints above, so the VMM's other
+    /// endpoints (migration, snapshot, restore, device hotplug) stay
+    /// unreachable through this client.
+    async fn call(
         &self,
         method: Method,
         endpoint: &'static str,

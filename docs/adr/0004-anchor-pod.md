@@ -1,7 +1,7 @@
 # 0004: One VM Anchor Pod per running VM
 
 Status: Accepted
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
 
 ## Context
 
@@ -135,7 +135,12 @@ start.
   kubectl drain filters, not tested).
 - The fixed name and the at-most-one rule exclude a second VMM for a VM,
   which live migration needs (a source and a target at the same time).
-  Migration would need a different fencing scheme.
+  Together with `ReadWriteOnce` claims they are what prevents a second
+  copy of a VM today: `ClaimInUse` ignores pods of the same VM, and
+  `DiskInUse` is checked on one node only. Live migration is Not supported
+  (ADR 0013); a migration design would need a new fencing scheme with one
+  Kubernetes-held authority for the active copy, enforced on the data
+  path.
 
 ## Alternatives considered
 
@@ -189,3 +194,6 @@ start.
   namespace admission, and the fencing effect of tolerations. After the
   architecture review: a PodDisruptionBudget over VM labels counts the
   never-Ready import Pod as unhealthy.
+- 2026-10-04: the migration consequence now links ADR 0013 and states that
+  the fixed name, the at-most-one rule, and `ReadWriteOnce` claims are what
+  prevents a second copy of a VM today. The decision is unchanged.

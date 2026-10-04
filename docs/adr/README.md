@@ -28,6 +28,7 @@ Status values: Proposed, Accepted, Superseded, Rejected.
 | [0010](0010-license.md) | License under Apache-2.0 | Accepted |
 | [0011](0011-vm-host-identity.md) | Each VM runs as a distinct unprivileged host identity | Accepted |
 | [0012](0012-protocol-versioning.md) | Runtime protocol versions, features, and negotiation | Accepted |
+| [0013](0013-live-migration.md) | Live migration is not supported | Accepted |
 
 Template:
 

@@ -19,6 +19,8 @@ implementation and the runtime-boundary experiments), followed on the same
 day by a review of block-mode storage, the image import, and the disk
 handoff, and by a review of import integrity (where the import record
 lives, what counts as a completed import, and who can approve one).
+On 2026-10-04 the live migration evaluation (ADR 0013) and its experiment
+were reviewed (see [Live migration](#live-migration-not-supported)).
 Findings and their resolution are listed in
 [Review findings](#review-findings).
 
@@ -487,6 +489,64 @@ What it does not give:
   the Hadron node); without it, they are stopped hard. See
   [kairos-integration.md](kairos-integration.md).
 
+## Live migration (Not supported)
+
+Live migration is Not supported
+([ADR 0013](adr/0013-live-migration.md)). Baryon has no migration
+resource, no migration RPC in the runtime protocol, and no migration code
+in baryon-virtd. The Cloud Hypervisor client
+(`crates/cloud-hypervisor/src/api.rs`) can call only `vmm.ping`,
+`vm.info`, `vm.power-button`, and `vmm.shutdown`; its generic request
+method is private, so no other endpoint is reachable through it. The
+pinned Cloud Hypervisor binary contains `vm.send-migration` and
+`vm.receive-migration`, but its API socket is reachable only by host root,
+and a VMM has an empty network namespace, so it cannot reach a TCP
+migration peer. Nothing in this section is Implemented or Tested.
+
+Threat model for any future design. These are Designed constraints
+recorded in ADR 0013, not decisions:
+
+- The migration stream is guest-controlled input. It comes from the source
+  VMM, which its guest may control. A Cloud Hypervisor v53 destination
+  adopts the received VM configuration (including its Landlock settings,
+  disk paths, and console paths) and deserializes full device state,
+  checking only the protocol version and CPUID. The destination's
+  confinement (seccomp, Landlock, identity, network namespace), disks,
+  network file descriptors, and console must come from the destination's
+  baryon-virtd, never from the stream.
+- The receive endpoint is unauthenticated and unbounded. Plain `tcp:` has
+  no authentication; with TLS any client certificate from the CA is
+  accepted, with no binding to a source; after the `Config` step up to 128
+  additional connections from any peer write memory payloads into guest
+  memory; payload sizes come from the peer; there are no I/O timeouts, and
+  `timeout_s` is a pre-copy duration limit only. Cloud Hypervisor's
+  listener must never be reachable beyond the VM's own identity;
+  baryon-virtd must authenticate the peer node, bind the session to one
+  authorized migration, enforce deadlines whose expiry kills the
+  destination VMM, and bound payload sizes.
+- A relay in baryon-virtd would make the root runtime hold the guest's
+  memory in plaintext as it passes, hold node credentials, and listen on
+  TCP. Today no Baryon component listens on TCP and baryon-virtd holds no
+  credentials. A migration must be authorized by a Kubernetes object that
+  only baryon-controller can create or approve, enforced by admission, and
+  the destination must come from authenticated node identity, never from
+  an anchor, a user, or a VM field.
+- Two running copies of one VM corrupt its disk. Cloud Hypervisor releases
+  its disk locks before the switchover and does not take them back after a
+  failure; its locks are host-local. A lost final acknowledgement resumes
+  the source while the destination runs (v53: pre-copy and post-copy;
+  main: pre-copy). `ClaimInUse` and `DiskInUse` do not cover two copies of
+  one VM on different nodes. Fencing must be one authority held in
+  Kubernetes and enforced on the data path.
+- Guest memory is plaintext to the host during a migration, as it is at
+  any time. Confidential computing would need a different design (Not
+  supported).
+
+The 2026-10-04 experiment recorded in ADR 0013 used a root VMM in the host
+network namespace, plain TCP without authentication, no Landlock, and a
+shared device outside Baryon's claim and device exclusion. It validates no
+security property.
+
 ## Review findings
 
 Findings of the 2026-10-03 review and their state:
@@ -594,13 +654,30 @@ restart policy, runtime protocol 1.2, VirtualizationNode `status.vms`, and
 | Repeated guest DHCP requests driving the responder log and baryon-virtd's work | Mitigated: at most one acknowledgement per 60 s reported by the responder and processed by baryon-virtd; repeats are logged at debug level. The log is not size-capped while the VM runs |
 | A responder that hangs without exiting | Open: not detected, because supervision sees only the exit (pidfd); `NetworkReady` stays True |
 
+Findings of the 2026-10-04 review of the live migration evaluation
+(ADR 0013). Live migration is Not supported, so no finding applies to the
+running system; each is recorded as an entry criterion for a future design
+(see [Live migration](#live-migration-not-supported)):
+
+| Finding | Severity | State |
+|---|---|---|
+| A lost final acknowledgement, or an error after it, resumes the source while the destination runs (v53 pre-copy and post-copy, main pre-copy); the source resumes without its disk locks | High | Not applicable (no migration); entry criteria 2 and 3 in ADR 0013 |
+| The destination adopts the source's configuration from the stream (Landlock settings, disk and console paths) and deserializes full device state | High | Not applicable; entry criterion 4 |
+| The receive endpoint is unauthenticated (plain TCP), not bound to a source (TLS), accepts up to 128 additional connections from any peer, and has no I/O timeouts | High | Not applicable; entry criterion 5 |
+| A relay in baryon-virtd would hold plaintext guest memory and node credentials and listen on TCP; authorization and destination choice are undefined | Medium | Not applicable; entry criterion 6 and the runtime ownership question in ADR 0013 |
+| Disk locks are host-local and released before the switchover; `ClaimInUse` and `DiskInUse` do not cover two copies of one VM on different nodes, so fencing must be enforced on the data path | Medium | Not applicable; entry criterion 3 |
+| Memory payload sizes are chosen by the peer | Low | Not applicable; entry criterion 5 |
+| The destination checks CPU compatibility by CPUID only; MSRs and mitigation-relevant enumeration are unverified | Low | Not applicable; entry criterion 9 |
+| Cloud Hypervisor's seccomp profile allows `userfaultfd` and inet sockets that Baryon does not use | Low | Open (Future hardening) |
+| The experiment ran outside Baryon's confinement (root VMM, host network namespace, plain TCP, no Landlock, shared device outside claim exclusion) | Note | Documented (ADR 0013 and above); validates no security property |
+
 ## Future hardening
 
 | Item | Status |
 |---|---|
 | Verify the anchor through the kubelet pod resources API (pod was allocated the vm resource), in addition to the identity check | Designed |
 | Reduce baryon-virtd's capability set; seccomp and Landlock for baryon-virtd | Designed |
-| A Baryon-owned seccomp or Landlock layer for the VMM on top of Cloud Hypervisor's | Designed |
+| A Baryon-owned seccomp or Landlock layer for the VMM on top of Cloud Hypervisor's, denying at least `userfaultfd` and AF_INET and AF_INET6 sockets, which Baryon does not use (Cloud Hypervisor v53 allows both). The Hadron image sets `vm.unprivileged_userfaultfd` to 0 and `/dev/userfaultfd` is root-only (checked on a node on 2026-10-04), which still lets an unprivileged process create a user-mode-only userfaultfd | Designed |
 | Kubernetes user namespaces (`hostUsers: false`) as additional hardening for the Anchor container; not the VM identity contract (ADR 0011) | Planned (evaluation) |
 | A `/dev` check that works with runtime bind-mounted device nodes before user namespaces are adopted | Planned |
 | `ReadWriteOncePod` for claims Baryon creates where the CSI driver supports it | Planned |
@@ -612,7 +689,9 @@ restart policy, runtime protocol 1.2, VirtualizationNode `status.vms`, and
 
 ## Not supported
 
-VFIO and PCI passthrough, SR-IOV, live migration, snapshots, and confidential
+VFIO and PCI passthrough, SR-IOV, live migration (see
+[Live migration](#live-migration-not-supported) and
+[ADR 0013](adr/0013-live-migration.md)), snapshots, and confidential
 computing (SEV-SNP, TDX, measured boot, attestation) are not supported. The
 current handoff is host-mediated by design: baryon-virtd resolves disks,
 creates the TAP, starts the DHCP responder, and writes SMBIOS strings. None

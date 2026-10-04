@@ -125,9 +125,11 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   egress to the image server lets the import run.
 - A Service with `publishNotReadyAddresses: true` that selects VM labels
   also routes to the import Pod while an import runs.
-- Migration note: during a future migration two pods of one VM would carry
-  the same labels. The rule then is that only the active pod carries the
-  VM's labels, and they move at switchover.
+- Migration note: live migration is Not supported (ADR 0013). If a
+  migration design is accepted, two pods of one VM would exist during a
+  migration and would carry the same labels. The recorded rule for that
+  case is that only the active pod carries the VM's labels, and they move
+  at switchover.
 - CNI compatibility requirements: the pod interface is an Ethernet device
   supporting live MAC change; the CNI tolerates the MAC change after ADD and
   learns guest MACs by ARP; it does not need the pod's own kernel to answer on
@@ -138,7 +140,9 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
 - Readiness from the DHCP acknowledgement precedes full guest reachability on
   a disk's first boot by about 10 s (cloud-init first-boot work).
 - Pod-network live migration needs CNI support for keeping the IP and MAC
-  across pods; it is not a property this design provides.
+  across pods; it is not a property this design provides. ADR 0013 lists a
+  CNI contract for keeping the pod IP, or an explicit decision that the
+  guest's address changes, as an entry criterion.
 
 ## Alternatives considered
 
@@ -189,3 +193,6 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   state is reported as `NetworkReady` (ADR 0008), and the question whether
   the responder must be re-adopted after a baryon-virtd restart is answered
   (it is not; a new one is started when the anchor reattaches).
+- 2026-10-04: the migration lines now link ADR 0013 (live migration Not
+  supported) and its guest address entry criterion. The decision is
+  unchanged.

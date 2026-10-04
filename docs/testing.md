@@ -501,10 +501,10 @@ top of 5f75b47 that added `spec.placement`, the VM labels on Baryon's pods,
 an earlier build of the same change, and "placement change, before the last
 four changes" is the build that differs from the final code only by the
 four changes named in its row. "network health change" is the change on
-top of 8cd8a9f that added DHCP responder supervision for as long as the VM
-runs, runtime protocol 1.2, VirtualizationNode `status.vms`, and the
-`NetworkReady` condition; every host ran runtime protocol 1.2 unless the
-row says otherwise.
+top of 8cd8a9f, committed as 29c512c, that added DHCP responder
+supervision for as long as the VM runs, runtime protocol 1.2,
+VirtualizationNode `status.vms`, and the `NetworkReady` condition; every
+host ran runtime protocol 1.2 unless the row says otherwise.
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|

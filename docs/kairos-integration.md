@@ -291,9 +291,10 @@ VirtualizationNode Ready=True, device plugin slots healthy again
 ## Cooperation with upgrades
 
 Baryon has no upgrade controller and does not move running VMs: live
-migration is Not supported, so a node upgrade stops the VMs on the node and
-they start again on a node that can reach their storage. Baryon only exposes
-node state that an upgrade workflow can read.
+migration is Not supported ([ADR 0013](adr/0013-live-migration.md)), so a
+node upgrade stops the VMs on the node and they start again on a node that
+can reach their storage. Baryon only exposes node state that an upgrade
+workflow can read.
 
 VirtualizationNode state with semantics for upgrades:
 

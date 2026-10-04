@@ -5,7 +5,7 @@ kind node container acted as the host (see
 [runtime-boundary.md](../runtime-boundary.md), Experiment C) and on a single
 Baryon-enabled Hadron node (k3s, systemd cgroup driver). The cgroupfs driver
 is Not supported.
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
 
 ## Context
 
@@ -123,11 +123,14 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
   supported.
 - Live migration constraints from this decision: the VMM's empty network
   namespace rules out Cloud Hypervisor's TCP migration transport (a Unix
-  socket brokered by baryon-virtd would be needed), and the
+  socket relayed by baryon-virtd would be needed, which ADR 0013 records as
+  a new network-facing surface of the root runtime), and the
   `IdentityConflict` check refuses a second VMM of the same VM on one node.
 - Live migration with fd-backed networking needs upstream Cloud Hypervisor
-  support (cloud-hypervisor#7054, #8566) or a different network attachment for
-  migratable VMs.
+  support (cloud-hypervisor#7054, #8566; #8778 proposes a general fd list).
+  ADR 0013 decides that live migration is Not supported and evaluates a
+  different network attachment for migratable VMs (vhost-user-net,
+  rejected).
 
 ## Alternatives considered
 
@@ -165,3 +168,6 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
   identity consequences now refer to it instead of describing how the
   identity is computed; a collision on a node is handled by placing the VM
   on another node instead of being reported only as a start failure.
+- 2026-10-04: the live migration consequences now link ADR 0013, which
+  evaluates the TCP transport, the relay through baryon-virtd, and a
+  different network attachment. The decision is unchanged.

@@ -128,8 +128,25 @@ only the kind host has not been repeated on a Hadron node.
 
 ## Migration constraints recorded so far
 
+Live migration is Not supported; the evaluation, its entry criteria, and
+the experiment are in [ADR 0013](adr/0013-live-migration.md).
+
 - Cloud Hypervisor does not accept network fds on `vm.receive-migration`
-  (cloud-hypervisor#7054, #8566).
+  (cloud-hypervisor#7054, #8566); #8778 proposes one `external_fds` list
+  on restore and receive-migration for network, VFIO, and IOMMU fds. Disks
+  and host paths on the destination are not covered by any of them. Main
+  substitutes fds on receive for VFIO devices only.
+- Cloud Hypervisor releases the source's disk locks before sending device
+  state and does not take them back if the migration fails; its locks are
+  host-local.
+- A lost final acknowledgement resumes the source while the destination
+  already runs the guest: in v53 for pre-copy and post-copy, on main for
+  pre-copy. Only an authority outside both VMMs can decide which copy
+  runs.
+- The runtime directory, serial socket, and Landlock writable directory are
+  keyed by the Anchor Pod UID; a target Anchor Pod has a new UID, so the
+  configuration in the migration stream names paths that do not exist on
+  the target.
 - A new Anchor Pod gets a new pod IP; pod-network migration needs CNI support
   for keeping IP and MAC.
 - Snapshot and migration compatibility across Cloud Hypervisor majors is
@@ -140,7 +157,8 @@ only the kind host has not been repeated on a Hadron node.
   (ADR 0004) leave no room for a second pod for the same VM during a
   migration. Whether migration needs a different pod naming is Open.
 - The VMM's network namespace is empty, so it has no TCP transport for
-  migration; a Unix socket brokered by baryon-virtd would be needed.
+  migration; a Unix socket brokered by baryon-virtd would be needed, which
+  would make the root runtime a network-facing relay (ADR 0013).
 - baryon-virtd refuses a second VM with the same host identity on a node
   (`IdentityConflict`), which also refuses a same-node migration target.
 - The VM's labels are copied to its Anchor Pod, so during a migration two
@@ -151,7 +169,9 @@ only the kind host has not been repeated on a Hadron node.
 
 - Is the systemd cgroup driver requirement permanent?
 - A durable VM identity across re-create, restore, and move.
-- Migration against the fixed Anchor Pod name and the at-most-one-VMM rule.
+- Migration against the fixed Anchor Pod name and the at-most-one-VMM rule
+  (Not supported; the open questions are listed in
+  [ADR 0013](adr/0013-live-migration.md#hard-questions-left-open)).
 - Exclusion between a VM's import Pod and its Anchor Pod with more than one
   controller replica (it relies on the single replica today).
 - An explicit flow for growing a root disk (`rootDisk` is immutable).

@@ -190,8 +190,8 @@ Minimum host image per cluster release:
 | Cluster release | Protocol | Minimum host image |
 |---|---|---|
 | a73f37f (first published commit) | 1.0 | a73f37f |
-| 597b637 to 8cd8a9f | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
-| the network health change | 1.2 | protocol: any 1.x host; `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`); host-side safety fixes: an image built from the same commit as the cluster release or later |
+| 597b637 to b0413aa | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
+| 29c512c (the network health change) | 1.2 | protocol: any 1.x host; `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`); host-side safety fixes: an image built from the same commit as the cluster release or later |
 
 Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
 `tests/e2e/skew.sh`, one VM per node, a baryon-virtd restart on every node):
