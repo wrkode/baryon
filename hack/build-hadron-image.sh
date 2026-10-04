@@ -15,6 +15,11 @@ distro="${KUBERNETES_DISTRO-k3s}"
 version="${KUBERNETES_VERSION:-$K3S_VERSION}"
 baryon_version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 commit="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+# Mark builds from a tree with uncommitted changes to tracked files, so they
+# are not mistaken for builds of the commit itself.
+if [ "$commit" != unknown ] && ! git diff --quiet HEAD -- 2>/dev/null; then
+  commit="$commit-dirty"
+fi
 
 args=()
 for v in HADRON_IMAGE KAIROS_INIT_IMAGE \

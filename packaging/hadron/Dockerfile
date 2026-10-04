@@ -54,9 +54,15 @@ ENV RUSTUP_TOOLCHAIN=1.99.0
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml clippy.toml ./
 COPY crates/ crates/
+# COPY keeps the sources' modification times, and cargo decides by them
+# whether an artifact in the shared target cache is current. A cache last
+# filled from other sources (another checkout or commit) with newer times
+# would be reused as is. Touch the workspace sources so that its crates are
+# always rebuilt; dependencies stay cached.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    cargo build --locked --release --target x86_64-unknown-linux-musl -p baryon-virtd \
+    find crates -type f -exec touch {} + \
+    && cargo build --locked --release --target x86_64-unknown-linux-musl -p baryon-virtd \
     && install -D -m 0755 target/x86_64-unknown-linux-musl/release/baryon-virtd /out/baryon-virtd
 
 FROM alpine:3.22 AS manifest

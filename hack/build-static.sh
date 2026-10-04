@@ -21,6 +21,11 @@ for p in "${packages[@]}"; do
 done
 
 commit="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+# Mark builds from a tree with uncommitted changes to tracked files, so they
+# are not mistaken for builds of the commit itself.
+if [ "$commit" != unknown ] && ! git diff --quiet HEAD -- 2>/dev/null; then
+  commit="$commit-dirty"
+fi
 cache="${BARYON_BUILD_CACHE:-${HOME}/.cache/baryon-build}"
 mkdir -p "$cache/registry" "$cache/git"
 
