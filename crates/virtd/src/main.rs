@@ -120,8 +120,15 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn init_tracing(format: LogFormat, stderr: bool) {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    // The DHCP responder (logging to stderr) always logs at info: its log
+    // is not size-capped while the VM runs, and debug would add a line for
+    // every request the guest sends.
+    let filter = if stderr {
+        tracing_subscriber::EnvFilter::new("info")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     match (format, stderr) {
         (LogFormat::Json, false) => builder.json().flatten_event(true).init(),

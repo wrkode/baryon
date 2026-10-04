@@ -31,8 +31,9 @@ struct Args {
     /// kubelet device plugin directory as mounted into this container.
     #[arg(long, default_value = "/var/lib/kubelet/device-plugins")]
     device_plugin_dir: PathBuf,
-    /// VM slots advertised per node.
-    #[arg(long, default_value_t = 64)]
+    /// VM slots advertised per node; at most the number of VM entries a
+    /// VirtualizationNode can hold.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..=baryon_api::node::MAX_NODE_VMS as i64))]
     vm_slots: u32,
     /// /dev/kvm on the host.
     #[arg(long, default_value = "/dev/kvm")]
@@ -40,8 +41,10 @@ struct Args {
     /// Host directory with the baryon-virtd anchor socket.
     #[arg(long, default_value = "/run/baryon/anchor")]
     anchor_socket_dir: PathBuf,
-    /// Seconds between VirtualizationNode refreshes.
-    #[arg(long, default_value_t = 30)]
+    /// Seconds between VirtualizationNode refreshes. baryon-controller treats
+    /// a node it has not seen refreshed for 90 s as not reporting, so the
+    /// interval is at most 30 s.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(5..=30))]
     status_interval_seconds: u64,
 }
 

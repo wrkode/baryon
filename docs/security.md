@@ -51,11 +51,13 @@ Channels across these boundaries:
 |---|---|---|
 | guest | VMM | virtio devices, serial, ACPI, SMBIOS, firmware |
 | guest | DHCP responder | DHCP frames on the TAP |
-| DHCP responder | baryon-virtd | one JSON event line per acknowledged lease (length-limited, checked against the lease) |
+| DHCP responder | baryon-virtd | one JSON event line per acknowledged lease (length-limited, checked against the lease); the responder reports at most one per 60 s, and baryon-virtd processes at most one per 60 s |
 | VMM | baryon-virtd | process exit, the Cloud Hypervisor REST API (baryon-virtd is the client), serial socket, event file |
 | baryon-anchor | baryon-virtd | gRPC on `/run/baryon/anchor/virtd.sock` |
 | baryon-node-agent | baryon-virtd | gRPC on `/run/baryon/node/virtd.sock` |
 | baryon-controller, baryon-node-agent | API server | HTTPS with service account tokens |
+| baryon-node-agent | API server | VirtualizationNode `status.vms` of its own node: per Anchor Pod UID, the DHCP responder state, a reason (at most 64 bytes), a message (at most 1024 bytes), and two times; no VM names, namespaces, addresses, PIDs, paths, or TAP names; at most 256 entries (CRD validation: `state` enum, `maxLength`, `maxItems`) |
+| API server | baryon-controller | VirtualizationNode watch, read for the `NetworkReady` condition of the VMs on each node; the controller takes the reason from the state, never from the node's text, and caps the message at 1024 bytes |
 
 No Baryon component listens on TCP. The Cloud Hypervisor API is never exposed
 outside the node and is not reachable by the guest or the anchor. The
@@ -150,10 +152,23 @@ own VM, because a different spec for the same pod is refused.
 
 | Subject | Rights | Notes |
 |---|---|---|
-| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and, on Baryon pods, to the import approval, the `vm-label-keys` annotation, and labels with keys that are not reserved; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
+| baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; virtualizationnodes: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and, on Baryon pods, to the import approval, the `vm-label-keys` annotation, and labels with keys that are not reserved; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
 | `baryon-vm-edit` (ClusterRole, aggregated into `edit` and `admin`) | virtualmachines: get, list, watch, create, update, patch, delete, deletecollection; virtualmachineclasses: get, list, watch | For namespace users (`deploy/base/tenant/roles.yaml`). No `virtualmachines/status`: baryon-controller is its only writer. Nothing on PersistentVolumes. |
 | `baryon-vm-view` (ClusterRole, aggregated into `view`) | virtualmachines, virtualmachineclasses: get, list, watch | Read access for namespace users. |
-| baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Narrowed per node by admission, below. |
+| baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Writes are narrowed per node by admission, below. `get` is not: a node agent can read every node's VirtualizationNode, which holds host inventory and, per VM, Anchor Pod UIDs and the responder state, no VM names or addresses. |
+
+Tenants cannot read VirtualizationNodes: `baryon-vm-edit` and `baryon-vm-view`
+grant nothing on them, and no Baryon role is aggregated into `view`, `edit`,
+or `admin` for them. A VirtualizationNode lists Anchor Pod UIDs of every
+namespace with their node; tenants see the result for their own VMs only,
+as the `NetworkReady` condition.
+
+The `NetworkReady` condition of a VM depends on the node agent of the node
+its Anchor Pod runs on. A compromised node agent can write only its own
+node's VirtualizationNode (`baryon-node-agent-own-node`), so it can affect
+only the `NetworkReady` condition of VMs on its own node, within the
+reasons and message bounds above. It cannot change `Ready` or any other
+condition through this path.
 
 ### Admission policies
 
@@ -327,8 +342,16 @@ What it does not give:
   the responder's events as untrusted input: lines are limited to 4 KiB and
   an event is ignored unless its address and MAC match the lease. The
   responder exits when its stdin closes, so it never outlives the
-  baryon-virtd that started it; a responder that exits early is restarted
-  with backoff, at most 10 times in a row.
+  baryon-virtd that started it. A responder that exits while the VM runs
+  is restarted for as long as the VM runs, with backoff from 1 s doubling
+  to at most 60 s (ADR 0007, revision of 2026-10-04). Accepted trade-off: a
+  guest that can crash the responder's parser gets a fresh responder about
+  once a minute for as long as the VM runs, instead of 11 in total. Each
+  restart is a new exec with the same confinement, the responder holds no
+  state, and without it the guest loses its address when its lease
+  (86400 s) expires. The responder reports at most one acknowledgement per
+  60 s and logs repeats at debug level only, so guest requests add at most
+  one line per 60 s to its log at the default level.
 - Serial console: baryon-virtd reads it to detect a login prompt and appends
   it to a size-capped log (8 MiB per file; one previous file is kept on
   rotation). It never writes guest input anywhere that is executed.
@@ -421,13 +444,16 @@ What it does not give:
   VirtualMachine with an `http` source on a restored volume that has no
   record, and that otherwise looks fresh, can import over it.
 - Runtime records (`/run/baryon/vms/<pod-uid>/record.json`, tmpfs, mode 0600):
-  the VM spec, VMM pid and start time, uid, cgroup paths, and guest MAC. No
-  secrets. A record is trusted after a restart only if the process start time
+  the VM spec, VMM pid and start time, uid, cgroup paths, guest MAC, and the
+  time of the last DHCP acknowledgement. No secrets. A record is trusted after a restart only if the process start time
   and executable still match.
 - Logs (`/var/log/baryon/vms/<namespace>_<name>_<pod-uid>/`, persistent on
   Kairos): console output (mode 0600, directories 0700), the Cloud
   Hypervisor log and output, and the DHCP responder log (all 0600, at most
-  16 MiB each when copied). Console output can contain anything the guest
+  16 MiB each when copied). While the VM runs, the responder log
+  `ctl/dhcp.log` on the host's `/run` is not size-capped; repeated
+  acknowledgements are logged only at debug level, and each responder
+  start adds a line. Console output can contain anything the guest
   prints, including credentials. On Hadron the parent directory is 0750
   root, and the image's tmpfiles.d entry removes per-VM log entries older
   than 14 days, except under the directories of running VMs, which
@@ -486,7 +512,7 @@ Findings of the 2026-10-03 re-review and the architecture gate:
 | baryon-virtd, as root, followed paths inside the VMM-owned directory (log tail into status, log copies, serial connect): a compromised VMM could point it at host files or at an endless device | High | Fixed: `vmm_files.rs` (no symlinks, owner and link checks, bounded reads, `O_PATH` connect); root-written files moved to `ctl` |
 | VMM-writable files on the host's `/run` had no size limit | Medium | Fixed: private 32 MiB tmpfs per VM |
 | Admission policies do not gate static pods or the device plugin path | Medium | Documented (Admission policies); node-level check Designed |
-| Pod-liveness check excluded the responder by raw pid; responder failure count reset on every attach | Low | Fixed: exclusion only while the responder's pidfd is alive; the count resets only after a stable run |
+| Pod-liveness check excluded the responder by raw pid; responder failure count reset on every attach | Low | Fixed: exclusion only while the responder's pidfd is alive; the count resets only after a stable run. Since 2026-10-04 the count decides the backoff and the `Failing` state, not a restart limit (risks of 2026-10-04 below) |
 | Under the cgroupfs driver nothing outside baryon-virtd stops the VMM before volume teardown | Architecture | Fixed: baryon-virtd refuses non-systemd container cgroups; cgroupfs Not supported |
 | Ephemeral containers and pod-level resources are not matched by the vm-resource policy | Note | Not a bypass today (they cannot request extended resources); watched |
 | The node-agent policy indexes the node name list without a length check | Note | Fails closed (a CEL error denies) |
@@ -556,6 +582,17 @@ Findings of the 2026-10-03 review of VM placement:
 | Placement allowed system PriorityClasses, cross-namespace pod affinity, and tolerations of control-plane and out-of-service taints | Medium | Fixed: CRD validation rules; Tested by the CI API server checks |
 | Label sync removed labels set by other actors | Low | Fixed: only recorded keys are removed; Tested by the placement E2E on the k0s cluster |
 | Recorded label keys were read from a user-writable annotation without the reserved-key filter | Low | Fixed: the keys are filtered with `reserved_label`; unit test |
+
+Risks of the guest network health change (2026-10-04: the DHCP responder
+restart policy, runtime protocol 1.2, VirtualizationNode `status.vms`, and
+`NetworkReady`):
+
+| Risk | State |
+|---|---|
+| Unbounded responder restarts: a guest that can crash the responder's parser gets a new responder about once a minute for as long as the VM runs, instead of 11 in total | Accepted (Guest attack surface; ADR 0007 revision of 2026-10-04): each restart is a fresh exec with the VMM's confinement, the responder holds no state, and without it the guest loses its address when its lease expires |
+| Node-sourced text in VM conditions: a node agent writes the reason and message that reach `NetworkReady` | Mitigated: baryon-controller sets the reason from the state, never from the node's text, and caps the node's message at 1024 bytes; the CRD limits `state` to an enum and `reason` and `message` to 64 and 1024 bytes; `baryon-node-agent-own-node` limits a node agent to its own node's VMs |
+| Repeated guest DHCP requests driving the responder log and baryon-virtd's work | Mitigated: at most one acknowledgement per 60 s reported by the responder and processed by baryon-virtd; repeats are logged at debug level. The log is not size-capped while the VM runs |
+| A responder that hangs without exiting | Open: not detected, because supervision sees only the exit (pidfd); `NetworkReady` stays True |
 
 ## Future hardening
 

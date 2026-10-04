@@ -148,6 +148,57 @@ therefore has no network path of its own to host, node-local, or cluster
 addresses. Tested: on the Hadron node the VMM's network namespace differed
 from the host's and contained only loopback. See [security.md](security.md).
 
+## Guest network service health
+
+baryon-virtd supervises each VM's DHCP responder through its pidfd
+(`crates/virtd/src/vm.rs`). Status: Tested by unit tests and by the E2E
+test `tests/e2e/network-health.sh` on the k0s cluster with ceph-rbd and
+lvm-local, covering a restart after one kill, `DhcpResponderFailing` under
+repeated kills, a guest without an address, Anchor Pod replacement, a
+baryon-virtd restart, the node agent removed from the VM's node, and a node
+reboot ([testing.md](testing.md#k0s-cluster)). A responder that hangs
+without exiting is not tested; see Limits.
+
+- A responder that exits while the VM runs is restarted for as long as the
+  VM runs, with backoff from 1 s, doubling to at most 60 s. The count of
+  consecutive failures resets after a responder ran for 5 minutes, not when
+  the anchor reattaches.
+- State reported by baryon-virtd (runtime protocol 1.2): `Ready` when a
+  responder has started, `Restarting` after a failure, and `Failing` from
+  the 11th consecutive failure on. baryon-virtd also reports the time of
+  the last lease acknowledgement and the lease expiry (acknowledgement plus
+  86400 s), and clears the state when the VM stops.
+- The responder reports at most one acknowledgement per 60 s to
+  baryon-virtd and logs repeats within that interval at debug level only;
+  baryon-virtd processes at most one acknowledgement per 60 s. The
+  reported lease expiry can therefore be up to 60 s earlier than the
+  guest's own.
+- baryon-virtd keeps the time of the last acknowledgement in the VM's
+  runtime record and restores it after its own restart; the new
+  baryon-virtd starts a new responder when the anchor reattaches.
+- baryon-node-agent publishes the state in its VirtualizationNode
+  (`status.vms`, by Anchor Pod UID), and baryon-controller turns it into the
+  VM's `NetworkReady` condition ([api.md](api.md#networkready)). The VM's
+  `Ready` condition is not affected: a guest that has its address keeps it
+  until the lease expires, and the `NetworkReady` message gives that time.
+
+Limits:
+
+- A responder that hangs without exiting is not detected: supervision sees
+  only its exit.
+- The state `Ready`, and with it `NetworkReady=True`, means that the
+  responder process started, not that it served a request.
+- The node agent reports every 30 s by default (at most 30 s), which adds
+  up to that much latency to `NetworkReady`.
+- The responder log (`ctl/dhcp.log` in the VM's runtime directory, see
+  [development.md](development.md#places-on-a-baryon-node)) is not
+  size-capped while the VM runs. Repeated acknowledgements are logged only
+  at debug level, so the guest's requests add at most one line per 60 s at
+  the default log level; each responder start adds a line.
+- During a cluster release rollout, a new baryon-controller with a node
+  agent of the earlier release reports `NetworkReady` Unknown until the
+  DaemonSet has rolled ([compatibility.md](compatibility.md#version-skew)).
+
 ## Identity
 
 | Property | Stable across | Changes when |
@@ -167,13 +218,12 @@ from the host's and contained only loopback. See [security.md](security.md).
   network namespace is reachable only through the anchor pidfd. A guest
   reboot or reset while baryon-virtd is down therefore gets no address until
   baryon-virtd is back and the anchor has reattached; a running guest keeps
-  its 24 h lease.
-- A responder that exits early is restarted with backoff (up to 60 s). After
-  10 consecutive failures it is not restarted for that VM (only logged), and
-  the guest keeps its current lease. The failure count resets only when a
-  responder ran for 5 minutes, not on reattach.
+  its 24 h lease. See [Guest network service health](#guest-network-service-health)
+  for restarts while the VM runs.
 - The separate responder process is Tested on the kind host (confinement,
   crash restart, one new responder after a baryon-virtd restart, a new lease
   after a guest reset) and on the Hadron node (confinement after a node
-  reboot, replacement after a baryon-virtd restart); see
+  reboot, replacement after a baryon-virtd restart), and on the k0s cluster
+  (restart after kills, replacement after a baryon-virtd restart and after
+  a node reboot, by `tests/e2e/network-health.sh`); see
   [testing.md](testing.md#results).

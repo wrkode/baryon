@@ -91,6 +91,26 @@ EOF
 done
 for n in "${nodes[@]}"; do wait_for "${vm_on[$n]} Ready on $n" ready "${vm_on[$n]}"; done
 
+# NetworkReady by version: a controller that sets it reports True from a
+# node at runtime protocol 1.2 or later whose node agent publishes VM
+# entries, Unknown RuntimeDoesNotReport from an older host, and Unknown
+# NotReported while the node agent publishes no entries.
+net_of() { "${k[@]}" get virtualmachine "$1" -o jsonpath='{.status.conditions[?(@.type=="NetworkReady")].status}/{.status.conditions[?(@.type=="NetworkReady")].reason}' 2>/dev/null; }
+for n in "${nodes[@]}"; do
+  v="${vm_on[$n]}"
+  if [ "$(net_of "$v")" = / ]; then
+    log "SKIP $v NetworkReady (the controller does not set it)"
+    continue
+  fi
+  pv="$(vnode "$n" '{.status.runtime.protocolVersion}')"
+  case "${pv:-1.0}" in
+    1.0|1.1) want=Unknown/RuntimeDoesNotReport ;;
+    *) if [ -n "$(vnode "$n" '{.status.vms}')" ]; then want=True/AddressServiceRunning; else want=Unknown/NotReported; fi ;;
+  esac
+  net_is_want() { [ "$(net_of "$1")" = "$2" ]; }
+  wait_for "$v NetworkReady $want (protocol ${pv:-1.0})" net_is_want "$v" "$want"
+done
+
 log "restarting baryon-virtd on every node"
 declare -A before
 for n in "${nodes[@]}"; do before[$n]="$(pod_uid_of "${vm_on[$n]}")/$(restarts_of "${vm_on[$n]}")"; done

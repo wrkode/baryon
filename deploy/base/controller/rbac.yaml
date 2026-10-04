@@ -21,6 +21,10 @@ rules:
   - apiGroups: ["virtualization.baryon.io"]
     resources: ["virtualmachineclasses"]
     verbs: ["get", "list", "watch"]
+  # Host-side state of the VMs on each node (NetworkReady).
+  - apiGroups: ["virtualization.baryon.io"]
+    resources: ["virtualizationnodes"]
+    verbs: ["get", "list", "watch"]
   # patch: only the import approval annotation on Baryon pods
   # (policy/controller-writes.yaml).
   - apiGroups: [""]

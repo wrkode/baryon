@@ -42,6 +42,10 @@ pub struct VmRecord {
     /// 0 if it had not yet. A recovered VM is reported booted only if set.
     #[serde(default)]
     pub guest_booted_at_unix_ms: i64,
+    /// Last DHCP acknowledgement to the guest (Unix ms), 0 if none, so the
+    /// lease countdown survives a baryon-virtd restart.
+    #[serde(default)]
+    pub dhcp_last_ack_unix_ms: i64,
     /// Device numbers of the VM's block disks, so a restarted baryon-virtd
     /// keeps refusing them to other VMs.
     #[serde(default)]
@@ -122,6 +126,7 @@ mod tests {
             guest_mac: "02:00:00:00:00:01".into(),
             guest_booted_at_unix_ms: 0,
             block_devices: vec![rustix::fs::makedev(251, 0)],
+            dhcp_last_ack_unix_ms: 0,
         };
         rec.write(dir.path()).unwrap();
         assert_eq!(VmRecord::read(dir.path()).unwrap(), rec);

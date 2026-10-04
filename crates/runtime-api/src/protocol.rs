@@ -23,7 +23,9 @@ pub const MAJOR: u32 = 1;
 /// - 1.0: the initial protocol, without negotiation.
 /// - 1.1: `ProtocolVersion`, `AnchorService.Negotiate`, required features in
 ///   `AttachRequest`, version and features in `RuntimeInfo`.
-pub const MINOR: u32 = 1;
+/// - 1.2: `NetworkStatus` in `VmStatus` (host-side guest network service).
+///   Not a feature: a VM does not need it to run.
+pub const MINOR: u32 = 2;
 
 /// Feature names. A name, once released, keeps its meaning.
 pub mod feature {

@@ -279,8 +279,15 @@ separate responder process).
   baryon-virtd restart it was restored when the anchor reattached (observed:
   2 s); renewals in between fail harmlessly because the lease is 24 h. The
   separate responder process exits with baryon-virtd and is started again
-  when the anchor reattaches (Tested on the kind host and the Hadron node; see
+  when the anchor reattaches (Tested on the kind host, the Hadron node, and
+  the k0s cluster; see
   [testing.md](testing.md#results) and [networking.md](networking.md)).
+- Since 2026-10-04 baryon-virtd restarts a failed responder for as long as
+  the VM runs, instead of giving up after 10 consecutive failures, and
+  reports its state to the cluster as the VM's `NetworkReady` condition
+  (ADR 0007 and ADR 0008 revisions; Tested: `tests/e2e/network-health.sh`
+  on the k0s cluster, see [testing.md](testing.md#k0s-cluster) and
+  [networking.md](networking.md#guest-network-service-health)).
 
 ### Decision
 

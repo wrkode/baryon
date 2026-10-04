@@ -20,14 +20,16 @@ use tonic::transport::Endpoint;
 
 use baryon_api::conditions::{self, ConditionUpdate};
 use baryon_api::node::{
-    CpuStatus, HugepageStatus, IommuStatus, KvmStatus, NumaNodeStatus, PciDeviceStatus,
-    RuntimeStatus, VfioStatus,
+    CpuStatus, HugepageStatus, IommuStatus, KvmStatus, MAX_NODE_VMS, NodeVmNetwork, NodeVmStatus,
+    NumaNodeStatus, PciDeviceStatus, RuntimeStatus, VfioStatus,
 };
 use baryon_api::{VirtualizationNode, VirtualizationNodeSpec, VirtualizationNodeStatus};
 use baryon_host::HostReport;
 use baryon_runtime_api::protocol;
 use baryon_runtime_api::v1alpha1::node_service_client::NodeServiceClient;
-use baryon_runtime_api::v1alpha1::{GetHostRequest, RuntimeInfo, WatchVmsRequest};
+use baryon_runtime_api::v1alpha1::{
+    GetHostRequest, NetworkState, RuntimeInfo, VmStatus, WatchVmsRequest,
+};
 
 const FIELD_MANAGER: &str = "baryon-node-agent";
 
@@ -44,6 +46,8 @@ pub(crate) struct Observation {
     pub host: Option<HostReport>,
     pub runtime: Option<RuntimeInfo>,
     pub vm_count: Option<u32>,
+    /// Status of every VM on the node, as baryon-virtd reports it.
+    pub vms: Vec<VmStatus>,
     pub error: Option<String>,
 }
 
@@ -97,22 +101,24 @@ fn runtime_compatible(r: &RuntimeInfo) -> Result<(), String> {
 /// Ask baryon-virtd for the host report, runtime information, and VM count.
 pub(crate) async fn observe(socket: &Path) -> Observation {
     match observe_inner(socket).await {
-        Ok((host, runtime, vm_count)) => Observation {
+        Ok((host, runtime, vms)) => Observation {
             host: Some(host),
             runtime: Some(runtime),
-            vm_count: Some(vm_count),
+            vm_count: Some(u32::try_from(vms.len()).unwrap_or(u32::MAX)),
+            vms,
             error: None,
         },
         Err(e) => Observation {
             host: None,
             runtime: None,
             vm_count: None,
+            vms: Vec::new(),
             error: Some(format!("{e:#}")),
         },
     }
 }
 
-async fn observe_inner(socket: &Path) -> anyhow::Result<(HostReport, RuntimeInfo, u32)> {
+async fn observe_inner(socket: &Path) -> anyhow::Result<(HostReport, RuntimeInfo, Vec<VmStatus>)> {
     let channel = Endpoint::try_from(format!("unix://{}", socket.display()))?
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(30))
@@ -130,11 +136,8 @@ async fn observe_inner(socket: &Path) -> anyhow::Result<(HostReport, RuntimeInfo
     let host: HostReport = serde_json::from_str(&info.report_json)?;
     let runtime = info.runtime.unwrap_or_default();
     let mut vms = client.watch_vms(WatchVmsRequest {}).await?.into_inner();
-    let count = match vms.message().await? {
-        Some(list) => u32::try_from(list.vms.len()).unwrap_or(u32::MAX),
-        None => 0,
-    };
-    Ok((host, runtime, count))
+    let list = vms.message().await?.map(|l| l.vms).unwrap_or_default();
+    Ok((host, runtime, list))
 }
 
 async fn publish(
@@ -188,6 +191,44 @@ async fn publish(
     )
     .await?;
     Ok(())
+}
+
+/// The VirtualizationNode entry of one VM: its Anchor Pod UID and the
+/// host-side network state, when baryon-virtd reports it (1.2 and later).
+/// `s` cut to at most `max` bytes at a character boundary.
+fn truncated(s: &str, max: usize) -> String {
+    let mut end = s.len().min(max);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
+fn node_vm_status(vm: &VmStatus) -> NodeVmStatus {
+    let time = |ms: i64| {
+        (ms > 0)
+            .then(|| Timestamp::from_millisecond(ms).ok().map(Time))
+            .flatten()
+    };
+    let network = vm.network.as_ref().and_then(|n| {
+        let state = match NetworkState::try_from(n.state).ok()? {
+            NetworkState::Ready => "Ready",
+            NetworkState::Restarting => "Restarting",
+            NetworkState::Failing => "Failing",
+            NetworkState::Unspecified => return None,
+        };
+        Some(NodeVmNetwork {
+            state: state.to_owned(),
+            reason: truncated(&n.reason, 64),
+            message: truncated(&n.message, 1024),
+            last_transition_time: time(n.since_unix_ms),
+            lease_expires_time: time(n.lease_expires_unix_ms),
+        })
+    });
+    NodeVmStatus {
+        anchor_pod_uid: vm.pod_uid.clone(),
+        network,
+    }
 }
 
 /// Translate an observation into status. Pure, for tests.
@@ -294,6 +335,19 @@ pub(crate) fn build_status(
                 hypervisor_version: r.hypervisor_version.clone(),
             });
             s.vm_count = obs.vm_count;
+            if obs.vms.len() > MAX_NODE_VMS {
+                tracing::warn!(
+                    vms = obs.vms.len(),
+                    max = MAX_NODE_VMS,
+                    "more VMs than a VirtualizationNode can list; publishing the first"
+                );
+            }
+            s.vms = obs
+                .vms
+                .iter()
+                .take(MAX_NODE_VMS)
+                .map(node_vm_status)
+                .collect();
 
             let compatible = obs.runtime.as_ref().map_or(
                 Err("baryon-virtd sent no runtime information".to_owned()),
@@ -368,6 +422,7 @@ mod tests {
             host: None,
             runtime: None,
             vm_count: None,
+            vms: Vec::new(),
             error: Some("connection refused".into()),
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
@@ -394,6 +449,7 @@ mod tests {
                 ..Default::default()
             }),
             vm_count: Some(2),
+            vms: Vec::new(),
             error: None,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
@@ -441,6 +497,7 @@ mod tests {
             host: Some(host),
             runtime: Some(runtime(baryon_runtime_api::PROTOCOL, Some((2, 0)))),
             vm_count: Some(0),
+            vms: Vec::new(),
             error: None,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
@@ -468,6 +525,7 @@ mod tests {
             host: Some(host),
             runtime: Some(runtime(baryon_runtime_api::PROTOCOL, None)),
             vm_count: Some(0),
+            vms: Vec::new(),
             error: None,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
@@ -478,5 +536,42 @@ mod tests {
             conditions::find(&s.conditions, conditions::node::RUNTIME_HEALTHY)
                 .is_some_and(|c| c.status == "True")
         );
+    }
+
+    #[test]
+    fn vm_network_state_is_published_by_anchor_pod_uid() {
+        use baryon_runtime_api::v1alpha1::NetworkStatus;
+        let vm = |uid: &str, network: Option<NetworkStatus>| VmStatus {
+            pod_uid: uid.into(),
+            vm_name: "secret-name".into(),
+            vm_namespace: "secret-ns".into(),
+            network,
+            ..Default::default()
+        };
+        let failing = node_vm_status(&vm(
+            "pod-1",
+            Some(NetworkStatus {
+                state: NetworkState::Failing as i32,
+                reason: "DhcpResponderFailing".into(),
+                message: "m".into(),
+                since_unix_ms: 1_000_000,
+                consecutive_failures: 11,
+                last_ack_unix_ms: 0,
+                lease_expires_unix_ms: 0,
+            }),
+        ));
+        assert_eq!(failing.anchor_pod_uid, "pod-1");
+        let n = failing.network.as_ref().unwrap();
+        assert_eq!(
+            (n.state.as_str(), n.reason.as_str()),
+            ("Failing", "DhcpResponderFailing")
+        );
+        assert!(n.last_transition_time.is_some());
+        assert!(n.lease_expires_time.is_none());
+        // A 1.1 baryon-virtd sends no network status.
+        assert!(node_vm_status(&vm("pod-2", None)).network.is_none());
+        // The entry carries no names or namespaces.
+        let json = serde_json::to_string(&failing).unwrap();
+        assert!(!json.contains("secret"));
     }
 }

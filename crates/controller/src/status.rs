@@ -30,6 +30,10 @@ pub(crate) struct Observed<'a> {
     pub identity_conflict_nodes: Vec<String>,
     /// The disk is not usable and will not be imported: (reason, message).
     pub storage_blocked: Option<(String, String)>,
+    /// The VirtualizationNode of the node the Anchor Pod runs on.
+    pub node: Option<&'a baryon_api::VirtualizationNode>,
+    /// Whether the controller saw that node's heartbeat recently.
+    pub node_fresh: bool,
     /// `status.rootDiskImport` to report.
     pub root_disk_import: Option<baryon_api::vm::RootDiskImportStatus>,
 }
@@ -75,16 +79,101 @@ fn split_reason(msg: &str) -> (String, String) {
     }
 }
 
+/// NetworkReady of a running VM whose Anchor Pod `pod_uid` runs on the node
+/// `node`: the host-side guest network service state that baryon-virtd
+/// reports through the node agent. Unknown when the node's report is
+/// missing, stale (`fresh` false), or from a runtime that does not report
+/// it. The reason comes from the reported state, not from the node; the
+/// node's message is length-capped.
+pub(crate) fn network_condition(
+    node: Option<&baryon_api::VirtualizationNode>,
+    fresh: bool,
+    pod_uid: &str,
+) -> ConditionUpdate {
+    let unknown = |reason: &str, message: String| {
+        ConditionUpdate::unknown(vm::NETWORK_READY, reason, message)
+    };
+    let Some(status) = node.and_then(|n| n.status.as_ref()) else {
+        return unknown(
+            "RuntimeUnreachable",
+            "the node reports no host state".to_owned(),
+        );
+    };
+    if !fresh {
+        return unknown(
+            "RuntimeUnreachable",
+            "the node's Baryon runtime has not reported for 90 s; the state of the guest network service is unknown".to_owned(),
+        );
+    }
+    match conditions::find(&status.conditions, conditions::node::RUNTIME_HEALTHY) {
+        Some(c) if c.status == conditions::TRUE => {}
+        c => {
+            return unknown(
+                "RuntimeUnreachable",
+                capped(format!(
+                    "the node's Baryon runtime is not healthy ({}); the state of the guest network service is unknown",
+                    c.map_or("not reported", |c| c.reason.as_str())
+                )),
+            );
+        }
+    }
+    let reports = status
+        .runtime
+        .as_ref()
+        .and_then(|r| r.protocol_version.as_deref())
+        .and_then(|v| v.split_once('.'))
+        .and_then(|(major, minor)| Some((major.parse::<u32>().ok()?, minor.parse::<u32>().ok()?)))
+        .is_some_and(|v| v >= (1, 2));
+    if !reports {
+        return unknown(
+            "RuntimeDoesNotReport",
+            "the node's baryon-virtd does not report the guest network service (runtime protocol before 1.2)".to_owned(),
+        );
+    }
+    let Some(net) = status
+        .vms
+        .iter()
+        .find(|v| v.anchor_pod_uid == pod_uid)
+        .and_then(|v| v.network.as_ref())
+    else {
+        return unknown(
+            "NotReported",
+            "the node has not reported this VM yet".to_owned(),
+        );
+    };
+    let mut message = net.message.clone();
+    if let Some(t) = &net.lease_expires_time
+        && net.state != "Ready"
+    {
+        message = format!("{message} (guest lease valid until {})", t.0);
+    }
+    let message = capped(message);
+    match net.state.as_str() {
+        "Ready" => ConditionUpdate::new(vm::NETWORK_READY, true, "AddressServiceRunning", message),
+        "Restarting" => {
+            ConditionUpdate::new(vm::NETWORK_READY, false, "DhcpResponderRestarting", message)
+        }
+        "Failing" => {
+            ConditionUpdate::new(vm::NETWORK_READY, false, "DhcpResponderFailing", message)
+        }
+        _ => unknown(
+            "NotReported",
+            "the node reports an unknown state".to_owned(),
+        ),
+    }
+}
+
 /// Longest scheduler message copied into a condition; the full message is
 /// on the pod.
 const SCHEDULER_MESSAGE_MAX: usize = 1024;
 
-/// `msg` cut to [`SCHEDULER_MESSAGE_MAX`] bytes at a character boundary.
+/// `msg` cut to at most [`SCHEDULER_MESSAGE_MAX`] bytes, including the
+/// " ..." marker, at a character boundary. Also the limit of an event note.
 pub(crate) fn capped(msg: String) -> String {
     if msg.len() <= SCHEDULER_MESSAGE_MAX {
         return msg;
     }
-    let mut end = SCHEDULER_MESSAGE_MAX;
+    let mut end = SCHEDULER_MESSAGE_MAX - 4;
     while !msg.is_char_boundary(end) {
         end -= 1;
     }
@@ -400,6 +489,31 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
         updates.extend(not_ready("Pending", "creating the Anchor Pod"));
     }
 
+    // NetworkReady: the host-side guest network service of the running VM.
+    let running = updates
+        .iter()
+        .rev()
+        .find(|u| u.type_ == vm::RUNNING)
+        .is_some_and(|u| u.status == conditions::TRUE);
+    let running_on = obs
+        .pod
+        .filter(|_| running)
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+        .and_then(|p| {
+            Some((
+                p.metadata.uid.as_deref()?,
+                p.spec.as_ref()?.node_name.as_ref()?,
+            ))
+        });
+    updates.push(match running_on {
+        Some((uid, _)) => network_condition(obs.node, obs.node_fresh, uid),
+        None => ConditionUpdate::unknown(
+            vm::NETWORK_READY,
+            "NotRunning",
+            "the VM is not running on a node",
+        ),
+    });
+
     status.conditions = conditions::merge(&previous.conditions, &updates, generation, now);
     status
 }
@@ -467,6 +581,7 @@ mod tests {
         Pod {
             metadata: kube::api::ObjectMeta {
                 name: Some("web-anchor".into()),
+                uid: Some("pod-uid-1".into()),
                 ..Default::default()
             },
             spec: Some(PodSpec {
@@ -523,6 +638,8 @@ mod tests {
         assert_eq!(s.node_name.as_deref(), Some("worker-1"));
         assert_eq!(s.addresses[0].address, "10.244.1.5");
         assert_eq!(s.observed_generation, Some(3));
+        // A running VM on a node without a report: Unknown, not NotRunning.
+        assert_eq!(cond(&s, vm::NETWORK_READY).reason, "RuntimeUnreachable");
     }
 
     #[test]
@@ -567,6 +684,8 @@ mod tests {
         assert!(ready.message.contains("signal 9"));
         assert!(ready.message.contains("back-off"));
         assert_eq!(s.restart_count, Some(2));
+        // The Anchor Pod exists but the VM does not run.
+        assert_eq!(cond(&s, vm::NETWORK_READY).reason, "NotRunning");
     }
 
     #[test]
@@ -833,7 +952,102 @@ mod tests {
         assert_eq!(capped("short".into()), "short");
         let long = "x".repeat(5000);
         let c = capped(long);
-        assert!(c.len() <= SCHEDULER_MESSAGE_MAX + 4);
+        assert!(c.len() <= SCHEDULER_MESSAGE_MAX);
         assert!(c.ends_with(" ..."));
+    }
+
+    #[test]
+    fn network_ready_comes_from_the_nodes_report() {
+        use baryon_api::node::{NodeVmNetwork, NodeVmStatus, RuntimeStatus};
+        use baryon_api::{VirtualizationNode, VirtualizationNodeSpec, VirtualizationNodeStatus};
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+        let t = |s: i64| Time(Timestamp::from_second(s).unwrap());
+        let node = |heartbeat: i64, healthy: bool, version: &str, state: Option<&str>| {
+            let mut n = VirtualizationNode::new("node1", VirtualizationNodeSpec {});
+            n.status = Some(VirtualizationNodeStatus {
+                heartbeat_time: Some(t(heartbeat)),
+                conditions: vec![Condition {
+                    type_: "RuntimeHealthy".into(),
+                    status: if healthy { "True" } else { "False" }.into(),
+                    reason: "R".into(),
+                    message: String::new(),
+                    last_transition_time: t(0),
+                    observed_generation: None,
+                }],
+                runtime: Some(RuntimeStatus {
+                    protocol_version: Some(version.into()),
+                    ..Default::default()
+                }),
+                vms: state
+                    .map(|st| {
+                        vec![NodeVmStatus {
+                            anchor_pod_uid: "pod-1".into(),
+                            network: Some(NodeVmNetwork {
+                                state: st.into(),
+                                reason: if st == "Ready" {
+                                    "AddressServiceRunning"
+                                } else {
+                                    "DhcpResponderFailing"
+                                }
+                                .into(),
+                                message: "m".into(),
+                                last_transition_time: Some(t(500)),
+                                lease_expires_time: Some(t(90_000)),
+                            }),
+                        }]
+                    })
+                    .unwrap_or_default(),
+                ..Default::default()
+            });
+            n
+        };
+        // The heartbeat argument stands for freshness as the controller saw it.
+        let c = |n: &VirtualizationNode| {
+            let fresh = n.status.as_ref().and_then(|s| s.heartbeat_time.as_ref()) != Some(&t(800));
+            network_condition(Some(n), fresh, "pod-1")
+        };
+
+        let ready = c(&node(990, true, "1.2", Some("Ready")));
+        assert_eq!(
+            (ready.status, ready.reason.as_str()),
+            ("True", "AddressServiceRunning")
+        );
+        let failing = c(&node(990, true, "1.2", Some("Failing")));
+        assert_eq!(
+            (failing.status, failing.reason.as_str()),
+            ("False", "DhcpResponderFailing")
+        );
+        assert!(failing.message.contains("lease valid until"));
+        // Stale or unhealthy report, old runtime, no entry for this pod.
+        assert_eq!(
+            c(&node(800, true, "1.2", Some("Ready"))).reason,
+            "RuntimeUnreachable"
+        );
+        assert_eq!(
+            c(&node(990, false, "1.2", Some("Ready"))).reason,
+            "RuntimeUnreachable"
+        );
+        assert_eq!(
+            c(&node(990, true, "1.1", None)).reason,
+            "RuntimeDoesNotReport"
+        );
+        assert_eq!(c(&node(990, true, "1.2", None)).reason, "NotReported");
+        for u in [
+            c(&node(800, true, "1.2", Some("Ready"))),
+            c(&node(990, true, "1.1", None)),
+        ] {
+            assert_eq!(u.status, "Unknown");
+        }
+        assert_eq!(network_condition(None, true, "pod-1").status, "Unknown");
+        // The reason comes from the state; the message is capped.
+        let mut forged = node(990, true, "1.2", Some("Failing"));
+        if let Some(v) = forged.status.as_mut().and_then(|s| s.vms.first_mut()) {
+            let n = v.network.as_mut().unwrap();
+            n.reason = "SomethingElse".into();
+            n.message = "x".repeat(5000);
+        }
+        let f = c(&forged);
+        assert_eq!(f.reason, "DhcpResponderFailing");
+        assert!(f.message.len() <= 1024);
     }
 }

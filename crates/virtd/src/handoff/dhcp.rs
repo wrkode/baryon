@@ -24,7 +24,11 @@ use super::network::PodIpv4;
 #[cfg(test)]
 use super::network::PodRoute;
 
-const LEASE_SECONDS: u32 = 86_400;
+pub const LEASE_SECONDS: u32 = 86_400;
+/// Minimum interval between two reported acknowledgements. The guest can
+/// send requests at will; repeats within the interval are answered but only
+/// logged at debug level and not reported to baryon-virtd.
+pub const ACK_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 const PACKET_OUTGOING: u8 = 4;
 
 /// DNS settings read from the pod's resolv.conf.
@@ -101,6 +105,7 @@ pub async fn serve(
 ) -> io::Result<()> {
     let socket = AsyncFd::new(socket)?;
     let mut buf = vec![0u8; 2048];
+    let mut last_reported: Option<std::time::Instant> = None;
     loop {
         let received = tokio::select! {
             () = cancel.cancelled() => return Ok(()),
@@ -140,7 +145,10 @@ pub async fn serve(
                 Err(_would_block) => continue,
             }
         }
-        if acked {
+        if acked && last_reported.is_some_and(|t| t.elapsed() < ACK_REPORT_INTERVAL) {
+            tracing::debug!(ip = %lease.ipv4.address, mac = %lease.client_mac, "DHCP lease acknowledged again");
+        } else if acked {
+            last_reported = Some(std::time::Instant::now());
             tracing::info!(ip = %lease.ipv4.address, mac = %lease.client_mac, "DHCP lease acknowledged");
             let _ = events
                 .send(DhcpEvent::Acknowledged {

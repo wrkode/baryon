@@ -70,6 +70,48 @@ pub struct VirtualizationNodeStatus {
     /// VMs currently known to the host runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_count: Option<u32>,
+    /// Host-side state of each VM on the node, by Anchor Pod UID. Carries
+    /// no VM names, namespaces, or addresses. Entries have no `network`
+    /// when baryon-virtd does not report it (runtime protocol before 1.2).
+    /// At most [`MAX_NODE_VMS`] entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 256))]
+    pub vms: Vec<NodeVmStatus>,
+}
+
+/// Most entries in `status.vms`.
+pub const MAX_NODE_VMS: usize = 256;
+
+/// Host-side state of one VM.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeVmStatus {
+    /// UID of the VM's Anchor Pod.
+    #[serde(rename = "anchorPodUID")]
+    pub anchor_pod_uid: String,
+    /// The guest network service on the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<NodeVmNetwork>,
+}
+
+/// State of the host-side guest network service (the DHCP responder).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeVmNetwork {
+    /// Ready, Restarting, or Failing.
+    #[schemars(extend("enum" = ["Ready", "Restarting", "Failing"]))]
+    pub state: String,
+    #[schemars(length(max = 64))]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(length(max = 1024))]
+    pub message: String,
+    /// When the state last changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition_time: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
+    /// When the guest's lease expires without a renewal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_time: Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::Time>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, schemars::JsonSchema)]

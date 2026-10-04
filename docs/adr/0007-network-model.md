@@ -6,7 +6,7 @@ see [runtime-boundary.md](../runtime-boundary.md), Experiment B) and with
 flannel (k3s default) on a single Baryon-enabled Hadron node (the "Hadron
 node"). The Hadron node is one node, so traffic there was same-node through
 the `cni0` bridge; cross-node flannel (vxlan) is not tested.
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
 
 ## Context
 
@@ -49,6 +49,15 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   IPv4 routes as classless static routes (option 121, with host routes for
   off-link gateways), the router, MTU, DNS servers and search domains from
   the pod's resolv.conf, and the VM name as hostname.
+- baryon-virtd restarts a responder that exits for as long as the VM runs,
+  with backoff from 1 s, doubling to at most 60 s. The count of consecutive
+  failures resets after a responder ran for 5 minutes. It reports the
+  responder's state: Ready when a responder has started, Restarting after
+  a failure, and Failing from the 11th consecutive failure on. The state
+  reaches the cluster as the VM's `NetworkReady` condition (ADR 0008,
+  runtime protocol 1.2 in ADR 0012). The responder reports at most one
+  lease acknowledgement per 60 s, and baryon-virtd keeps the time of the
+  last one in the VM's runtime record.
 - The SMBIOS system serial number is `ds=nocloud;i=<VM UID>;h=<VM name>`,
   which enables cloud-init's NoCloud datasource and its fallback DHCP
   configuration in cloud images without a metadata server.
@@ -78,11 +87,18 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   Inferred, not tested.
 - The DHCP responder exits with baryon-virtd and is restarted only while an
   anchor is attached (the pod network namespace is reached through the
-  anchor's pidfd). A guest that reboots or resets while baryon-virtd is down
-  gets no address until baryon-virtd is back; after 10 consecutive responder
-  failures baryon-virtd stops restarting it, and the guest keeps its 24 h
-  lease. Whether the responder should be re-adopted like the VMM is an open
-  question ([design-notes.md](../design-notes.md)).
+  anchor's pidfd). The responder is not re-adopted like the VMM: the new
+  baryon-virtd starts a new responder for a re-adopted VM when its anchor
+  reattaches, and restores the time of the last acknowledgement from the
+  runtime record. A running guest keeps its 24 h lease across the restart;
+  a guest that reboots, resets, or renews while baryon-virtd is down gets
+  no answer until the anchor has reattached
+  ([design-notes.md](../design-notes.md)).
+- A guest whose responder keeps failing keeps its address until its lease
+  expires; `NetworkReady` is False from the first failure (within one node
+  agent interval) and its message
+  gives the lease expiry. A responder that hangs without exiting is not
+  detected: baryon-virtd sees only its exit (pidfd).
 - The guest routes exactly like the pod: same-node and cross-node traffic
   both worked with kindnet, which routes the pod subnet through the gateway.
   With flannel (a bridge, `cni0`), guest ping and SSH from other pods worked,
@@ -157,3 +173,19 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   user-writable label-keys annotation are ignored, the import Pod's labels
   are not synced, an egress-deny NetworkPolicy on VM labels blocks imports,
   and `publishNotReadyAddresses` Services reach the importer.
+- 2026-10-04: baryon-virtd restarts a failed DHCP responder for as long as
+  the VM runs, instead of not restarting it after 10 consecutive failures.
+  After 10 consecutive failures it reports the responder as failing
+  (`NetworkReady=False`, `DhcpResponderFailing`) and keeps restarting it
+  every 60 s. Rationale: the responder holds no state; without it the guest
+  loses its address when its lease (86400 s) expires; and each restart is a
+  fresh exec with the VMM's confinement (the VM's unprivileged host
+  identity, the VMM's cgroup). Accepted exposure: a guest that can crash
+  the responder's parser gets a new responder about once a minute for as
+  long as the VM runs, instead of 11 in total
+  ([security.md](../security.md#guest-attack-surface)). Also recorded: the
+  responder reports at most one acknowledgement per 60 s, baryon-virtd
+  keeps the last acknowledgement time in the runtime record, the responder
+  state is reported as `NetworkReady` (ADR 0008), and the question whether
+  the responder must be re-adopted after a baryon-virtd restart is answered
+  (it is not; a new one is started when the anchor reattaches).

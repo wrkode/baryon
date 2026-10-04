@@ -76,6 +76,12 @@ files individually, so baryon-virtd holds a shared BSD lock on the log
 directory of every running VM; systemd-tmpfiles skips locked directories,
 and the logs of a running VM are never removed however quiet its console
 is. The lock is released when the VM ends.
+While a VM runs, its DHCP responder logs to `ctl/dhcp.log` in the VM's
+runtime directory under `/run/baryon/vms/` (tmpfs), which is not
+size-capped; the responder logs a repeated lease acknowledgement within
+60 s only at debug level, so a guest's requests add at most one line per
+60 s at the default level. The last 16 MiB are copied to the per-pod log directory when
+the VM stops.
 Console output can contain credentials. To keep logs longer, override the
 file with one of the same name in `/etc/tmpfiles.d`. Retention is Tested
 manually on a single k3s node with a short override age (stale directories

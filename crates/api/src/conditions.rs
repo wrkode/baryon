@@ -17,6 +17,9 @@ pub mod vm {
     pub const READY: &str = "Ready";
     /// The spec changed in a way that takes effect only after a restart.
     pub const RESTART_REQUIRED: &str = "RestartRequired";
+    /// The host-side services of the guest network (the DHCP responder)
+    /// work. Says nothing about the guest's own network stack.
+    pub const NETWORK_READY: &str = "NetworkReady";
 }
 
 /// VirtualizationNode condition types.

@@ -181,6 +181,8 @@ versioned runtime protocol of ADR 0012.
 | Hosts of another major version are reported `ProtocolIncompatible` on the VirtualizationNode, their `virtualization.baryon.io/vm` slots become unhealthy, and running VMs continue | Implemented, unit tests |
 | A cluster release supports Anchor Pods of the previous release that are still running, and hosts of the same major version | Tested for 1.0 Anchor Pods under the 1.1 cluster release |
 | No VM requires a feature beyond the 1.0 set until feature-aware placement exists | Designed (ADR 0012); placement by feature is Planned |
+| The minor version only decides whether optional status is available, never whether a peer or a VM is accepted. With a host before 1.2, a running VM's `NetworkReady` is Unknown with reason `RuntimeDoesNotReport` | Implemented, unit tests |
+| A baryon-controller of the network health change with a baryon-node-agent of an earlier release, as during a cluster release rollout: the node agent publishes no `status.vms`, so a running VM's `NetworkReady` is Unknown, `NotReported` on 1.2 hosts and `RuntimeDoesNotReport` on earlier hosts, until the DaemonSet has rolled. A baryon-controller of an earlier release ignores `status.vms` and sets no `NetworkReady` | Implemented; not tested |
 | Host-side safety fixes (disk path checks, the block device registry in baryon-virtd) are not negotiated | Until releases are tagged, run a host image built from the same commit as the cluster release or later |
 
 Minimum host image per cluster release:
@@ -188,7 +190,8 @@ Minimum host image per cluster release:
 | Cluster release | Protocol | Minimum host image |
 |---|---|---|
 | a73f37f (first published commit) | 1.0 | a73f37f |
-| 597b637 and later | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
+| 597b637 to 8cd8a9f | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
+| the network health change | 1.2 | protocol: any 1.x host; `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`); host-side safety fixes: an image built from the same commit as the cluster release or later |
 
 Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
 `tests/e2e/skew.sh`, one VM per node, a baryon-virtd restart on every node):
@@ -201,6 +204,14 @@ Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
   with `RestartRequired=True` (`AnchorImageChanged`).
 - The node agent published `protocolVersion` 1.0 for old hosts and 1.1 with
   features for new ones.
+
+Guest network health across releases: the cluster release of the network
+health change needs the updated CRD (VirtualizationNode `status.vms`) and
+the controller RBAC that adds `get`, `list`, and `watch` on
+virtualizationnodes; `kubectl apply --server-side -k deploy/base` installs
+both. The new node agent refuses `--vm-slots` outside 1 to 256 and
+`--status-interval-seconds` outside 5 to 30, so a DaemonSet that set other
+values must be changed before the upgrade.
 
 VM placement across releases: Anchor Pods of an earlier release have no
 `virtualization.baryon.io/placement-hash` annotation; baryon-controller

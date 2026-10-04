@@ -1,7 +1,7 @@
 # 0008: v1alpha1 API surface and status ownership
 
 Status: Accepted
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
 
 ## Context
 
@@ -18,7 +18,7 @@ Group `virtualization.baryon.io`, version `v1alpha1`, three kinds:
 |---|---|---|---|
 | VirtualMachine | Namespaced | baryon-controller only | user intent for one VM |
 | VirtualMachineClass | Cluster | none | compute shape: vCPUs, memory |
-| VirtualizationNode | Cluster, named after and owned by the Node | baryon-node-agent on that node only | host capabilities, runtime health, heartbeat |
+| VirtualizationNode | Cluster, named after and owned by the Node | baryon-node-agent on that node only | host capabilities, runtime health, heartbeat, host-side state of each VM by Anchor Pod UID |
 
 VirtualMachine spec contains only fields with an implementation:
 `className`, `runPolicy` (`Running` or `Stopped`), `rootDisk` (an HTTP
@@ -59,6 +59,19 @@ kubelet:
   for example `VmmKilled: VMM was killed by signal 9`
 - pod IPs and node
 
+Host-side state that the anchor does not report reaches the controller
+through the VirtualizationNode of the Anchor Pod's node. `status.vms` lists,
+per Anchor Pod UID, the state of the VM's guest network service (the DHCP
+responder, ADR 0007) as baryon-virtd reports it (runtime protocol 1.2, ADR
+0012). It carries no VM names, namespaces, addresses, PIDs, paths, or TAP
+names, and at most 256 entries. baryon-controller reads it from a watch and
+stays the only writer of VirtualMachine status. A node's report counts only
+while the controller has seen the node's heartbeat change within the last
+90 s, measured on the controller's own clock, so clock skew between nodes
+and the controller does not matter. The anchor does not report this
+itself: it has no API access, and its single readiness probe already
+carries guest readiness.
+
 The import state reaches the controller through the import Pod
 (`<vm>-import`), also written only by kubelet: its importer container state
 and termination message, and its `PodScheduled` condition while it cannot
@@ -73,8 +86,8 @@ it is reset when the claim is recreated. It is not an API guarantee: the
 PersistentVolume record is the authority (ADR 0006).
 
 The controller derives VirtualMachine Conditions (`Scheduled`,
-`StorageReady`, `Running`, `Ready`, `RestartRequired`) from these and from the
-root claim, and writes status with server-side apply. Conditions are a
+`StorageReady`, `Running`, `Ready`, `RestartRequired`, `NetworkReady`) from
+these and from the root claim, and writes status with server-side apply. Conditions are a
 list-map keyed by `type`. There is no phase field; `kubectl get` shows Ready
 and its reason. An existing Anchor Pod decides `Running` and `Ready`; class
 or spec problems show only when there is no pod. `Running` means the Anchor
@@ -88,6 +101,10 @@ Pod cannot be scheduled, `Scheduled` and `Ready` are False with the
 scheduler's reason and message (cut to 1024 bytes); when the API server
 refuses to create one (HTTP 422 or 403), the reason is `PodRejected` with
 the API server's message.
+`NetworkReady` is derived from the node's report only while `Running` is
+True, and does not change `Ready`. Its reason comes from the reported
+state, never from the node's text; the node's message is capped at 1024
+bytes. The reasons are listed in [api.md](../api.md#networkready).
 
 Anchor Pods carry the labels `virtualization.baryon.io/vm-name`,
 `virtualization.baryon.io/vm-uid`, and `app.kubernetes.io/managed-by=baryon`;
@@ -124,6 +141,11 @@ PersistentVolumes.
 
 - One writer per object; no node component holds write access to
   VirtualMachines.
+- A compromised node agent can affect only the `NetworkReady` condition of
+  VMs whose Anchor Pod runs on its own node: `baryon-node-agent-own-node`
+  limits its writes to that node's VirtualizationNode.
+- `NetworkReady` reflects the node agent's last report, so it lags the
+  host by up to one node agent interval (at most 30 s).
 - Runtime detail is limited to what fits a reason and message; detailed
   runtime state stays on the node (baryon-virtd logs, console logs).
 - `rootDisk` cannot be changed in place. Disk growth needs an explicit flow
@@ -177,3 +199,7 @@ PersistentVolumes.
   reason, the scheduler's reason and message on `Scheduled` and `Ready`,
   `PodRejected`, the copy of the VM's labels to its pods, and the rule that
   capability requirements, when they ship, belong on VirtualMachineClass.
+- 2026-10-04: the `NetworkReady` condition and VirtualizationNode
+  `status.vms` (host-side state per Anchor Pod UID, read by the controller,
+  which stays the only writer of VM status), the 90 s staleness rule on the
+  controller's clock, and why the anchor does not report this state.

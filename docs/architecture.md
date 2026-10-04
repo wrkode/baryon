@@ -195,6 +195,13 @@ host access. For each VirtualMachine it:
   `AnchorPodConflict`. Every pod delete carries a UID precondition.
 - derives status from the Anchor Pod, the import Pod, the claim, and the
   import decision (ADR 0008) and records Events
+- reads VirtualizationNodes from a watch and derives the `NetworkReady`
+  condition of each running VM from the entry for its Anchor Pod in its
+  node's `status.vms`, while the controller has seen that node's heartbeat
+  change within 90 s; a VirtualizationNode change triggers the VMs on that
+  node only when its runtime health, protocol version, or `status.vms`
+  changed, and a check every 15 s reconciles all VMs when a node stops
+  reporting (ADR 0008; Implemented, unit tests)
 - when baryon-virtd refuses the VM on a node for a host identity conflict
   (`IdentityConflict` in the anchor's termination message), records the
   node in `status.identityConflictNodes`, replaces the Anchor Pod, and keeps
@@ -316,7 +323,10 @@ as uid 0 without capabilities. It reads from baryon-virtd's node socket
   answers, speaks a compatible protocol, and KVM is usable; grants /dev/kvm
   and the anchor socket) and `virtualization.baryon.io/import` (socket
   `baryon-import.sock`; the same slot count and health; grants nothing)
-- writes the VirtualizationNode for its node with a heartbeat
+- writes the VirtualizationNode for its node with a heartbeat (every 30 s
+  by default, 5 to 30 s), including `status.vms`: per Anchor Pod UID, the
+  state of the VM's DHCP responder as baryon-virtd reports it (runtime
+  protocol 1.2)
 
 ### baryon-virtd (Implemented; Tested by the lifecycle E2E on the Hadron node and the kind host)
 
@@ -344,7 +354,9 @@ Hadron image, running as root, not a Kubernetes client (ADR 0005). It:
 - opens a packet socket on the TAP and starts a per-VM DHCP responder
   process (`baryon-virtd dhcp-responder`, shown as `baryon-dhcp`) with the
   VMM's confinement; baryon-virtd does not parse guest frames itself
-  (Tested on the Hadron node and the kind host)
+  (Tested on the Hadron node and the kind host); restarts the responder
+  with backoff for as long as the VM runs and reports its state in the VM
+  status (ADR 0007; Implemented, unit tests)
 - resolves the disk inside the pod mount namespace, accepting only the two
   Anchor container disk paths with their kind (`/var/lib/baryon/disks/root/disk.img`
   as a regular file, `/dev/baryon/root` as a block device on the
@@ -446,6 +458,7 @@ claim is garbage collected.
 | VM disk content | the claim | CSI backend |
 | Completed root disk import | the annotation `virtualization.baryon.io/disk-import` on the bound PersistentVolume, written by baryon-controller | etcd |
 | Runtime status seen by the cluster | the Anchor Pod status, written by kubelet | etcd |
+| Host-side guest network state seen by the cluster | VirtualizationNode `status.vms`, written by the node agent from baryon-virtd's report | etcd |
 | Running VMM | the host kernel (process, pidfd) | node |
 | Runtime records | baryon-virtd, reconstructable | `/run/baryon/vms/<pod-uid>/` (tmpfs) |
 | Host capabilities | the host kernel | sysfs, procfs |
@@ -458,11 +471,11 @@ that no longer match.
 
 | From | To | Transport | Purpose |
 |---|---|---|---|
-| baryon-controller | Kubernetes API | HTTPS | VMs, Pods (Anchor and import Pods), claims, PersistentVolumes (read, and the import record), Events |
-| baryon-node-agent | Kubernetes API | HTTPS | VirtualizationNode |
+| baryon-controller | Kubernetes API | HTTPS | VMs, Pods (Anchor and import Pods), claims, PersistentVolumes (read, and the import record), VirtualizationNodes (read), Events |
+| baryon-node-agent | Kubernetes API | HTTPS | VirtualizationNode, including `status.vms` |
 | kubelet | baryon-node-agent | gRPC, kubelet device plugin socket | slots, allocation |
 | baryon-anchor | baryon-virtd | gRPC over `/run/baryon/anchor/virtd.sock` (0666; peer checks per connection and per attach) | attach, stop, VM status |
-| baryon-node-agent | baryon-virtd | gRPC over `/run/baryon/node/virtd.sock` (0600 in a 0700 directory; peer uid 0 required) | host info, VM list |
+| baryon-node-agent | baryon-virtd | gRPC over `/run/baryon/node/virtd.sock` (0600 in a 0700 directory; peer uid 0 required) | host info, VM list with each VM's network status |
 | baryon-virtd | Cloud Hypervisor | command line, inherited fds, HTTP over its API socket in the root-only `ctl` directory of the VM runtime directory | VM operations |
 | baryon-virtd | DHCP responder | inherited packet socket; lease as one JSON line on stdin; acknowledged leases as JSON lines on stdout, checked against the lease | guest addressing |
 

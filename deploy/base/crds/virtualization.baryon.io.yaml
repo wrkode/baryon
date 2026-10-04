@@ -1680,6 +1680,54 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              vms:
+                description: |-
+                  Host-side state of each VM on the node, by Anchor Pod UID. Carries
+                  no VM names, namespaces, or addresses. Entries have no `network`
+                  when baryon-virtd does not report it (runtime protocol before 1.2).
+                  At most [`MAX_NODE_VMS`] entries.
+                items:
+                  description: Host-side state of one VM.
+                  properties:
+                    anchorPodUID:
+                      description: UID of the VM's Anchor Pod.
+                      type: string
+                    network:
+                      description: The guest network service on the host.
+                      nullable: true
+                      properties:
+                        lastTransitionTime:
+                          description: When the state last changed.
+                          format: date-time
+                          nullable: true
+                          type: string
+                        leaseExpiresTime:
+                          description: When the guest's lease expires without a renewal.
+                          format: date-time
+                          nullable: true
+                          type: string
+                        message:
+                          maxLength: 1024
+                          type: string
+                        reason:
+                          maxLength: 64
+                          type: string
+                        state:
+                          description: Ready, Restarting, or Failing.
+                          enum:
+                          - Ready
+                          - Restarting
+                          - Failing
+                          type: string
+                      required:
+                      - reason
+                      - state
+                      type: object
+                  required:
+                  - anchorPodUID
+                  type: object
+                maxItems: 256
+                type: array
             type: object
         required:
         - spec

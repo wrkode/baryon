@@ -63,6 +63,7 @@ pub(crate) struct Context {
     pub client: kube::Client,
     pub anchor_image: String,
     pub recorder: Recorder,
+    pub nodes: Arc<crate::nodes::NodeView>,
 }
 
 impl std::fmt::Debug for Context {
@@ -545,6 +546,8 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 .unwrap_or_default(),
             storage_blocked: None,
             root_disk_import: vm.status.as_ref().and_then(|s| s.root_disk_import.clone()),
+            node: None,
+            node_fresh: false,
         };
         write_status(vm, ctx, ns, &observed).await?;
         return Ok(Action::requeue(Duration::from_secs(60)));
@@ -794,7 +797,17 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         }
     }
 
+    let node_name = pod
+        .as_ref()
+        .and_then(|p| p.spec.as_ref())
+        .and_then(|s| s.node_name.clone());
+    let (node, node_fresh) = node_name
+        .as_deref()
+        .map_or((None, false), |n| ctx.nodes.get(n));
+    let node_settled = node_name.as_deref().is_none_or(|n| ctx.nodes.settled(n));
     let observed = Observed {
+        node: node.as_deref(),
+        node_fresh,
         blocked: obs_blocked,
         claim_name,
         claim: claim.as_ref(),
@@ -823,6 +836,8 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         {
             60
         }
+        // The node store lags the watch that triggered this reconcile.
+        None if !node_settled => 5,
         None => 300,
     };
     Ok(Action::requeue(Duration::from_secs(requeue)))
@@ -860,6 +875,34 @@ async fn write_status(
             &Patch::Apply(&patch),
         )
         .await?;
+        let net_before = vm.status.as_ref().and_then(|s| {
+            baryon_api::conditions::find(&s.conditions, baryon_api::conditions::vm::NETWORK_READY)
+                .map(|c| c.status.clone())
+        });
+        if let Some(net) = baryon_api::conditions::find(
+            &new_status.conditions,
+            baryon_api::conditions::vm::NETWORK_READY,
+        ) && net_before.as_deref() != Some(net.status.as_str())
+            // Warn on every loss; report True only as a recovery, not on
+            // every start.
+            && (net.status == baryon_api::conditions::FALSE
+                || (net.status == baryon_api::conditions::TRUE
+                    && net_before.as_deref() == Some(baryon_api::conditions::FALSE)))
+        {
+            let (t, reason) = if net.status == baryon_api::conditions::TRUE {
+                (EventType::Normal, "NetworkReady")
+            } else {
+                (EventType::Warning, "NetworkNotReady")
+            };
+            event(
+                ctx,
+                vm,
+                t,
+                reason,
+                status::capped(format!("{}: {}", net.reason, net.message)),
+            )
+            .await;
+        }
         if let Some(after) = ready_after
             && ready_before.as_deref() != Some(after.status.as_str())
         {

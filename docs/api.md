@@ -253,6 +253,7 @@ Conditions:
 | `StorageReady` | The claim is bound and the disk is in place: for an `http` source, its import is recorded on the PersistentVolume. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict`, and the import refusals `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` |
 | `Running` | The Anchor container is running; it runs or starts the VMM (reason `AnchorRunning`). It does not by itself mean that the VMM runs. | `Starting`, `Stopping`, `Stopped`, `Pending`, and the failure reasons below |
 | `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `PodRejected`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
+| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running (reason `AddressServiceRunning`). Derived only while `Running` is True; see [NetworkReady](#networkready). | `DhcpResponderRestarting`, `DhcpResponderFailing`. Unknown: `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning` |
 | `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (`spec.placement` changed, see [Placement](#placement)), or `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` |
 
 Precedence: an existing Anchor Pod decides `Running` and `Ready`. Class or
@@ -336,6 +337,56 @@ volume devices the pod's `runAsUser` and `runAsGroup` (containerd:
 is up; on a disk's first boot the guest typically becomes reachable a few
 seconds later.
 
+#### NetworkReady
+
+`NetworkReady` reports the host-side service of the guest network, the
+VM's DHCP responder ([networking.md](networking.md#guest-network-service-health)).
+It says nothing about the guest's own network stack and does not change
+`Ready`. baryon-controller derives it from the VirtualizationNode of the
+Anchor Pod's node (`status.vms`), only while the VM's `Running` condition
+is True. Status: Tested by unit tests and by the E2E
+test `tests/e2e/network-health.sh` on the k0s cluster for True
+(`AddressServiceRunning`), False (`DhcpResponderFailing`, and before the
+guest acquired an address), and Unknown (`RuntimeUnreachable` while the
+node agent of the VM's node is gone for longer than 90 s), with `Ready`
+staying True ([testing.md](testing.md#k0s-cluster)). `tests/e2e/skew.sh`
+checks True from hosts at runtime protocol 1.2 and Unknown
+(`RuntimeDoesNotReport`) from a host at 1.1, on a cluster with mixed
+hosts. A baryon-controller restart while
+a node agent is down is covered by unit tests only.
+
+| Status | Reason | Meaning |
+|---|---|---|
+| True | `AddressServiceRunning` | The responder process started. It does not show that it served a request. |
+| False | `DhcpResponderRestarting` | The responder stopped; baryon-virtd restarts it with backoff of at most 60 s. |
+| False | `DhcpResponderFailing` | The responder failed more than 10 times in a row; baryon-virtd keeps restarting it every 60 s. |
+| Unknown | `RuntimeUnreachable` | The node has no report, its report is stale (the controller has not seen its heartbeat change for 90 s), or its `RuntimeHealthy` condition is not True (its reason is in the message). |
+| Unknown | `RuntimeDoesNotReport` | The node's baryon-virtd speaks runtime protocol 1.1 or earlier and does not report the responder. |
+| Unknown | `NotReported` | The node's report has no entry for the current Anchor Pod. |
+| Unknown | `NotRunning` | The VM is not running on a node. |
+
+baryon-controller sets the reason from the reported state, never from the
+node's text, and caps the node's message at 1024 bytes. When False, the
+message includes "guest lease valid until <time>" if baryon-virtd saw a
+lease acknowledgement, or says that the guest has not acquired an address.
+The time can be up to 60 s earlier than the guest's own lease expiry,
+because acknowledgements are reported at most once per 60 s. The condition
+lags the host by up to one node agent interval (at most 30 s).
+
+Reading `Ready` and `NetworkReady` together:
+
+| Ready | NetworkReady | Meaning |
+|---|---|---|
+| False, `Booting` | True | A normal start: the responder runs, and the guest has not yet acquired its address or shown a login prompt. |
+| False, `Booting` | Unknown, `NotReported` | Early in a start, until the node agent's next report. |
+| True | True | The guest booted and its address service runs. |
+| True | False | The guest has its address and keeps it until the time in the message; it loses it after that unless the responder recovers. |
+| any | Unknown, `NotRunning` | The VM is not running. |
+
+baryon-controller emits a Warning event `NetworkNotReady` each time
+`NetworkReady` changes to False, and a Normal event `NetworkReady` only
+when it changes from False to True, not on every start.
+
 ### kubectl
 
 ```
@@ -346,8 +397,9 @@ debian   True    GuestBooted   node1   10.244.1.30   62s
 
 `kubectl describe virtualmachine <name>` shows conditions with messages and
 the Events recorded by baryon-controller (`ClaimCreated`, `Importing`,
-`DiskImported`, `Starting`, `Ready`, `NotReady`, `Stopping`, `Restarting`,
-`AnchorPodFinished`, `IdentityConflict`, `Deleted`). Events never contain
+`DiskImported`, `Starting`, `Ready`, `NotReady`, `NetworkReady`,
+`NetworkNotReady`, `Stopping`, `Restarting`, `AnchorPodFinished`,
+`IdentityConflict`, `Deleted`). Events never contain
 the source URL.
 
 ### Example
@@ -446,7 +498,7 @@ only by the baryon-node-agent on that node (enforced by the
 | Status field | Description |
 |---|---|
 | `conditions` | `Ready` (runtime healthy and KVM usable), `RuntimeHealthy` (baryon-virtd answered and speaks a compatible runtime protocol). Reasons include `RuntimeUnreachable`, `ProtocolIncompatible`, `KvmUnavailable`. |
-| `heartbeatTime` | Last refresh by the node agent (every 30 s by default). |
+| `heartbeatTime` | Last refresh by the node agent: every 30 s by default, 5 to 30 s (`--status-interval-seconds`). baryon-controller treats a node whose heartbeat it has not seen change for 90 s as not reporting. |
 | `architecture`, `kernelRelease`, `osImage`, `kairosVersion` | Host identity. |
 | `runtime` | baryon-virtd version, protocol package, `protocolVersion` (`<major>.<minor>`, `1.0` for a baryon-virtd that does not report one), `features` (runtime protocol features, ADR 0012), hypervisor and its version. |
 | `cpu` | Model, online CPUs, virtualization extension, nested virtualization. |
@@ -456,6 +508,7 @@ only by the baryon-node-agent on that node (enforced by the
 | `vfio` | Legacy container device present, vfio-pci driver registered. |
 | `pciDevices` | PCI functions except bridges: address, vendor, device, class, driver, IOMMU group, NUMA node. |
 | `vmCount` | VMs known to baryon-virtd. |
+| `vms` | Host-side state of each VM on the node, at most 256 entries (the node agent publishes the first 256 and logs a warning when there are more): `anchorPodUID`, and `network` with `state` (`Ready`, `Restarting`, or `Failing`), `reason` (at most 64 bytes), `message` (at most 1024 bytes), `lastTransitionTime`, and `leaseExpiresTime`. Entries carry no VM names, namespaces, addresses, PIDs, paths, or TAP names. A baryon-virtd before runtime protocol 1.2 gives entries without `network`. |
 
 ```
 $ kubectl get virtualizationnodes
@@ -470,7 +523,7 @@ visible in the Node's `status.allocatable`:
 
 | Resource | Slots | Requested by | Grants |
 |---|---|---|---|
-| `virtualization.baryon.io/vm` | 64 by default | each Anchor Pod, once | /dev/kvm and the baryon-virtd anchor socket |
+| `virtualization.baryon.io/vm` | 64 by default, 1 to 256 (`--vm-slots`) | each Anchor Pod, once | /dev/kvm and the baryon-virtd anchor socket |
 | `virtualization.baryon.io/import` | the same as `vm`, with the same health | each import Pod, once | nothing; it only places the import Pod on a node that can run the VM |
 
 While baryon-virtd on a node is unreachable or speaks an incompatible
@@ -504,3 +557,8 @@ import records live. Status: Tested by the import integrity E2E on the k0s
 cluster, which creates, starts, stops, and restarts its VirtualMachine as a
 service account bound to `edit` and checks that this account cannot write
 the VirtualMachine status or the PersistentVolume.
+
+Neither role grants anything on VirtualizationNodes, whose `status.vms`
+lists the Anchor Pod UIDs of all namespaces by node. Namespace users see
+the host-side network state of their own VMs only, as `NetworkReady`.
+Status: Implemented (role definitions); not covered by an E2E check.

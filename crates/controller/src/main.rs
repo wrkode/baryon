@@ -4,6 +4,7 @@
 
 mod anchor;
 mod disk_import;
+mod nodes;
 mod reconcile;
 mod resources;
 mod status;
@@ -19,11 +20,11 @@ use kube::Api;
 use kube::ResourceExt;
 use kube::runtime::controller::{Config as ControllerConfig, Controller};
 use kube::runtime::events::{Recorder, Reporter};
-use kube::runtime::reflector::ObjectRef;
+use kube::runtime::reflector::{self, ObjectRef};
 use kube::runtime::utils::Backoff;
-use kube::runtime::watcher;
+use kube::runtime::{WatchStreamExt as _, watcher};
 
-use baryon_api::{VirtualMachine, VirtualMachineClass, keys};
+use baryon_api::{VirtualMachine, VirtualMachineClass, VirtualizationNode, keys};
 
 const BUILD: baryon_version::BuildInfo = baryon_version::BuildInfo::new("baryon-controller");
 
@@ -62,16 +63,72 @@ async fn main() -> anyhow::Result<()> {
         controller: "baryon-controller".to_owned(),
         instance: std::env::var("POD_NAME").ok(),
     };
+    // VirtualizationNodes, for NetworkReady: a reflector the reconciler
+    // reads, and the time each node's heartbeat was last seen.
+    let (node_reader, node_writer) = reflector::store();
+    let node_view = Arc::new(nodes::NodeView::new(node_reader.clone()));
+    let view = node_view.clone();
+    tokio::spawn(
+        watcher(
+            Api::<VirtualizationNode>::all(client.clone()),
+            watcher::Config::default(),
+        )
+        .backoff(TriggerBackoff::default())
+        .reflect(node_writer)
+        .applied_objects()
+        .for_each(move |r| {
+            match r {
+                Ok(n) => view.saw(&n),
+                Err(e) => tracing::warn!(error = %e, "VirtualizationNode watch error"),
+            }
+            futures::future::ready(())
+        }),
+    );
+    // Without the nodes, every running VM would briefly report NetworkReady
+    // Unknown after a controller restart.
+    if tokio::time::timeout(Duration::from_secs(30), node_reader.wait_until_ready())
+        .await
+        .is_err()
+    {
+        tracing::warn!("VirtualizationNodes not listed after 30 s; starting without them");
+    }
+    // A node whose report goes stale or fresh changes nothing the trigger
+    // sees: check periodically and reconcile all VMs when that happens.
+    let (stale_tx, stale_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let view = node_view.clone();
+    tokio::spawn(async move {
+        let mut fresh = view.fresh_nodes();
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            tick.tick().await;
+            let now = view.fresh_nodes();
+            // Both directions: a node that stops reporting, and one that
+            // reports again (its heartbeat alone triggers nothing).
+            if now != fresh {
+                tracing::info!(
+                    "a VirtualizationNode stopped or resumed reporting; reconciling VMs"
+                );
+                let _ = stale_tx.try_send(());
+            }
+            fresh = now;
+        }
+    });
+    let stale = futures::stream::unfold(stale_rx, |mut rx| async move {
+        rx.recv().await.map(|()| ((), rx))
+    });
+
     let ctx = Arc::new(reconcile::Context {
         client: client.clone(),
         anchor_image: args.anchor_image,
         recorder: Recorder::new(client.clone(), reporter),
+        nodes: node_view.clone(),
     });
 
     let managed = format!("{}={}", keys::MANAGED_BY_LABEL, keys::MANAGED_BY);
     let vms: Api<VirtualMachine> = Api::all(client.clone());
     let controller = Controller::new(vms, watcher::Config::default());
     let store = controller.store();
+    let node_store = controller.store();
     controller
         .owns(
             Api::<Pod>::all(client.clone()),
@@ -94,6 +151,28 @@ async fn main() -> anyhow::Result<()> {
                     .collect::<Vec<_>>()
             },
         )
+        // A node's VirtualizationNode carries the host-side state of its
+        // VMs (NetworkReady). Heartbeat-only updates trigger nothing.
+        .watches(
+            Api::<VirtualizationNode>::all(client.clone()),
+            watcher::Config::default(),
+            move |node| {
+                if !node_view.changed(&node) {
+                    return Vec::new();
+                }
+                let name = node.name_any();
+                node_store
+                    .state()
+                    .into_iter()
+                    .filter(|vm| {
+                        vm.status.as_ref().and_then(|s| s.node_name.as_deref())
+                            == Some(name.as_str())
+                    })
+                    .map(|vm| ObjectRef::from_obj(&*vm))
+                    .collect::<Vec<_>>()
+            },
+        )
+        .reconcile_all_on(stale)
         .with_config(ControllerConfig::default().concurrency(args.concurrency))
         .trigger_backoff(TriggerBackoff::default())
         .shutdown_on_signal()

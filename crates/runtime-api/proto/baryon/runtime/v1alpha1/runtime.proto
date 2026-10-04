@@ -152,6 +152,36 @@ message VmStatus {
   int64 stopped_at_unix_ms = 9;
   GuestStatus guest = 10;
   string hypervisor_version = 11;
+  // Host-side guest network service (the DHCP responder) of this VM. Added
+  // in 1.2; absent from older baryon-virtd.
+  NetworkStatus network = 12;
+}
+
+enum NetworkState {
+  NETWORK_STATE_UNSPECIFIED = 0;
+  // The DHCP responder runs.
+  NETWORK_STATE_READY = 1;
+  // The DHCP responder stopped and is being restarted.
+  NETWORK_STATE_RESTARTING = 2;
+  // The DHCP responder failed repeatedly; baryon-virtd keeps restarting it.
+  NETWORK_STATE_FAILING = 3;
+}
+
+// State of the services baryon-virtd provides to the guest network on the
+// host. It says nothing about the guest's own network stack.
+message NetworkStatus {
+  NetworkState state = 1;
+  // Machine-readable CamelCase reason.
+  string reason = 2;
+  string message = 3;
+  // When state last changed.
+  int64 since_unix_ms = 4;
+  // Responder failures since it last ran stably.
+  uint32 consecutive_failures = 5;
+  // Last DHCP acknowledgement to the guest, 0 if none.
+  int64 last_ack_unix_ms = 6;
+  // When the guest's lease expires without a renewal, 0 if no lease.
+  int64 lease_expires_unix_ms = 7;
 }
 
 message GuestStatus {

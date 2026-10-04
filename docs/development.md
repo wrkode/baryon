@@ -152,7 +152,7 @@ and the node agent watch are open; the anchors reconnect.
 | `journalctl -u baryon-virtd` | host runtime log (JSON) |
 | `/usr/share/baryon/components.json` | versions and checksums of the host components, and the Baryon `gitCommit` the image was built from |
 | `/run/baryon/vms/<pod-uid>/record.json` | runtime record of each VM (mode 0600) |
-| `/run/baryon/vms/<pod-uid>/ctl/` | root-only (0700): `api.sock` (Cloud Hypervisor API), `cloud-hypervisor.out` (VMM stdout and stderr), `dhcp.log` (DHCP responder log) |
+| `/run/baryon/vms/<pod-uid>/ctl/` | root-only (0700): `api.sock` (Cloud Hypervisor API), `cloud-hypervisor.out` (VMM stdout and stderr), `dhcp.log` (DHCP responder log: a line per responder start and per reported lease acknowledgement, repeats within 60 s at debug level only; not size-capped while the VM runs) |
 | `/run/baryon/vms/<pod-uid>/vmm/` | a tmpfs of its own (32 MiB, 256 inodes, mode 0700, owned by the VM's identity, `nosuid,nodev,noexec`), unmounted when the VM ends: serial socket, event file, `cloud-hypervisor.log` |
 | `/var/log/baryon/vms/<ns>_<vm>_<pod-uid>/console.log` | guest serial console (mode 0600, directory 0700) |
 | `/var/log/baryon/vms/<ns>_<vm>_<pod-uid>/` | also the last 16 MiB of `cloud-hypervisor.log`, `cloud-hypervisor.out`, and `dhcp.log`, copied when the VM stops (mode 0600); on Hadron removed after 14 days untouched |

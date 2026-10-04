@@ -39,7 +39,9 @@ use baryon_cloud_hypervisor::launch::{
     ApiSocket, ConsoleMode, Disk, DiskSource, ImageType, LaunchConfig, MacAddr, Net, Payload,
     Platform,
 };
-use baryon_runtime_api::v1alpha1::{GuestStatus, VmPhase, VmSpec, VmStatus};
+use baryon_runtime_api::v1alpha1::{
+    GuestStatus, NetworkState, NetworkStatus, VmPhase, VmSpec, VmStatus,
+};
 
 use crate::cgroup::{self, VmmCgroup};
 use crate::config::Config;
@@ -78,9 +80,10 @@ const VMM_OUTPUT: &str = "cloud-hypervisor.out";
 const STATUS_LOG_BYTES: u64 = 64 * 1024;
 /// How much of each VMM log is kept under the log directory after a VM ends.
 const PRESERVED_LOG_BYTES: u64 = 16 * 1024 * 1024;
-/// Consecutive DHCP responder failures after which baryon-virtd stops
-/// restarting it for this VM.
-const MAX_DHCP_RESTARTS: u32 = 10;
+/// Consecutive DHCP responder failures after which it is reported as
+/// failing. baryon-virtd keeps restarting it while the VM runs: the
+/// responder holds no state, and without it the guest loses its address.
+const DHCP_FAILING_AFTER: u32 = 10;
 /// A responder that ran this long resets the failure count.
 const DHCP_STABLE: Duration = Duration::from_secs(300);
 /// Upper bound of the restart backoff.
@@ -434,6 +437,7 @@ impl Manager {
 
         let mut sup = Supervisor::new(self, entry, cmd_rx);
         sup.record = Some(rec.clone());
+        sup.dhcp_last_ack = rec.dhcp_last_ack_unix_ms;
         sup.vmm = Some(VmmProcess {
             pid: rec.vmm_pid,
             pidfd,
@@ -517,6 +521,51 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The reported network status for a responder `state` (and when it began),
+/// `failures` since it last ran stably, and the last lease acknowledgement
+/// (Unix ms, 0 if none). Messages hold no relative times: they stay in the
+/// VM's condition until the state changes.
+fn network_status(state: (NetworkState, i64), failures: u32, last_ack: i64) -> NetworkStatus {
+    let lease_expires = if last_ack > 0 {
+        last_ack.saturating_add(i64::from(crate::handoff::dhcp::LEASE_SECONDS) * 1000)
+    } else {
+        0
+    };
+    let lease = if last_ack > 0 {
+        "the guest's lease stays valid until it expires"
+    } else {
+        "the guest has not acquired an address"
+    };
+    let retry = format!(
+        "baryon-virtd restarts it with backoff of at most {} s",
+        DHCP_MAX_BACKOFF.as_secs()
+    );
+    let (reason, message) = match state.0 {
+        NetworkState::Ready => (
+            "AddressServiceRunning",
+            "the DHCP responder for the guest runs".to_owned(),
+        ),
+        NetworkState::Restarting => (
+            "DhcpResponderRestarting",
+            format!("the DHCP responder stopped; {retry}; {lease}"),
+        ),
+        NetworkState::Failing => (
+            "DhcpResponderFailing",
+            format!("the DHCP responder failed {failures} times in a row; {retry}; {lease}"),
+        ),
+        NetworkState::Unspecified => ("Unknown", String::new()),
+    };
+    NetworkStatus {
+        state: state.0 as i32,
+        reason: reason.to_owned(),
+        message,
+        since_unix_ms: state.1,
+        consecutive_failures: failures,
+        last_ack_unix_ms: last_ack,
+        lease_expires_unix_ms: lease_expires,
+    }
+}
+
 fn initial_status(pod_uid: &str, spec: &VmSpec, m: &Manager) -> VmStatus {
     VmStatus {
         pod_uid: pod_uid.to_owned(),
@@ -530,6 +579,7 @@ fn initial_status(pod_uid: &str, spec: &VmSpec, m: &Manager) -> VmStatus {
         stopped_at_unix_ms: 0,
         guest: Some(GuestStatus::default()),
         hypervisor_version: m.hypervisor_version.clone(),
+        network: None,
     }
 }
 
@@ -578,6 +628,14 @@ struct Supervisor {
     /// The DHCP responder process, while it runs.
     dhcp: Option<dhcp_helper::Responder>,
     dhcp_failures: u32,
+    /// Reported state of the responder and when it last changed.
+    dhcp_state: (NetworkState, i64),
+    /// Last DHCP acknowledgement to the guest, Unix ms, 0 if none.
+    dhcp_last_ack: i64,
+    /// When an acknowledgement was last processed. The responder already
+    /// reports at most one per interval; this bounds the work here even if
+    /// a responder reports more.
+    dhcp_ack_processed: Option<Instant>,
     dhcp_restart_at: Option<Instant>,
     dhcp_tx: mpsc::Sender<DhcpEvent>,
     dhcp_rx: mpsc::Receiver<DhcpEvent>,
@@ -618,6 +676,9 @@ impl Supervisor {
             helpers: CancellationToken::new(),
             dhcp: None,
             dhcp_failures: 0,
+            dhcp_state: (NetworkState::Unspecified, 0),
+            dhcp_last_ack: 0,
+            dhcp_ack_processed: None,
             dhcp_restart_at: None,
             dhcp_tx,
             dhcp_rx,
@@ -960,6 +1021,7 @@ impl Supervisor {
             started_at_unix_ms: started,
             guest_mac: pod.mac.to_string(),
             guest_booted_at_unix_ms: 0,
+            dhcp_last_ack_unix_ms: 0,
             block_devices,
         };
         if let Err(e) = record.write(&dir) {
@@ -1030,6 +1092,7 @@ impl Supervisor {
             Ok(r) => {
                 tracing::info!(pod = %self.pod_uid(), pid = r.process.pid, "DHCP responder started");
                 self.dhcp = Some(r);
+                self.publish_network(NetworkState::Ready);
             }
             Err(e) => {
                 tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot start the DHCP responder");
@@ -1038,8 +1101,8 @@ impl Supervisor {
         }
     }
 
-    /// The responder exited while the VM runs: restart it with backoff, a
-    /// bounded number of times.
+    /// The responder exited while the VM runs: restart it with backoff for as
+    /// long as the VM runs.
     fn on_dhcp_exit(&mut self) {
         let Some(r) = self.dhcp.take() else {
             return;
@@ -1057,15 +1120,28 @@ impl Supervisor {
     }
 
     fn schedule_dhcp_restart(&mut self) {
-        self.dhcp_failures += 1;
-        if self.dhcp_failures > MAX_DHCP_RESTARTS {
-            tracing::error!(pod = %self.pod_uid(), failures = self.dhcp_failures - 1, "DHCP responder keeps failing; not restarting it for this VM");
-            self.dhcp_restart_at = None;
-            return;
-        }
+        self.dhcp_failures = self.dhcp_failures.saturating_add(1);
         let backoff =
             Duration::from_secs(1u64 << (self.dhcp_failures - 1).min(6)).min(DHCP_MAX_BACKOFF);
         self.dhcp_restart_at = Some(Instant::now() + backoff);
+        if self.dhcp_failures == DHCP_FAILING_AFTER + 1 {
+            tracing::error!(pod = %self.pod_uid(), failures = DHCP_FAILING_AFTER, "DHCP responder keeps failing; restarting it every {} s", DHCP_MAX_BACKOFF.as_secs());
+        }
+        let state = if self.dhcp_failures > DHCP_FAILING_AFTER {
+            NetworkState::Failing
+        } else {
+            NetworkState::Restarting
+        };
+        self.publish_network(state);
+    }
+
+    /// Report the responder state to the anchor and node agent.
+    fn publish_network(&mut self, state: NetworkState) {
+        if self.dhcp_state.0 != state {
+            self.dhcp_state = (state, now_ms());
+        }
+        let n = network_status(self.dhcp_state, self.dhcp_failures, self.dhcp_last_ack);
+        self.publish(|s| s.network = Some(n));
     }
 
     /// Open a new DHCP socket in the pod network namespace and start a
@@ -1114,6 +1190,9 @@ impl Supervisor {
     /// gone before its cgroup is removed.
     async fn stop_dhcp(&mut self) {
         self.dhcp_restart_at = None;
+        // The VM no longer runs: nothing to report about its address service.
+        self.dhcp_state = (NetworkState::Unspecified, 0);
+        self.publish(|s| s.network = None);
         if let Some(r) = self.dhcp.take() {
             let fd = r.process.pidfd.try_clone().ok();
             r.stop();
@@ -1230,7 +1309,16 @@ impl Supervisor {
                     None => {}
                 },
                 Some(ev) = self.dhcp_rx.recv() => match ev {
-                    DhcpEvent::Acknowledged { ip, mac } => self.on_guest_evidence(Some((ip, mac)), false),
+                    DhcpEvent::Acknowledged { ip, mac } => {
+                        let due = self.dhcp_ack_processed.is_none_or(|t| {
+                            t.elapsed() >= crate::handoff::dhcp::ACK_REPORT_INTERVAL
+                        });
+                        if due {
+                            self.dhcp_ack_processed = Some(Instant::now());
+                            self.on_dhcp_ack();
+                            self.on_guest_evidence(Some((ip, mac)), false);
+                        }
+                    }
                 },
                 Some(SerialEvent::LoginPrompt) = self.serial_rx.recv() => self.on_guest_evidence(None, true),
                 () = sleep_until(deadline) => {
@@ -1314,7 +1402,7 @@ impl Supervisor {
             match self.reopen_dhcp(&anchor).await {
                 // The failure count is not reset here: it only resets after
                 // a responder ran for DHCP_STABLE, so a flapping anchor
-                // cannot defeat the restart limit.
+                // cannot hide a responder that keeps failing.
                 Ok(socket) => self.start_dhcp(socket, &anchor),
                 Err(e) => {
                     tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot restore the DHCP responder");
@@ -1332,6 +1420,21 @@ impl Supervisor {
         if self.sessions == 0 && self.stopping.is_none() {
             self.detach_deadline = Some(Instant::now() + self.cfg.reattach_grace);
         }
+    }
+
+    /// The responder acknowledged a lease: remember when, also in the
+    /// runtime record, so the lease countdown survives a baryon-virtd
+    /// restart.
+    fn on_dhcp_ack(&mut self) {
+        self.dhcp_last_ack = now_ms();
+        if let Some(rec) = self.record.as_mut() {
+            rec.dhcp_last_ack_unix_ms = self.dhcp_last_ack;
+            if let Err(e) = rec.write(&self.cfg.vm_dir(&self.entry.pod_uid)) {
+                tracing::warn!(pod = %self.entry.pod_uid, error = %e, "cannot update runtime record");
+            }
+        }
+        let state = self.dhcp_state.0;
+        self.publish_network(state);
     }
 
     fn on_guest_evidence(&mut self, dhcp: Option<(Ipv4Addr, MacAddr)>, login: bool) {
@@ -1882,5 +1985,28 @@ mod tests {
         assert!(oom_killed(dir.path()));
         std::fs::write(dir.path().join("memory.events"), "oom_kill 0\n").unwrap();
         assert!(!oom_killed(dir.path()));
+    }
+
+    #[test]
+    fn network_status_reports_the_responder_and_the_lease() {
+        let ready = network_status((NetworkState::Ready, 5), 0, 0);
+        assert_eq!(ready.state, NetworkState::Ready as i32);
+        assert_eq!(ready.reason, "AddressServiceRunning");
+        assert_eq!((ready.since_unix_ms, ready.lease_expires_unix_ms), (5, 0));
+
+        let restarting = network_status((NetworkState::Restarting, 7), 2, 1_000);
+        assert_eq!(restarting.reason, "DhcpResponderRestarting");
+        assert!(restarting.message.contains("at most 60 s"));
+        assert!(restarting.message.contains("lease stays valid"));
+        assert_eq!(
+            restarting.lease_expires_unix_ms,
+            1_000 + i64::from(crate::handoff::dhcp::LEASE_SECONDS) * 1000
+        );
+
+        let failing = network_status((NetworkState::Failing, 9), 11, 0);
+        assert_eq!(failing.reason, "DhcpResponderFailing");
+        assert_eq!(failing.consecutive_failures, 11);
+        assert!(failing.message.contains("has not acquired an address"));
+        assert!(failing.message.contains("failed 11 times"));
     }
 }

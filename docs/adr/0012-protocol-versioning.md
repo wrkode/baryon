@@ -1,7 +1,7 @@
 # 0012: Runtime protocol versions, features, and negotiation
 
 Status: Accepted
-Date: 2026-10-03
+Date: 2026-10-03, revised 2026-10-04
 
 ## Context
 
@@ -34,8 +34,18 @@ express a breaking change except changing the package.
   - 1.1 adds `ProtocolVersion`, `AnchorService.Negotiate`, the version and
     required features in `AttachRequest`, and the version and features in
     `RuntimeInfo`.
+  - 1.2 adds `NetworkStatus` in `VmStatus` (field 12): the state of the
+    VM's DHCP responder (`READY`, `RESTARTING`, `FAILING`), a reason, a
+    message, when the state last changed, the count of consecutive
+    failures, the time of the last lease acknowledgement, and the lease
+    expiry (ADR 0007). It is not a feature: a VM does not need it to run.
+  - A consumer may use the minor version to decide whether optional status
+    is available (baryon-controller reports `NetworkReady` Unknown with
+    reason `RuntimeDoesNotReport` for hosts before 1.2). It must never
+    refuse a peer or a VM because of the minor version.
 - Features are named capabilities that a VM needs from baryon-virtd, for
-  example `disk.block`. A released name keeps its meaning. The 1.0 features
+  example `disk.block`. Only what a VM needs to run is a feature; optional
+  status is not. A released name keeps its meaning. The 1.0 features
   are `boot.firmware`, `disk.file`, `disk.block`, and `network.pod`; a 1.0
   peer is treated as implementing exactly these. Constants and checks live in
   `crates/runtime-api/src/protocol.rs`.
@@ -171,3 +181,7 @@ express a breaking change except changing the package.
   Anchor Pods of an earlier release have no
   `virtualization.baryon.io/placement-hash` annotation; the controller
   treats one as matching a VM without placement.
+- 2026-10-04: protocol 1.2 (`NetworkStatus` in `VmStatus`), the rule that
+  only what a VM needs to run is a feature, and the rule that a consumer
+  may use the minor version to decide whether optional status is available
+  but never refuses a peer or a VM because of it.
