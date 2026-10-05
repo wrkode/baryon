@@ -13,6 +13,14 @@ Baryon is early, pre-release software. The API is `v1alpha1` and will
 change; which parts are contract, the v0.1 freeze, and the change log are
 in [docs/api-stability.md](docs/api-stability.md).
 
+Which versions v0.1 is tested with (Hadron, Kairos, Cloud Hypervisor, k0s
+and Kubernetes, container runtime, CNI, CSI drivers, guests) is in the
+[support matrix](docs/compatibility.md#v01-support-matrix); which host and
+cluster versions work together is in
+[version skew](docs/compatibility.md#version-skew); what happens to VMs
+when a node is cordoned, drained, rebooted, or upgraded is in the
+[lifecycle contract](docs/kairos-integration.md#lifecycle-contract).
+
 ## Status
 
 Status labels follow [docs/architecture.md](docs/architecture.md). Tested
@@ -141,9 +149,9 @@ debian   True    GuestBooted   node1   10.244.1.30   62s
 | [runtime-boundary.md](docs/runtime-boundary.md) | experiments and evidence behind the runtime design |
 | [networking.md](docs/networking.md), [storage.md](docs/storage.md) | data paths |
 | [security.md](docs/security.md) | threat model and privileges |
-| [kairos-integration.md](docs/kairos-integration.md) | Hadron, Kairos, AuroraBoot, Kairos Operator, Cluster API |
+| [kairos-integration.md](docs/kairos-integration.md) | Hadron, Kairos, AuroraBoot, Kairos Operator, Cluster API; lifecycle contract and upgrade runbook |
 | [hadron.md](docs/hadron.md) | the Baryon-enabled Hadron image |
-| [compatibility.md](docs/compatibility.md) | host, Kubernetes, CNI, CSI, guest requirements |
+| [compatibility.md](docs/compatibility.md) | v0.1 support matrix; host, Kubernetes, CNI, CSI, guest requirements; version skew and upgrades |
 | [design-notes.md](docs/design-notes.md) | open and answered design questions |
 | [development.md](docs/development.md), [testing.md](docs/testing.md) | working on Baryon |
 | [adr/](docs/adr/) | architecture decision records |

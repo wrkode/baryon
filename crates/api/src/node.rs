@@ -101,6 +101,11 @@ pub struct NodeVmNetwork {
 pub struct RuntimeStatus {
     /// Version of baryon-virtd on the node.
     pub virtd_version: String,
+    /// Git commit baryon-virtd was built from; `-dirty` marks a build from
+    /// a tree with uncommitted changes, `unknown` a build without the
+    /// information.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtd_git_commit: Option<String>,
     /// Version of Cloud Hypervisor on the node.
     pub hypervisor_version: String,
     /// Runtime protocol version of baryon-virtd, `<major>.<minor>`; 1.0 for

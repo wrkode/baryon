@@ -61,6 +61,13 @@ the documented reason and is breaking. Clients must treat a reason they
 do not know as the condition's status alone: a new reason does not change
 what `True`, `False`, or `Unknown` mean.
 
+Runtime protocol during the 0.1 series: it stays at major version 1,
+and new minor versions may add only optional status. A 0.1.x release
+must not make a runtime feature required unless feature-aware placement
+ships in the same release (ADR 0012), so that any 1.x host keeps
+running every VM of any 0.1.x cluster release
+([compatibility.md](compatibility.md#which-combinations-work)).
+
 "Frozen" does not mean permanent stability. `v1alpha1` stays alpha, and
 the next minor release may change the API, with a documented upgrade path.
 
@@ -102,6 +109,9 @@ VirtualizationNode:
 - `status.heartbeatTime`
 - `status.vmCount`
 - `status.runtime.virtdVersion` and `status.runtime.hypervisorVersion`
+- `status.runtime.virtdGitCommit` as an optional, informational string:
+  the field and its meaning (the build of baryon-virtd) are contract, its
+  format is not
 
 ## Not contract
 
@@ -234,6 +244,21 @@ API changes; the API stays `v1alpha1`. Details are in
   The `Ready` True reason `KvmAvailable` was renamed `RuntimeReady`. A host
   report whose schema version the node agent does not read is now
   `ProtocolIncompatible` instead of `RuntimeUnreachable`.
+- New optional VirtualizationNode field `status.runtime.virtdGitCommit`:
+  the commit baryon-virtd was built from, `-dirty` for a build from a
+  tree with uncommitted changes, `unknown` for a build without the
+  information. Informational; the format is not contract. The node
+  agent's `host inventory` log line also gains `host_image`, the Hadron
+  base image named in the host image's component manifest.
+- VirtualMachine `Running` and `Ready` can now be Unknown, with the new
+  reason `NodeUnreachable` (before, Unknown was not used for them):
+  Kubernetes marked the Anchor Pod not ready while kubelet's last status
+  of the Anchor container is ready, which is what the node lifecycle
+  controller leaves when a node stops reporting. It takes precedence over
+  `Stopping` for a Terminating Anchor Pod on such a node. `NetworkReady`
+  is then Unknown with reason `NodeUnreachable` as well. Clients that
+  assumed `Running` and `Ready` are only True or False must handle
+  Unknown.
 - List semantics: VirtualMachine `status.addresses` is an atomic list
   whose `type` is the enum `InternalIP`; `status.identityConflictNodes`
   is a set; VirtualizationNode `status.vms` is a map keyed by

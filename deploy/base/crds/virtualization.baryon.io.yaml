@@ -1554,6 +1554,12 @@ spec:
                       a baryon-virtd that does not report one. Internal: compatibility is
                       reported by the `RuntimeHealthy` condition.
                     type: string
+                  virtdGitCommit:
+                    description: |-
+                      Git commit baryon-virtd was built from; `-dirty` marks a build from
+                      a tree with uncommitted changes, `unknown` a build without the
+                      information.
+                    type: string
                   virtdVersion:
                     description: Version of baryon-virtd on the node.
                     type: string

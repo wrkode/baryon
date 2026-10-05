@@ -91,7 +91,14 @@ pub(crate) async fn run(
         // The host inventory is logged, not published: at start and when
         // it changes.
         if let Some(h) = &obs.host {
-            let now = inventory_summary(h);
+            let mut now = inventory_summary(h);
+            if let Some(image) = obs
+                .runtime
+                .as_ref()
+                .and_then(|r| host_image(&r.components_json))
+            {
+                now.push_str(&format!(" host_image={image}"));
+            }
             if now != inventory {
                 tracing::info!(inventory = %now, "host inventory");
                 inventory = now;
@@ -108,6 +115,16 @@ pub(crate) async fn run(
             tracing::warn!(error = %e, "publishing VirtualizationNode failed");
         }
     }
+}
+
+/// The host image named in the component manifest of the host image
+/// (`hadronImage`), if any.
+fn host_image(components_json: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(components_json)
+        .ok()?
+        .get("hadronImage")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// One line describing the host for the node agent's log.
@@ -378,6 +395,7 @@ pub(crate) fn build_status(
                 features.retain(|f| seen.insert(f.clone()));
                 RuntimeStatus {
                     virtd_version: r.virtd_version.clone(),
+                    virtd_git_commit: Some(r.virtd_git_commit.clone()).filter(|c| !c.is_empty()),
                     protocol_version: Some(
                         protocol::Version::of_peer(r.version.as_ref()).to_string(),
                     ),
@@ -669,5 +687,15 @@ mod tests {
         // The entry carries no names or namespaces.
         let json = serde_json::to_string(&failing).unwrap();
         assert!(!json.contains("secret"));
+    }
+
+    #[test]
+    fn the_host_image_comes_from_the_component_manifest() {
+        assert_eq!(
+            host_image(r#"{"hadronImage":"ghcr.io/kairos-io/hadron:v0.5.3"}"#).as_deref(),
+            Some("ghcr.io/kairos-io/hadron:v0.5.3")
+        );
+        assert_eq!(host_image(""), None);
+        assert_eq!(host_image("{}"), None);
     }
 }

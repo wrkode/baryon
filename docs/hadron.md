@@ -109,12 +109,14 @@ symlink with a layout check, and finally kairos-init
 (`quay.io/kairos/kairos-init:v4.3.0`) with the Kubernetes provider:
 
 ```
-/kairos-init -s install -m generic -t false -p k3s --provider-k3s-version <v> --version <baryon version>
-/kairos-init -s init    -m generic -t false -p k3s --provider-k3s-version <v> --version <baryon version>
+/kairos-init -s install -m generic -t false -p k0s --provider-k0s-version <v> --version <baryon version>
+/kairos-init -s init    -m generic -t false -p k0s --provider-k0s-version <v> --version <baryon version>
 ```
 
-`KUBERNETES_DISTRO=k0s` selects k0s (set `KUBERNETES_VERSION` to the k0s
-version); an empty value builds a core image without Kubernetes. For provider-kubernetes (kubeadm), copy the host layer
+The build script installs k0s by default (`KUBERNETES_DISTRO=k0s`,
+version `K0S_VERSION` in `packaging/versions.env`); `KUBERNETES_DISTRO=k3s`
+selects k3s (not supported in v0.1) and an empty value builds a core image
+without Kubernetes. For provider-kubernetes (kubeadm), copy the host layer
 onto `ghcr.io/kairos-io/provider-kubernetes:<release>` instead; not tested.
 
 kairos-init runs last because its install and init stages rebuild the initrd

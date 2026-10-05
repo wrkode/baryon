@@ -156,6 +156,60 @@ Baryon's point of view. Baryon needs no Cluster API integration to run on it.
 "Runtime dependency" means Baryon VMs cannot run without it. No row in the
 right-hand columns is required for a Baryon installation.
 
+## Lifecycle contract
+
+Who owns what when a node changes:
+
+- Kairos owns the node and its OS: installation, A/B upgrades and
+  rollback, recovery, and trusted boot. Kubernetes-driven OS upgrades go
+  through Kairos Operator (`NodeOpUpgrade`). Baryon has no OS upgrade
+  controller and does not gate upgrades.
+- Kubernetes owns cordon, drain, eviction, scheduling, and volume attach
+  and detach.
+- Baryon owns VM runtime reconciliation. baryon-controller replaces an
+  Anchor Pod that is gone and reports VM status; baryon-virtd runs the
+  VMMs and reattaches them after its own restart; baryon-node-agent
+  publishes the VirtualizationNode state that an upgrade workflow can read
+  (`Ready`, `RuntimeHealthy`, `heartbeatTime`, `vmCount`; see
+  [Cooperation with upgrades](#cooperation-with-upgrades)).
+- Live migration is Not supported ([ADR 0013](adr/0013-live-migration.md)).
+  A node event that removes an Anchor Pod stops the VM; it starts again
+  where its storage allows.
+
+Upgrade procedure for v0.1: one `NodeOpUpgrade` per node with Kairos
+Operator v0.2.2, starting the next node only after the previous node has
+rebooted and its VMs are back
+([runbook](#runbook-upgrade-one-node-with-kairos-operator)). The
+`NodeOpUpgrade` of one node is Tested on the k0s cluster. The check of the
+runbook's step 5, which tells by the Node's boot ID and the
+VirtualizationNode heartbeat that the node has rebooted and reports
+again, is Designed; the tested runs waited for the VirtualizationNode
+`Ready` condition instead. One node per `NodeOpUpgrade` is the procedure
+tested with v0.2.2, not a permanent limitation of Kairos Operator: v0.2.2
+counts a node's reboot as complete
+before the node is back, so `concurrency: 1` in one `NodeOpUpgrade` for
+several nodes does not keep their outages from overlapping. Such a run
+completed on the k0s cluster and every VM recovered, but it is not the
+procedure for v0.1. The manual `kairos-agent upgrade` procedure
+([Manual A/B upgrade](#manual-ab-upgrade)) is Tested as well.
+
+What happens to the VMs on a node:
+
+| Event | VMs on the node | Evidence |
+|---|---|---|
+| Cordon | Running VMs keep running; a cordon does not touch running pods. New VMs, and VMs whose Anchor Pod is replaced, are not placed on the node: VM placement cannot tolerate the cordon taint | No new VM on a cordoned node: Tested (multi-node and placement E2E, cordon cases). Running VMs: Kubernetes cordon semantics, not checked separately |
+| Drain | Anchor Pods are removed (`kubectl drain` evicts them; the `NodeOpUpgrade` drain of v0.2.2 deletes them). Each guest gets an ACPI shutdown, within the Anchor Pod's 90 s termination grace period. baryon-controller creates a new Anchor Pod, and the scheduler places it where the VM's storage allows: a VM on Ceph RBD starts on another node after CSI detach and attach; a VM on OpenEBS LVM LocalPV waits for its node (`ClaimPending`, and `Unschedulable` while the node is cordoned) | Tested with the `NodeOpUpgrade` drain: manual procedure on the k0s cluster ([testing.md](testing.md#k0s-cluster)). `kubectl drain`: Not tested |
+| Graceful node shutdown (a reboot or shutdown that does not go through Kubernetes) | kubelet terminates the Anchor Pods first, and the guests shut down cleanly. Needs kubelet graceful node shutdown with `shutdownGracePeriod` minus `shutdownGracePeriodCriticalPods` at least 90 s; the tested nodes set 150 s and 30 s through Kairos cloud-config | Tested: manual procedure on the k0s cluster (including the Kairos Operator reboot without drain) and the Hadron k3s node ([Node reboot](#node-reboot)) |
+| Node reboot without graceful node shutdown | The guests are stopped hard. After boot the old Anchor Pod fails admission (`UnexpectedAdmissionError`) and is replaced | Tested on the Hadron k3s node. Not a supported configuration: graceful node shutdown is a host requirement ([compatibility.md](compatibility.md#host-requirements)) |
+| Reboot, including the reboot of an A/B upgrade | baryon-controller creates a new Anchor Pod (new pod UID and IP, same MAC). A VM on node-local storage comes back on the same node once the node is Ready; a VM on shared storage may start on another node | Tested: manual procedures on the k0s cluster and the Hadron k3s node |
+| baryon-controller restart | VMs are untouched; reconciliation resumes after the restart | Tested: multi-node E2E (case controller) on the k0s cluster |
+| baryon-virtd restart | VMs keep running (the same VMM process); each anchor reattaches and baryon-virtd recovers the VM's runtime state; the DHCP responder is replaced | Tested: multi-node E2E (case virtd) on the k0s cluster; manual procedure on the Hadron k3s node |
+| baryon-virtd stopped | The VirtualizationNode goes `Ready` False and the node takes no new VMs; VMs on other nodes are untouched; the node's VM is Ready again once baryon-virtd is back | Tested: multi-node E2E (case runtime-down) on the k0s cluster |
+| Node failure (crash, power loss, partition) | The VM is down, or its state is unknown during a partition. Once Kubernetes marks the Anchor Pod not ready, the VM's `Running` and `Ready` are Unknown with reason `NodeUnreachable` ([api.md](api.md#node-unreachable)). A VM that was still booting keeps `Ready` False (`Booting`); only `NetworkReady` (Unknown after 90 s) shows the loss. baryon-controller creates no new Anchor Pod while the old pod object exists (fencing, ADR 0004). After taint-based eviction the pod stays Terminating until kubelet on the node confirms it, an administrator deletes it after confirming that the node is off, or the node gets the `node.kubernetes.io/out-of-service` taint. Then the VM starts where its storage allows | `NodeUnreachable`: Implemented, unit test. Fencing: ADR 0004. Behavior after the out-of-service taint: inferred from upstream pod garbage collection, not observed. Power loss: Tested on the k0s cluster (the node of a VM pinned to it lost power; ceph-rbd): once Kubernetes marked the pod not ready, `Running`, `Ready`, and `NetworkReady` were Unknown (`NodeUnreachable`); no new Anchor Pod was created while the node was off, also after the taint eviction marked the old pod Terminating; after power-on kubelet confirmed the deletion and a new Anchor Pod brought the VM back to Ready. The out-of-service taint was not tested |
+| Kairos rollback after a failed upgrade boot | The node boots the previous host image. An older host image of the same protocol major version works with the cluster release ([compatibility.md](compatibility.md#which-combinations-work)), but lacks the host-side safety fixes of newer releases; VMs come back as after a reboot | Not tested; pending in the release validation |
+| Deleting the Node object | The VirtualizationNode is garbage-collected through its owner reference to the Node, and Kubernetes deletes the pods bound to the missing node, which removes the fencing; baryon-controller then creates a new Anchor Pod. Delete the Node object only after confirming that the machine is off, because a guest that still runs there would run twice | Not tested; inferred from owner references and upstream pod garbage collection |
+| baryon-node-agent outage | VMs keep running and stay `Ready`. Their `NetworkReady` becomes Unknown (`RuntimeUnreachable`) once the node's report is older than 90 s. A stopping node agent sets the node's `Ready` and `RuntimeHealthy` to Unknown (`NodeAgentStopped`) | Tested: node-agent-outage E2E and network-health E2E (case agent) on the k0s cluster |
+
 ## Baryon-enabled image workflow (Implemented, see [hadron.md](hadron.md))
 
 ```
@@ -229,8 +283,8 @@ Status: Tested, manual procedure, on a single k3s node and on the k0s
 cluster, with one VM running; details for the k3s node in
 [hadron.md](hadron.md#reboot-behavior). On the k0s cluster, with graceful
 node shutdown and the VM on an LVM local volume, the guest shut down
-cleanly, and the VM came back without intervention once the node was Ready
-command, on a replacement Anchor Pod on the same node.
+cleanly, and the VM came back without intervention once the node was
+Ready, on a replacement Anchor Pod on the same node.
 
 - Without kubelet graceful node shutdown (the k3s default), the guest is
   stopped hard at the reboot. After boot, kubelet re-admits the existing
@@ -242,8 +296,9 @@ command, on a replacement Anchor Pod on the same node.
 - In both cases baryon-controller creates a new Anchor Pod (new pod UID and
   IP, same MAC). It stays Pending until the device plugin registers, and the
   VM boots again (timings in [testing.md](testing.md#results)).
-- baryon-virtd exits 2 s after SIGTERM. Before that change it waited for open gRPC streams until systemd killed it at the 90 s
-  stop timeout when it was restarted with VMs running. Node reboots were not
+- baryon-virtd exits 2 s after SIGTERM. Before that change it waited for
+  open gRPC streams until systemd killed it at the 90 s stop timeout when
+  it was restarted with VMs running. Node reboots were not
   delayed by it: the pods, and with them the client connections, are gone
   before systemd stops baryon-virtd.
 
@@ -314,10 +369,12 @@ removal before the node accepts VMs again).
 ### Runbook: upgrade one node with Kairos Operator
 
 Status: Tested on the k0s cluster with Kairos Operator v0.2.2, for one
-node and for a rolling upgrade of all three nodes (below). With v0.2.2,
+node; the step 5 check is Designed (see the step). A single
+`NodeOpUpgrade` for all three nodes was also run (below). With v0.2.2,
 `concurrency` does not bound how many nodes are down at once, so this
 runbook upgrades one node per `NodeOpUpgrade` and starts the next only
-after the previous node and its VMs are back.
+after the previous node and its VMs are back: step 5 checks that by the
+Node's boot ID, recorded in step 3, and the VirtualizationNode heartbeat.
 
 1. Optionally drain the node with kubectl first (this also cordons it).
    kubectl drain uses the Eviction API and honors PodDisruptionBudgets. Anchor Pods have no
@@ -465,7 +522,7 @@ one on an LVM local volume on each of node2 and node3):
 - VMs whose claims carried an older import record (no digest) got an
   import Pod after their drain; on filesystem claims the importer found the
   marker and left the disk unchanged (see
-  [compatibility.md](compatibility.md#version-skew)).
+  [compatibility.md](compatibility.md#release-specific-notes)).
 
 Limits:
 

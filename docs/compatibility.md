@@ -2,12 +2,14 @@
 
 Baryon does not depend on how a cluster or node was provisioned (manual
 Kairos install, AuroraBoot, Kairos Fleet, Cluster API, or anything else). It
-depends on the requirements below. Each one names the decision that creates
-it and how it has been verified so far.
+depends on the requirements below. The [support matrix](#v01-support-matrix)
+says which versions v0.1 is tested with. The requirement tables after it
+say what Baryon needs from a node and a cluster; each requirement names
+the decision that creates it and how it has been verified so far.
 
-Verification states: **Verified** (observed on a named environment),
-**Inferred** (from upstream code or documentation, not observed), **Open**
-(not checked).
+Verification states in the requirement tables: **Verified** (observed on a
+named environment), **Inferred** (from upstream code or documentation, not
+observed), **Open** (not checked).
 
 Environments: "k0s cluster" means three Baryon-enabled Hadron nodes (node1
 to node3, VMs with nested KVM) running k0s, the integration environment;
@@ -16,29 +18,80 @@ means a historical development cluster in which a kind node container acted
 as the host, no longer used and not a Baryon environment. All are described
 in [testing.md](testing.md#results).
 
-## Certified configuration
+## v0.1 support matrix
 
-None yet. The first certified configuration is planned to be:
+What the v0.1 series (0.1.0-rc1 and later 0.1 releases) is tested with.
+Support claims follow tests: only rows marked Tested are support claims,
+even where the architecture does not depend on the component. Expected
+and Not tested rows make no claim. States:
 
-| Component | Version |
+- **Tested**: observed on the k0s cluster with the results in
+  [testing.md](testing.md#results), unless the row names another
+  environment.
+- **Expected**: not tested; expected to work for the reason given.
+- **Not tested**: no evidence either way.
+- **Not supported**: known not to work, or excluded for v0.1, for the
+  reason given.
+
+| Component | Version | State |
+|---|---|---|
+| Baryon | 0.1.0-rc1 (workspace version 0.1.0, API `v1alpha1`, runtime protocol 1.2) | Tested on the k0s cluster with the API review change, after an in-place upgrade of the cluster ([testing.md](testing.md#k0s-cluster)): E2E lifecycle, node agent outage, deletion, placement, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, skew with all hosts on one build, and hostile disk. The network health E2E last ran with the runtime hardening change (8db33bb). `tests/e2e/repeat.sh` was not run. VirtualizationNode `status.runtime.virtdGitCommit` and the `host_image` field of the node agent's `host inventory` log line were added after those runs: Implemented, unit tests |
+| Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
+| Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
+| Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
+| Cloud Hypervisor | v53.0, static binary, SHA-256 pinned in `packaging/versions.env` | Tested. Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
+| UEFI firmware | CLOUDHV.fd from cloud-hypervisor/edk2 `ch-97eeb7b09`, SHA-256 pinned in `packaging/versions.env` | Tested |
+| virtiofsd | v1.14.0 | Shipped in the image, not used by Baryon |
+| Architecture | x86_64 | Tested. aarch64: Not supported, binaries and firmware are built for x86_64 only (aarch64 support is Planned) |
+| k0s | v1.36.4+k0s.1, one controller that also runs workloads and two workers | Tested. Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). See [Distribution support policy](#distribution-support-policy) for k3s and kubeadm |
+| Kubernetes | 1.36.4 (from k0s v1.36.4+k0s.1) | Tested. Other minor versions: Not tested; see [Kubernetes support policy for v0.1](#kubernetes-support-policy-for-v01) |
+| Container runtime | containerd 2.3.5 and runc 1.4.3 (bundled with k0s v1.36.4+k0s.1) | Tested, with `SystemdCgroup = true` and `device_ownership_from_security_context = true`. CRI-O and crun: Not tested |
+| kubelet cgroup driver | systemd | Tested. cgroupfs: Not supported; baryon-virtd refuses the VM (`CgroupDriverUnsupported`) |
+| CNI | kube-router v2.10.0 (the k0s default; no network provider set in the k0s configuration) | Tested, including traffic between nodes and through a ClusterIP Service |
+| Other CNIs | any | Not tested; must meet the [CNI requirements](#cni-requirements). Datapaths that address frames to the MAC recorded at CNI ADD, such as some eBPF datapaths, are expected to fail |
+| Cluster DNS | CoreDNS 1.14.7 (the k0s default) | Tested (Service DNS name from a probe pod) |
+| Filesystem-mode root disk claims | ReadWriteOnce | Tested: storage E2E with OpenEBS LVM LocalPV (last with the API review change) and Ceph RBD (last with the change set committed as 4d2b5df to 1835c0c) |
+| Raw block-mode root disk claims | ReadWriteOnce | Tested: storage E2E with Ceph RBD and import integrity E2E with OpenEBS LVM LocalPV and Ceph RBD, last with the API review change; storage E2E with OpenEBS LVM LocalPV last with the change set committed as 4d2b5df to 1835c0c. Needs containerd `device_ownership_from_security_context = true` |
+| Ceph RBD | Rook v1.20.8 (`rook/ceph:v1.20.8`), Ceph 19.2.3 (`quay.io/ceph/ceph:v19.2.3`), ceph-csi v3.17.1 (`quay.io/cephcsi/cephcsi:v3.17.1`) and ceph-csi-operator v1.0.4 (`quay.io/cephcsi/ceph-csi-operator:v1.0.4`) through the ceph-csi-drivers chart 1.0.4 | Tested: filesystem and block mode, ReadWriteOnce, and a move to another node with CSI detach and attach. Builds: see the two rows above; the move is part of every Ceph RBD storage E2E run (`storage.sh` moves the VM when its volume is not bound to a node), and testing.md names it for the c8e6c08 runs |
+| OpenEBS LVM LocalPV | lvm-driver 1.10.1 (`openebs/lvm-driver:1.10.1`) | Tested: filesystem and block mode, node-local, `WaitForFirstConsumer`. A VM on it starts again only on its node |
+| CephFS | any | Not tested |
+| local-path provisioner | k3s default | Not tested with v0.1; it ran only on the single-node k3s Hadron node with an earlier release (historical evidence) |
+| Other CSI drivers | any | Expected to work if they meet the [CSI requirements](#csi-requirements): Baryon consumes claims only through the Anchor Pod and the import Pod, as ordinary pod volumes. Not tested |
+| `ReadWriteMany` block claims shared across nodes | any | Not supported: one running VM per claim (`ClaimInUse`) |
+| Kairos Operator | v0.2.2, `NodeOpUpgrade` | Tested with the earlier step 5: the upgrade of one node with its own `NodeOpUpgrade`, the procedure of the [runbook](kairos-integration.md#runbook-upgrade-one-node-with-kairos-operator) and the [lifecycle contract](kairos-integration.md#lifecycle-contract), with a wait for the VirtualizationNode `Ready` condition in place of the current step 5, which is Designed. One `NodeOpUpgrade` for several nodes completed in one test, with overlapping node outages (with v0.2.2, `concurrency` does not prevent them); use one `NodeOpUpgrade` per node. Other versions: Not tested |
+| Guest OS | Debian 13 genericcloud raw image (amd64) | Tested |
+| Other Linux guests | any | Expected to work if they meet the [guest requirements](#guest-requirements) (UEFI-bootable raw image, DHCP client or cloud-init). Not tested |
+| Windows guests | any | Not supported; not tested |
+
+## Kubernetes support policy for v0.1
+
+- Tested minor version: 1.36, as k0s v1.36.4+k0s.1 on the k0s cluster.
+  The CI API server checks run against the same k0s version.
+- Other minor versions are Not tested for v0.1. Earlier commits ran on
+  Kubernetes 1.34 (the kind host, historical, not a Baryon environment)
+  and 1.36 (k3s v1.36.4+k3s1 on a single Hadron node, historical); this
+  is evidence about Kubernetes behavior, not support.
+- Requirement: a Baryon installation needs Kubernetes 1.32 or later,
+  because the admission policies that are part of the supported
+  installation need it ([Kubernetes requirements](#kubernetes-requirements)).
+  This is a floor below which Baryon cannot work, not a statement that
+  1.32 to 1.35 are supported.
+- Client types are generated for Kubernetes 1.36 and use only stable
+  fields (ADR 0008).
+
+## Distribution support policy
+
+Baryon's architecture does not depend on the Kubernetes distribution:
+baryon-virtd derives pod identity, namespaces, and cgroups from the
+connecting Anchor process, not from distribution paths (ADR 0005). Support
+claims still follow tests.
+
+| Distribution | State for v0.1 |
 |---|---|
-| Hadron | v0.5.x (default kernel, not `cloud`) |
-| Kairos | v4.3.x |
-| Kubernetes provider | k3s v1.36.x through `kairos-init -p k3s` |
-| CNI | flannel (k3s default) |
-| CSI | local-path (k3s default) |
-| Cloud Hypervisor | v53.0 (static build) |
-| UEFI firmware | cloud-hypervisor/edk2 `ch-97eeb7b09` CLOUDHV.fd |
-| virtiofsd | v1.14.0 (shipped, not used yet) |
-
-## Kubernetes distributions
-
-| Distribution | State |
-|---|---|
-| k0s | Tested on three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3 (kernel 7.2.6-hadron), Kairos v4.3.0, k0s v1.36.4+k0s.1 with one controller that also runs workloads and two workers, the k0s default CNI (kube-router; no network provider set in the k0s configuration), OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0. Needs the containerd drop-in and worker profile described in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container, which validates only API server behavior (CRD schema, CEL rules, admission policies); it is not a Baryon host. |
-| k3s | Tested on a single Baryon-enabled Hadron node (VM with nested KVM): Hadron v0.5.3 (kernel 7.2.6-hadron), Kairos through kairos-init v4.3.0, k3s v1.36.4+k3s1, flannel (vxlan backend, `cni0` bridge), local-path, systemd cgroup driver, Cloud Hypervisor v53.0. Multi-node behavior with k3s is not tested. |
-| kubeadm (provider-kubernetes) | not tested |
-| kind | not a Baryon environment. A development cluster in which a kind node container acted as the host was used for the runtime experiments and early E2E runs; it is no longer used. |
+| k0s | Tested: v1.36.4+k0s.1 on the k0s cluster, three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, one controller that also runs workloads and two workers, kube-router, OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0. Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container; it validates only API server behavior (CRD schema, CEL rules, admission policies) and is not a Baryon host |
+| k3s | Not supported for v0.1 until tested on more than one node. An earlier release ran on a single Baryon-enabled Hadron node (VM with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, k3s v1.36.4+k3s1, flannel (vxlan backend, `cni0` bridge), local-path, systemd cgroup driver, Cloud Hypervisor v53.0. That is historical evidence. `hack/build-hadron-image.sh` builds a k3s image only when `KUBERNETES_DISTRO=k3s` is set; the default is k0s |
+| kubeadm (provider-kubernetes) | Not tested |
+| kind | Not a Baryon environment. A development cluster in which a kind node container acted as the host was used for the runtime experiments and early E2E runs; it is no longer used |
 
 ## Host requirements
 
@@ -170,42 +223,165 @@ backend is Open. Other CNIs are not tested.
 
 ## Version skew
 
-baryon-virtd ships in the host image and is upgraded with the OS (Kairos);
-baryon-controller, baryon-node-agent, and the anchor image are the cluster
-release, upgraded with the cluster deployment. They communicate through the
-versioned runtime protocol of ADR 0012. API changes and their upgrade
-steps are listed per release in [api-stability.md](api-stability.md#change-log-per-release);
-for 0.1.0-rc1 see [Upgrade to 0.1.0-rc1](#upgrade-to-010-rc1).
+Baryon has two parts that are upgraded separately:
 
-| Rule | Status |
-|---|---|
-| A cluster release and a host image interoperate when they share the protocol major version, in any combination of minor versions | Tested: version skew E2E on the k0s cluster, below |
-| Hosts of another major version are reported `ProtocolIncompatible` on the VirtualizationNode, their `virtualization.baryon.io/vm` slots become unhealthy, and running VMs continue | Implemented, unit tests |
-| A cluster release supports Anchor Pods of the previous release that are still running, and hosts of the same major version | Tested for 1.0 Anchor Pods under the 1.1 cluster release |
-| No VM requires a feature beyond the 1.0 set until feature-aware placement exists | Designed (ADR 0012); placement by feature is Planned |
-| The minor version only decides whether optional status is available, never whether a peer or a VM is accepted. With a host before 1.2, a running VM's `NetworkReady` is Unknown with reason `RuntimeDoesNotReport` | Implemented, unit tests |
-| A baryon-controller of the network health change with a baryon-node-agent of an earlier release, as during a cluster release rollout: the node agent publishes no `status.vms`, so a running VM's `NetworkReady` is Unknown, `NotReported` on 1.2 hosts and `RuntimeDoesNotReport` on earlier hosts, until the DaemonSet has rolled. A baryon-controller of an earlier release ignores `status.vms` and sets no `NetworkReady` | Implemented; not tested |
-| Host-side safety fixes (disk path checks, the block device registry in baryon-virtd) are not negotiated | Until releases are tagged, run a host image built from the same commit as the cluster release or later |
+- the **host image**: the Baryon-enabled Hadron image with baryon-virtd,
+  Cloud Hypervisor, and the firmware. It is upgraded with the OS, through
+  Kairos, one node at a time ([lifecycle contract](kairos-integration.md#lifecycle-contract)).
+- the **cluster release**: the CRDs, admission policies, RBAC,
+  baryon-controller, baryon-node-agent, and the anchor image. It is
+  upgraded with `kubectl apply` (for this release, see
+  [Upgrade to 0.1.0-rc1](#upgrade-to-010-rc1); API changes and their
+  upgrade steps per release are in
+  [api-stability.md](api-stability.md#change-log-per-release)).
 
-Minimum host image per cluster release:
+The two talk through the versioned runtime protocol. This section is the
+operator contract; [ADR 0012](adr/0012-protocol-versioning.md) describes
+the mechanism (negotiation, features, major transitions).
+
+### Which combinations work
+
+The runtime protocol version is `<major>.<minor>`. The 0.1 series speaks
+major 1; minors 1.0, 1.1, and 1.2 exist, and 0.1.0-rc1 speaks 1.2.
+
+Rule (ADR 0012): any 1.x host image works with any 1.x cluster release.
+Tested pairs, on the k0s cluster with the version skew E2E (evidence
+below):
+
+| Cluster release | Host images | Status |
+|---|---|---|
+| 1.0 | 1.0 and 1.1 | Tested |
+| 1.1 | 1.0 and 1.1 | Tested |
+| 1.2 | 1.1 and 1.2 | Tested |
+
+Other pairs, for example a 1.2 cluster release with a 1.0 host, are allowed
+by ADR 0012 and not tested.
+
+| Combination | Result | Status |
+|---|---|---|
+| Cluster release newer than the host image (same major) | Works. Status that the newer minor added is absent for VMs on older hosts: with a host before 1.2, a running VM's `NetworkReady` is Unknown with reason `RuntimeDoesNotReport` | Tested for the pairs above (1.1 cluster release with 1.0 hosts, 1.2 cluster release with a 1.1 host) |
+| Host image newer than the cluster release (same major) | Works. The cluster release ignores what the newer host adds | Tested for the pair above (1.0 cluster release with 1.1 hosts) |
+| Host image and cluster release of different major versions | Refused: the node is not Ready and takes no new VMs; VMs already running on it keep running. A host of a new major version is reported `ProtocolIncompatible` only if it keeps serving major 1's `GetHost` and `GetRuntimeInfo`, as the transition rule of ADR 0012 requires; a host that does not is reported `RuntimeUnreachable` | Designed (ADR 0012). The checks are Implemented with unit tests; no second major version exists, so it is not tested end to end |
+| A VM that needs a feature the host does not implement | Refused on that host (`UnsupportedFeature`). Within the 0.1 series no VM needs a feature beyond the 1.0 features, so this cannot occur between 0.1 releases | Implemented, unit tests |
+
+The minor version decides only whether optional status is available. It
+never decides whether a node or a VM is accepted. Required features are
+checked per VM, when its anchor attaches.
+
+Release rule (ADR 0012): a 0.1.x release must not make a runtime feature
+required unless feature-aware placement ships in the same release.
+Without it, nothing steers a VM that needs the feature to a host that
+implements it.
+
+Host-side safety fixes (the disk path checks and the block device
+registry in baryon-virtd) are not part of the protocol and are not
+negotiated, so the protocol rule alone does not give them. Minimum host
+image:
 
 | Cluster release | Protocol | Minimum host image |
 |---|---|---|
-| a73f37f (first published commit) | 1.0 | a73f37f |
-| 597b637 to b0413aa | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
-| 29c512c (the network health change) | 1.2 | protocol: any 1.x host; `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`); host-side safety fixes: an image built from the same commit as the cluster release or later |
+| 0.1.0-rc1 | 1.2 | Protocol: any 1.x host. Host-side safety fixes: a host image of 0.1.0-rc1 or later. `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`) |
 
-Evidence on the k0s cluster, 2026-10-03 (version skew E2E,
-`tests/e2e/skew.sh`, one VM per node, a baryon-virtd restart on every node):
+The commits before 0.1.0-rc1 are listed in
+[Pre-release commits](#pre-release-commits).
 
-- 1.0 cluster release with mixed 1.0 and 1.1 hosts: 31 of 31 checks.
-- 1.1 cluster release with mixed hosts: 31 of 31. New anchors on 1.0 hosts
-  took the UNIMPLEMENTED path of `Negotiate` and attached.
-- A 1.0 anchor reattached to a 1.1 baryon-virtd after a restart.
-- VMs of the old release kept running through the cluster release upgrade,
-  with `RestartRequired=True` (`AnchorImageChanged`).
-- The node agent published `protocolVersion` 1.0 for old hosts and 1.1 with
+### Upgrade order
+
+Within a major version, either order works:
+
+- cluster release first, then the host images node by node. Tested: the
+  1.1 cluster release with mixed 1.0 and 1.1 hosts, and the 1.2 cluster
+  release with one 1.1 host.
+- host images first, node by node, then the cluster release. Tested: the
+  1.0 cluster release with mixed 1.0 and 1.1 hosts.
+
+A host image older than the cluster release lacks the host-side safety
+fixes of that release, even though the protocol accepts it: finish the
+host rollout, so that every node runs a host image of the cluster
+release or later.
+
+If a node shows `Ready` False with reason `ProtocolIncompatible` or
+`RuntimeUnreachable` after a host or cluster upgrade, compare the host
+runtime version with the cluster release
+([Identifying versions](#identifying-versions)).
+
+Running VMs keep running through a cluster release upgrade: a cluster
+release supports the Anchor Pods of the previous release that are still
+running (Tested for 1.0 Anchor Pods under the 1.1 cluster release). When
+the anchor image changes, they report `RestartRequired=True`
+(`AnchorImageChanged`) and use the new anchor from their next start
+(observed from the 1.0 to the 1.1 cluster release). A host image upgrade
+reboots the node, which stops its VMs
+([lifecycle contract](kairos-integration.md#lifecycle-contract)).
+
+During a rollout of the cluster release, a baryon-controller of the
+network health change or later with a baryon-node-agent of an earlier
+release gets no `status.vms` from that node agent, so a running VM's
+`NetworkReady` is Unknown, `NotReported` on 1.2 hosts and
+`RuntimeDoesNotReport` on earlier hosts, until the DaemonSet has rolled. A
+baryon-controller of an earlier release ignores `status.vms` and sets no
+`NetworkReady`. Implemented; not tested.
+
+Evidence on the k0s cluster (version skew E2E, `tests/e2e/skew.sh`, one VM
+per node, a baryon-virtd restart on every node; details in
+[testing.md](testing.md#k0s-cluster)):
+
+- 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts: 31 of 31
+  checks.
+- 1.1 cluster release (597b637) with mixed hosts: 31 of 31. New anchors on
+  1.0 hosts took the UNIMPLEMENTED path of `Negotiate` and attached. The
+  node agent published `protocolVersion` 1.0 for old hosts and 1.1 with
   features for new ones.
+- A 1.0 anchor reattached to a 1.1 baryon-virtd after a restart.
+- VMs of the 1.0 release kept running through the cluster release upgrade,
+  with `RestartRequired=True` (`AnchorImageChanged`).
+- 1.2 cluster release (the network health change) with one host on the
+  previous host image (1.1): 33 of 34. `NetworkReady` was True on the 1.2
+  hosts and Unknown (`RuntimeDoesNotReport`) on the 1.1 host, and every VM
+  reattached after the baryon-virtd restarts, including a 1.2 anchor on
+  the 1.1 host. The failed check was the build stamp: both host images
+  carried the same commit because the newer one was built from a tree with
+  uncommitted changes. The build scripts now mark such builds `-dirty`.
+
+These runs used builds before 0.1.0-rc1. 0.1.0-rc1 ran the skew E2E with
+all hosts on one build (33 of 33); it did not change the runtime protocol.
+
+### Identifying versions
+
+| What | Where | How to read it |
+|---|---|---|
+| baryon-controller build | its log line `starting`: field `build` (`baryon-controller <version> (<commit>)`) and field `anchor_image`; the Deployment's image | `kubectl logs -n baryon-system deployment/baryon-controller \| grep '"starting"'` and `kubectl get deployment baryon-controller -n baryon-system -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'` |
+| baryon-node-agent build | its log line `starting`: field `build` (`baryon-node-agent <version> (<commit>)`); the DaemonSet's image | `kubectl logs -n baryon-system <node-agent-pod> \| grep '"starting"'` and `kubectl get daemonset baryon-node-agent -n baryon-system -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'` |
+| Host runtime (baryon-virtd) build | VirtualizationNode `status.runtime.virtdVersion` (the Runtime column) and `status.runtime.virtdGitCommit` | `kubectl get virtualizationnodes -o custom-columns=NODE:.metadata.name,VIRTD:.status.runtime.virtdVersion,COMMIT:.status.runtime.virtdGitCommit,HYPERVISOR:.status.runtime.hypervisorVersion` |
+| Cloud Hypervisor | VirtualizationNode `status.runtime.hypervisorVersion` (the Hypervisor column): the version in the host image's component manifest, or the output of `cloud-hypervisor --version` when the manifest has none | as above |
+| Host image | the `host_image` field of the node agent's `host inventory` log line: the Hadron base image the Baryon-enabled image was built from ([api.md](api.md#host-inventory)). On the node, `/usr/share/baryon/components.json` lists the Baryon version and commit of the image, the Hadron and kairos-init images, the Kubernetes distribution and version, and the Cloud Hypervisor, firmware, and virtiofsd versions with their checksums | `kubectl logs -n baryon-system <node-agent-pod> \| grep '"host inventory"'`; on the node, `cat /usr/share/baryon/components.json` |
+| Runtime compatibility | VirtualizationNode `RuntimeHealthy` condition. `status.runtime.protocolVersion` and `status.runtime.features` are internal and only help diagnosis | `kubectl get virtualizationnode <node> -o jsonpath='{.status.conditions[?(@.type=="RuntimeHealthy")].reason}{"\n"}'` |
+
+`<node-agent-pod>` is the node agent pod of the node:
+`kubectl get pods -n baryon-system -l app.kubernetes.io/name=baryon-node-agent --field-selector spec.nodeName=<node> -o name`.
+
+The commit is the hash of the source the binary was built from,
+abbreviated to 12 characters by `hack/build-static.sh` and
+`hack/build-hadron-image.sh`. A
+`-dirty` suffix means the build came from a tree with uncommitted changes
+to tracked files, so it is not a build of that commit; `unknown` means a
+build without the information (a plain `cargo build`). baryon-virtd and
+`components.json` of a host image carry the same commit, because
+`hack/build-hadron-image.sh` stamps both. `virtdGitCommit` is absent while
+baryon-virtd is unreachable and when the node agent predates the field.
+
+### What you see
+
+| Situation | VirtualizationNode | VirtualMachine | Running VMs and placement |
+|---|---|---|---|
+| Cluster release newer than the host image (same major) | `Ready` True (`RuntimeReady`), `RuntimeHealthy` True; `runtime.protocolVersion` shows the older minor | Usual conditions; status of the newer minor is missing (next row) | VMs run; new VMs are placed on the node |
+| Optional status missing: the host predates the minor that adds it | As above | `NetworkReady` Unknown, reason `RuntimeDoesNotReport` (hosts before 1.2) | VMs run. Upgrade the host image to get the status |
+| Host image newer than the cluster release (same major) | `Ready` True, `RuntimeHealthy` True; the node agent publishes only the fields it knows | Usual conditions; a cluster release before 1.2 sets no `NetworkReady` | VMs run; new VMs are placed on the node |
+| Protocol major differs (Designed) | `Ready` False and `RuntimeHealthy` False, reason `ProtocolIncompatible`; the message names both versions. A host of a new major version that does not keep serving major 1's `GetHost` and `GetRuntimeInfo` shows `RuntimeUnreachable` instead. In both cases the node agent marks the node's `virtualization.baryon.io/vm` and `virtualization.baryon.io/import` slots unhealthy, so their allocatable is zero | A VM that needs a new Anchor Pod is placed on another node, or stays `Unschedulable` when no other node fits. A VM whose anchor still reaches the host (for example a pod scheduled before the slots became unhealthy) reports `Running` False and `Ready` False with reason `ProtocolIncompatible` | VMs already running on the node keep running. Compare the host runtime version with the cluster release, and bring both to the same major version |
+| A required feature is missing on the host | `Ready` True: the node is compatible. `runtime.features` lacks the feature | `Running` False and `Ready` False with reason `UnsupportedFeature`; the message names the missing features and says to upgrade the host image. kubelet restarts the Anchor container in place with back-off (`(restart back-off)` in the message); while a retry runs, `Running` is True and `Ready` False (`Booting`), with the refusal in the message | The VM does not start on that node. baryon-controller does not move it: the Anchor Pod stays on the node and every retry is refused until the host image is upgraded, after which the next retry attaches. A new Anchor Pod (after a restart request, a stop and start, or a drain) is placed by the scheduler, which may choose the same node. Cannot occur within the 0.1 series |
+| baryon-virtd refuses the attach for another reason | Unchanged | `Running` False and `Ready` False with reason `AttachRefused`, or the reason baryon-virtd gave (such as `IdentityConflict`); the message has the detail | As for `UnsupportedFeature`, except `IdentityConflict`, for which baryon-controller replaces the Anchor Pod away from the node |
+
+### Release-specific notes
 
 Guest network health across releases: the cluster release of the network
 health change needs the updated CRD (VirtualizationNode `status.vms`) and
@@ -260,6 +436,17 @@ migrates them:
   installs them. A VirtualMachine's status must be kept for the migration:
   a VirtualMachine of an earlier release restored without status has no
   evidence of its import.
+
+### Pre-release commits
+
+Minimum host image for the published commits before 0.1.0-rc1, kept for
+clusters that still run one of them:
+
+| Cluster release | Protocol | Minimum host image |
+|---|---|---|
+| a73f37f (first published commit) | 1.0 | a73f37f |
+| 597b637 to b0413aa | 1.1 | protocol: any 1.x host; host-side safety fixes: an image built from the same commit as the cluster release or later |
+| 29c512c (the network health change) to the commit before 0.1.0-rc1 | 1.2 | protocol: any 1.x host; `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`); host-side safety fixes: an image built from the same commit as the cluster release or later |
 
 ## Upgrade to 0.1.0-rc1
 

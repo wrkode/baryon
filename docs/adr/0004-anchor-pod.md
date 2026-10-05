@@ -197,3 +197,9 @@ start.
 - 2026-10-04: the migration consequence now links ADR 0013 and states that
   the fixed name, the at-most-one rule, and `ReadWriteOnce` claims are what
   prevents a second copy of a VM today. The decision is unchanged.
+- 2026-10-05: a VM whose Anchor Pod is on a node that stopped reporting is
+  reported as `Running` and `Ready` Unknown (`NodeUnreachable`), instead of
+  keeping kubelet's last report (`Ready` True) until eviction. The fencing
+  is unchanged: no new Anchor Pod while the old pod object exists.
+  Deleting the Node object, or the pod, removes the fencing; it is safe
+  only after confirming that the machine is off.

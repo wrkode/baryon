@@ -519,15 +519,19 @@ Results come from three environments:
   (node1, node2, node3) running the Baryon-enabled
   Hadron image (Hadron v0.5.3, kernel 7.2.6-hadron, Kairos v4.3.0) with k0s
   v1.36.4+k0s.1: node1 is the controller and also runs workloads, node2 and
-  node3 are workers. containerd from k0s with the Baryon drop-in (systemd
-  cgroups, device ownership; [compatibility.md](compatibility.md#k0s-node-configuration)),
+  node3 are workers. Components bundled with k0s v1.36.4+k0s.1 (checked
+  against upstream k0s at that tag): containerd 2.3.5, runc 1.4.3,
+  kube-router v2.10.0, CoreDNS 1.14.7. containerd with the Baryon drop-in
+  (systemd cgroups, device ownership; [compatibility.md](compatibility.md#k0s-node-configuration)),
   graceful node shutdown 150 s and 30 s through a k0s worker profile, the
   k0s default CNI (kube-router; no network provider set in the k0s
-  configuration), Cloud Hypervisor v53.0. Storage: OpenEBS
-  LVM LocalPV v1.10.1 (`WaitForFirstConsumer`, "lvm-local") and Rook v1.20.8
-  with Ceph v19.2.3 RBD ("ceph-rbd") through the
-  ceph-csi-drivers chart 1.0.4 with `kubeletDirPath` set to the k0s kubelet
-  root.
+  configuration), Cloud Hypervisor v53.0. Storage: OpenEBS LVM LocalPV
+  (`openebs/lvm-driver:1.10.1`, `WaitForFirstConsumer`, "lvm-local") and
+  Rook v1.20.8 (`rook/ceph:v1.20.8`) with Ceph 19.2.3
+  (`quay.io/ceph/ceph:v19.2.3`) RBD ("ceph-rbd") through the
+  ceph-csi-drivers chart 1.0.4 (`quay.io/cephcsi/cephcsi:v3.17.1`,
+  `quay.io/cephcsi/ceph-csi-operator:v1.0.4`) with `kubeletDirPath` set to
+  the k0s kubelet root.
 - **Hadron single node (k3s)**: one VM with nested KVM running the
   Baryon-enabled Hadron image (Hadron v0.5.3, kernel 7.2.6-hadron, Kairos
   through kairos-init v4.3.0), k3s v1.36.4+k3s1 with its embedded
@@ -599,6 +603,7 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | Regression of the other suites with the network health change | network health change | E2E lifecycle, deletion, storage, import integrity, multi-node, skew, hostile disk, placement | lifecycle 33 of 33, deletion 19 of 19, storage ceph-rbd Block 47 of 47, import integrity lvm-local Block 52 of 52 and ceph-rbd Block 52 of 52, multi-node 69 of 69, skew with all hosts on this build 33 of 33 (`NetworkReady` True, `AddressServiceRunning`, on all three nodes), hostile disk 4 of 4, placement 65 of 65 |
 | Version skew with the network health change, one host on the previous host image (runtime protocol 1.1) | network health change; previous host image | E2E skew (`EXPECT_MIXED=1`) | 33 of 34: `NetworkReady` True on the two 1.2 hosts and Unknown `RuntimeDoesNotReport` on the 1.1 host; every VM reattached after the baryon-virtd restarts, including a 1.2 anchor on the 1.1 host. The failed check was `EXPECT_MIXED`: both host images carried the same commit stamp because the newer one was built from an uncommitted tree; the build scripts now mark such builds `-dirty` |
 | API review change: E2E suites and the `NodeAgentStopped` transition | API review change | E2E | The k0s cluster was upgraded in place to this change (CRDs, then classes reapplied with `cpu.vcpus`, then the deployment; the running VM kept running). Then: lifecycle 35 of 35, node agent outage 32 of 32 (including the stopping agent marking its node Ready Unknown `NodeAgentStopped`), deletion 19 of 19, placement 65 of 65, storage ceph-rbd Block 47 of 47 and lvm-local Filesystem 36 of 36, import integrity lvm-local 52 of 52 and ceph-rbd 52 of 52, multi-node 69 of 69, skew (all hosts on one build) 33 of 33, hostile disk 4 of 4. The API server checks pass against the k0s API server container that CI uses (run locally; see [API server checks](#api-server-checks)) |
+| Node failure: power loss of the node of a running VM (ceph-rbd, VM pinned to the node) | on top of 66f2cba (`NodeUnreachable` reporting) | manual | `Running`, `Ready`, and `NetworkReady` Unknown (`NodeUnreachable`) once Kubernetes marked the pod not ready; no new Anchor Pod while the node was off, also after taint eviction marked the pod Terminating; after power-on the old pod was removed and the VM was Ready again on its node |
 | API review change: the Kairos runbook check of step 5 and a release-like upgrade from an earlier release | API review change | manual procedure | pending |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
 | Version skew, 1.1 cluster release (597b637) with mixed hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31; new anchors on 1.0 hosts took the UNIMPLEMENTED path of `Negotiate`; the node agent published `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones |

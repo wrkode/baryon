@@ -88,13 +88,13 @@ hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
 
 The script reads the pinned versions from `packaging/versions.env` and
 builds `packaging/hadron/Dockerfile`. `KUBERNETES_DISTRO` selects the
-Kubernetes provider that kairos-init installs: `k3s` (default, version from
-`K3S_VERSION`), `k0s` (set `KUBERNETES_VERSION` to the k0s version), or an
-empty value for a core image without Kubernetes:
+Kubernetes provider that kairos-init installs: `k0s` (default, the tested
+distribution, version from `K0S_VERSION`), `k3s` (version from
+`K3S_VERSION`; not supported in v0.1), or an empty value for a core image
+without Kubernetes. `KUBERNETES_VERSION` overrides the pinned version:
 
 ```bash
-KUBERNETES_DISTRO=k0s KUBERNETES_VERSION=<k0s version> \
-  hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
+KUBERNETES_DISTRO=k3s hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
 ```
 
 Turning the image into bootable media with AuroraBoot, node configuration,

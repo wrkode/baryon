@@ -52,7 +52,7 @@ lifetime of the data and namespace users cannot write it; claim metadata,
 which they can edit, is not used for the decision. The annotation
 `virtualization.baryon.io/imported-from` on claims of earlier releases is
 no longer written and is read only to migrate those VMs (see
-[compatibility.md](compatibility.md#version-skew)). The design is in ADR
+[compatibility.md](compatibility.md#release-specific-notes)). The design is in ADR
 0006.
 
 What baryon-controller does for a VirtualMachine with an `http` source

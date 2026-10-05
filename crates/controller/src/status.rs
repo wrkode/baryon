@@ -387,8 +387,42 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
             "anchor",
         );
         status.restart_count = anchor.map(|c| c.restart_count);
+        // The node lifecycle controller marks the pods of a node that stopped
+        // reporting not ready (PodReady False) but leaves kubelet's last
+        // container status in place. A ready container under a not-ready
+        // pod is that case: the VM's state is unknown.
+        let pod_ready = pod_status
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|c| c.iter().find(|c| c.type_ == "Ready"));
+        // kubelet itself sets Ready False on a pod in a terminal phase, which
+        // is not a lost node.
+        let terminal = matches!(
+            pod_status.and_then(|s| s.phase.as_deref()),
+            Some("Succeeded" | "Failed")
+        );
+        let node_lost = !terminal
+            && anchor.is_some_and(|c| c.ready)
+            && pod_ready.is_some_and(|c| c.status == conditions::FALSE);
 
-        if pod.metadata.deletion_timestamp.is_some() {
+        if node_lost {
+            let message = pod_ready
+                .and_then(|c| c.message.clone())
+                .filter(|m| !m.is_empty())
+                .map(capped)
+                .unwrap_or_else(|| {
+                    "the Anchor Pod's node stopped reporting; the VM's state is unknown".to_owned()
+                });
+            updates.push(ConditionUpdate::unknown(
+                vm::RUNNING,
+                "NodeUnreachable",
+                message.clone(),
+            ));
+            updates.push(ConditionUpdate::unknown(
+                vm::READY,
+                "NodeUnreachable",
+                message,
+            ));
+        } else if pod.metadata.deletion_timestamp.is_some() {
             updates.extend(not_ready("Stopping", "the guest is shutting down"));
         } else if status.node_name.is_none() {
             let reason = updates
@@ -523,7 +557,15 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
                 p.spec.as_ref()?.node_name.as_ref()?,
             ))
         });
+    let node_lost = updates
+        .iter()
+        .any(|u| u.type_ == vm::RUNNING && u.reason == "NodeUnreachable");
     updates.push(match running_on {
+        _ if node_lost => ConditionUpdate::unknown(
+            vm::NETWORK_READY,
+            "NodeUnreachable",
+            "the Anchor Pod's node stopped reporting",
+        ),
         Some((uid, _)) => network_condition(obs.node, obs.node_fresh, uid),
         None => ConditionUpdate::unknown(
             vm::NETWORK_READY,
@@ -1084,5 +1126,65 @@ mod tests {
         assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ClaimNotFound");
         let s = derive(&vm(), &Observed::default(), now());
         assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ClaimMissing");
+    }
+
+    #[test]
+    fn a_ready_vm_on_a_node_that_stopped_reporting_is_unknown() {
+        use k8s_openapi::api::core::v1::PodCondition;
+        let claim = bound_claim();
+        let mut p = pod(
+            ContainerStatus {
+                name: "anchor".into(),
+                ready: true,
+                state: Some(ContainerState {
+                    running: Some(ContainerStateRunning::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            true,
+        );
+        // What the node lifecycle controller leaves: PodReady False, the
+        // container status as kubelet last reported it.
+        p.status.as_mut().unwrap().conditions = Some(vec![PodCondition {
+            type_: "Ready".into(),
+            status: "False".into(),
+            ..Default::default()
+        }]);
+        let obs = Observed {
+            claim: Some(&claim),
+            pod: Some(&p),
+            ..Default::default()
+        };
+        let s = derive(&vm(), &obs, now());
+        for t in [vm::RUNNING, vm::READY, vm::NETWORK_READY] {
+            let c = cond(&s, t);
+            assert_eq!(
+                (c.status.as_str(), c.reason.as_str()),
+                ("Unknown", "NodeUnreachable"),
+                "{t}"
+            );
+        }
+        // Evicted from the lost node (Terminating): still unknown, not
+        // "the guest is shutting down".
+        p.metadata.deletion_timestamp = Some(now());
+        let obs = Observed {
+            claim: Some(&claim),
+            pod: Some(&p),
+            ..Default::default()
+        };
+        let s = derive(&vm(), &obs, now());
+        assert_eq!(cond(&s, vm::READY).reason, "NodeUnreachable");
+        // A terminal pod with Ready False (kubelet sets it) is not a lost
+        // node.
+        p.metadata.deletion_timestamp = None;
+        p.status.as_mut().unwrap().phase = Some("Failed".into());
+        let obs = Observed {
+            claim: Some(&claim),
+            pod: Some(&p),
+            ..Default::default()
+        };
+        let s = derive(&vm(), &obs, now());
+        assert_ne!(cond(&s, vm::READY).reason, "NodeUnreachable");
     }
 }

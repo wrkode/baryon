@@ -247,7 +247,7 @@ Limits:
   the default log level; each responder start adds a line.
 - During a cluster release rollout, a new baryon-controller with a node
   agent of the earlier release reports `NetworkReady` Unknown until the
-  DaemonSet has rolled ([compatibility.md](compatibility.md#version-skew)).
+  DaemonSet has rolled ([compatibility.md](compatibility.md#upgrade-order)).
 
 ## Identity
 

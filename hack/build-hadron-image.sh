@@ -3,7 +3,10 @@
 # packaging/versions.env.
 #
 # Usage: hack/build-hadron-image.sh [image-ref] [extra docker build args...]
-#   KUBERNETES_DISTRO=k3s (default) | k0s | "" (core image without Kubernetes)
+#   KUBERNETES_DISTRO=k0s (default, the tested distribution) | k3s (not
+#   supported) | "" (core image without Kubernetes)
+#   KUBERNETES_VERSION defaults to K0S_VERSION or K3S_VERSION from
+#   packaging/versions.env.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 # shellcheck source=../packaging/versions.env
@@ -11,8 +14,13 @@ cd "$(git rev-parse --show-toplevel)"
 
 ref="${1:-baryon/hadron:dev}"
 shift || true
-distro="${KUBERNETES_DISTRO-k3s}"
-version="${KUBERNETES_VERSION:-$K3S_VERSION}"
+distro="${KUBERNETES_DISTRO-k0s}"
+case "$distro" in
+  k0s) default_version="$K0S_VERSION" ;;
+  k3s) default_version="$K3S_VERSION" ;;
+  *) default_version="" ;;
+esac
+version="${KUBERNETES_VERSION:-$default_version}"
 baryon_version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
 commit="$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 # Mark builds from a tree with uncommitted changes to tracked files, so they

@@ -152,7 +152,7 @@ backing up or restoring volumes. The claim annotation
 `virtualization.baryon.io/imported-from` written by earlier releases is no
 longer written; baryon-controller reads it only to migrate VirtualMachines
 of earlier releases (see
-[compatibility.md](compatibility.md#version-skew)).
+[compatibility.md](compatibility.md#release-specific-notes)).
 
 To use existing data, such as a restored snapshot, a clone, or a claim
 from a deleted VirtualMachine, reference the claim with
@@ -374,8 +374,9 @@ Rules for every condition:
   are not Baryon contract: Kubernetes defines them.
 - Messages are human text, not for parsing, and can change in any
   release. Messages that baryon-controller copies from the scheduler, the
-  API server (`PodRejected`, `ClaimRejected`), or a node (`NetworkReady`)
-  are cut to at most 1024 bytes. Failure messages from the Anchor
+  API server (`PodRejected`, `ClaimRejected`), a node (`NetworkReady`), or
+  the Anchor Pod's `Ready` condition (`NodeUnreachable`) are cut to at
+  most 1024 bytes. Failure messages from the Anchor
   container's termination message are at most 4000 bytes (baryon-anchor
   cuts them); kubelet's waiting messages are copied as kubelet wrote
   them. Baryon puts no secrets in messages. The `ImportFailed` message can
@@ -389,9 +390,9 @@ VirtualMachine conditions:
 |---|---|---|---|---|
 | `Scheduled` | The current Anchor Pod is bound to a node. | `Scheduled` | There is no Anchor Pod, or it is not bound; the reasons are in [Not running reasons](#not-running-reasons). | not used |
 | `StorageReady` | The root disk claim exists and is bound, and for an `http` source its import is recorded on the PersistentVolume. For a `persistentVolumeClaim` source, a bound claim; its content is not checked. | `DiskReady` | See [StorageReady reasons](#storageready-reasons). | not used |
-| `Running` | The Anchor container of the current Anchor Pod runs. It runs the VMM or is starting it, and a VMM exit ends the container. It is not evidence that the guest runs; that is `Ready`. | `AnchorRunning` | See [Not running reasons](#not-running-reasons). | not used |
-| `Ready` | The guest produced boot evidence in the current VMM run: it acquired its address over DHCP or showed a console login prompt. | `GuestBooted` | `Booting` while `Running` is True; otherwise the `Running` reason. | not used |
-| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running and answering liveness probes. Derived only while `Running` is True. | `AddressServiceRunning` | `DhcpResponderRestarting`, `DhcpResponderFailing` | `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning`; see [NetworkReady](#networkready) |
+| `Running` | The Anchor container of the current Anchor Pod runs. It runs the VMM or is starting it, and a VMM exit ends the container. It is not evidence that the guest runs; that is `Ready`. | `AnchorRunning` | See [Not running reasons](#not-running-reasons). | `NodeUnreachable`; see [Node unreachable](#node-unreachable) |
+| `Ready` | The guest produced boot evidence in the current VMM run: it acquired its address over DHCP or showed a console login prompt. | `GuestBooted` | `Booting` while `Running` is True; otherwise the `Running` reason. | `NodeUnreachable`; see [Node unreachable](#node-unreachable) |
+| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running and answering liveness probes. Derived only while `Running` is True. | `AddressServiceRunning` | `DhcpResponderRestarting`, `DhcpResponderFailing` | `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning`, `NodeUnreachable`; see [NetworkReady](#networkready) |
 | `RestartRequired` | The current Anchor Pod differs from the pod baryon-controller would create now; the difference applies at the next start. | `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (see [Placement](#placement)), `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` | not used |
 
 How the VM conditions relate:
@@ -421,7 +422,7 @@ is no Anchor Pod; while a pod exists, the pod decides.
 |---|---|---|
 | `Pending` | all three | Creating the Anchor Pod, or the pod is not bound and the scheduler gave no reason. |
 | `Stopped` | all three, no pod | `runPolicy` is `Stopped`. |
-| `Stopping` | `Running`, `Ready` | The Anchor Pod is being deleted; the guest is shutting down. |
+| `Stopping` | `Running`, `Ready` | The Anchor Pod is being deleted; the guest is shutting down. On a node that stopped reporting, `NodeUnreachable` (Unknown) is reported instead. |
 | `Starting` | `Running`, `Ready` | The Anchor container has not started, or waits without a kubelet reason. |
 | `ClassNotFound` | all three, no pod | The VirtualMachineClass does not exist. |
 | `InvalidClass` | all three, no pod | The class has no `cpu.vcpus` (stored before 0.1.0-rc1) or an unusable `memory.size`. |
@@ -436,6 +437,32 @@ is no Anchor Pod; while a pod exists, the pod decides.
 | the `StorageReady` reason | all three | While the disk is not ready and no Anchor container runs, for example `ImportingDisk` or an import refusal. |
 | failure reasons | `Running`, `Ready` | The previous run of the Anchor container ended with a reason from baryon-virtd or baryon-anchor; see [Failure reasons](#failure-reasons). |
 | `VmStopped` | `Running`, `Ready` | The Anchor container's termination message has no `Reason:` prefix; the message is the termination message. |
+
+##### Node unreachable
+
+`Running` and `Ready` are Unknown with reason `NodeUnreachable` when the
+Anchor Pod's `Ready` condition is False while kubelet's last status of
+the Anchor container is ready. That is what Kubernetes leaves when a node
+stops reporting: the node lifecycle controller marks the node's pods not
+ready and keeps kubelet's last container status. The message is the pod
+condition's message, cut to 1024 bytes, or "the Anchor Pod's node
+stopped reporting; the VM's state is unknown". `NetworkReady` is
+Unknown with the same reason. `NodeUnreachable` takes precedence over
+`Stopping`: an Anchor Pod evicted from such a node stays Terminating, and
+the guest may still run. A VM that was not Ready yet when its node was
+lost (its Anchor container running but not ready, for example while
+booting) keeps `Running` True and `Ready` False (`Booting`), because the
+pod looks like a booting one; only `NetworkReady` (Unknown after 90 s)
+shows the loss. baryon-controller creates no new Anchor Pod
+while the old pod object exists (fencing, ADR 0004); what ends that is in
+the [lifecycle contract](kairos-integration.md#lifecycle-contract).
+Status: Tested: unit test
+`a_ready_vm_on_a_node_that_stopped_reporting_is_unknown` in
+`crates/controller/src/status.rs`, and a power loss of a VM's node on the
+k0s cluster (manual check; see the
+[lifecycle contract](kairos-integration.md#lifecycle-contract)). Releases before 0.1.0-rc1 reported
+the last state instead: `Ready` True until the pod was evicted, then
+`Stopping`.
 
 ##### StorageReady reasons
 
@@ -579,6 +606,7 @@ is down (`tests/e2e/node-agent-outage.sh`: `NetworkReady` stayed Unknown,
 | Unknown | `RuntimeDoesNotReport` | The node's baryon-virtd speaks runtime protocol 1.1 or earlier and does not report the responder. |
 | Unknown | `NotReported` | The node's report has no entry for the current Anchor Pod. On a VM's first start this lasts until the responder has answered its first liveness probe and the node agent has reported it. |
 | Unknown | `NotRunning` | The VM is not running on a node. |
+| Unknown | `NodeUnreachable` | The VM's `Running` and `Ready` are Unknown with `NodeUnreachable`: the Anchor Pod's node stopped reporting. |
 
 baryon-virtd sends a liveness probe to the responder every 10 s and
 reports it as running only after its first answer; after a failure, only
@@ -606,6 +634,7 @@ Reading `Ready` and `NetworkReady` together:
 | True | True | The guest booted and its address service runs and answers liveness probes. |
 | True | False | The guest has its address and keeps it until the time in the message; it loses it after that unless the responder recovers. |
 | any | Unknown, `NotRunning` | The VM is not running. |
+| Unknown, `NodeUnreachable` | Unknown, `NodeUnreachable` | The Anchor Pod's node stopped reporting; whether the VM runs is unknown. |
 
 baryon-controller emits a Warning event `NetworkNotReady` each time
 `NetworkReady` changes to False, and a Normal event `NetworkReady` only
@@ -752,6 +781,7 @@ Allocation, and baryon-node-agent logs the rest (see
 | `conditions` | `Ready` and `RuntimeHealthy`; see the table below. Valid only while `heartbeatTime` is recent. |
 | `heartbeatTime` | Last refresh by the node agent: every 30 s by default, 5 to 30 s (`--status-interval-seconds`). |
 | `runtime.virtdVersion` | Version of baryon-virtd on the node. |
+| `runtime.virtdGitCommit` | Optional, informational. The commit baryon-virtd was built from; a `-dirty` suffix marks a build from a tree with uncommitted changes, `unknown` a build without the information. Omitted when baryon-virtd reports none. The format is not contract. |
 | `runtime.hypervisorVersion` | Version of Cloud Hypervisor on the node. |
 | `runtime.protocolVersion` | Internal. Runtime protocol version of baryon-virtd, `<major>.<minor>`; `1.0` for a baryon-virtd that does not report one. Compatibility is reported by `RuntimeHealthy`. |
 | `runtime.features` | Internal. Runtime protocol features baryon-virtd implements (ADR 0012), a set. |
@@ -800,8 +830,11 @@ baryon-node-agent logs one line with the message `host inventory` when it
 starts and whenever the inventory changes: the architecture, kernel
 release, OS name, Kairos version, CPU model, online CPU count, nested
 virtualization, memory size, whether KVM is usable, whether the IOMMU is
-enabled and its group count, and the number of NUMA nodes and PCI
-devices. To read it for one node:
+enabled and its group count, the number of NUMA nodes and PCI devices,
+and `host_image`: the Hadron base image the Baryon-enabled image was
+built from, taken from the image's component manifest
+(`/usr/share/baryon/components.json`, field `hadronImage`) and omitted
+when the manifest has none. To read it for one node:
 
 ```bash
 pod="$(kubectl get pods -n baryon-system -l app.kubernetes.io/name=baryon-node-agent --field-selector spec.nodeName=<node> -o name)"
