@@ -16,10 +16,12 @@ jobs:
   lint:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -36,10 +38,12 @@ jobs:
   test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: actions/cache@v4
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -52,7 +56,9 @@ jobs:
   crds:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Toolchain (from rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - name: CRDs match the Rust types
@@ -61,6 +67,14 @@ jobs:
         run: hack/ci/k0s.sh start
       - name: CRD schema, CEL rules, and admission policies against the API server
         run: hack/ci/apiserver-checks.sh
+      - name: Release manifests render and the API server accepts them
+        run: |
+          d="sha256:$(printf '0%.0s' $(seq 64))"
+          CONTROLLER_IMAGE="ghcr.io/ci/baryon-controller@$d" \
+          NODE_AGENT_IMAGE="ghcr.io/ci/baryon-node-agent@$d" \
+          ANCHOR_IMAGE="ghcr.io/ci/baryon-anchor@$d" \
+            hack/release-manifests.sh _out/release
+          docker exec -i "${K0S_CONTAINER:-baryon-ci-k0s}" k0s kubectl apply --server-side --force-conflicts --dry-run=server -f - < _out/release/baryon.yaml
       - name: Stop k0s
         if: always()
         run: hack/ci/k0s.sh stop
@@ -68,7 +82,9 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Static musl binaries
         run: hack/build-static.sh
       - name: Images
@@ -78,3 +94,27 @@ jobs:
           done
       - name: Host artifacts are fetchable and match pinned checksums
         run: hack/fetch-artifacts.sh
+
+  deps:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Vulnerabilities, licenses, and sources of the dependencies
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories licenses sources bans
+
+  dco:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Every commit is signed off (DCO)
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: hack/check-dco.sh "$BASE" "$HEAD_SHA"

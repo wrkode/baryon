@@ -1,0 +1,172 @@
+name: release
+
+# Builds and publishes a release when a version tag is pushed: the
+# component images and the Baryon-enabled Hadron host image (k0s) on
+# ghcr.io, the installation manifests, the static baryon-virtd binary,
+# SHA-256 checksums, SPDX SBOMs, and build provenance attestations. The
+# release notes come from docs/release-notes/<tag>.md. Nothing is signed
+# with a key of the project; see docs/release.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release
+      packages: write # push images to ghcr.io
+      id-token: write # sign provenance attestations
+      attestations: write
+    env:
+      VERSION: ${{ github.ref_name }}
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The tag matches the workspace version and has release notes
+        run: |
+          test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$VERSION"
+          test -s "docs/release-notes/$VERSION.md"
+
+      - name: Static binaries
+        run: hack/build-static.sh
+
+      - name: Log in to ghcr.io
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Component images
+        id: images
+        run: |
+          for c in anchor node-agent controller; do
+            ref="$REGISTRY/baryon-$c:$VERSION"
+            docker build -f "packaging/images/$c.Dockerfile" -t "$ref" .
+            docker push "$ref"
+            digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")"
+            echo "${c//-/_}=$digest" >> "$GITHUB_OUTPUT"
+            echo "${c//-/_}_digest=${digest#*@}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Host image (Baryon-enabled Hadron, k0s)
+        id: host
+        run: |
+          ref="$REGISTRY/baryon-hadron:$VERSION-k0s"
+          hack/build-hadron-image.sh "$ref"
+          docker push "$ref"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")"
+          echo "ref=$digest" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest#*@}" >> "$GITHUB_OUTPUT"
+
+      - name: Release files
+        env:
+          CONTROLLER_IMAGE: ${{ steps.images.outputs.controller }}
+          NODE_AGENT_IMAGE: ${{ steps.images.outputs.node_agent }}
+          ANCHOR_IMAGE: ${{ steps.images.outputs.anchor }}
+          HOST_IMAGE: ${{ steps.host.outputs.ref }}
+        run: |
+          mkdir -p _release
+          hack/release-manifests.sh _release
+          install -m 0755 target/static/x86_64-unknown-linux-musl/release/baryon-virtd "_release/baryon-virtd-$VERSION-x86_64-linux-musl"
+          git archive --format=tar.gz --prefix="baryon-$VERSION/" -o "_release/baryon-$VERSION-source.tar.gz" HEAD
+          {
+            echo "controller: $CONTROLLER_IMAGE"
+            echo "node-agent: $NODE_AGENT_IMAGE"
+            echo "anchor: $ANCHOR_IMAGE"
+            echo "host (k0s $(sed -n 's/^K0S_VERSION=//p' packaging/versions.env)): $HOST_IMAGE"
+          } > _release/images.txt
+
+      - name: SBOM of the source tree
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          path: .
+          format: spdx-json
+          output-file: _release/baryon-${{ github.ref_name }}-source.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: SBOM anchor image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/baryon-anchor:${{ github.ref_name }}
+          format: spdx-json
+          output-file: _release/baryon-anchor-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: SBOM node agent image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/baryon-node-agent:${{ github.ref_name }}
+          format: spdx-json
+          output-file: _release/baryon-node-agent-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: SBOM controller image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/baryon-controller:${{ github.ref_name }}
+          format: spdx-json
+          output-file: _release/baryon-controller-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: SBOM host image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/baryon-hadron:${{ github.ref_name }}-k0s
+          format: spdx-json
+          output-file: _release/baryon-hadron-k0s-${{ github.ref_name }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Checksums
+        run: cd _release && sha256sum * > SHA256SUMS
+
+      - name: Provenance of the release files
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: "_release/*"
+      - name: Provenance of the anchor image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/baryon-anchor
+          subject-digest: ${{ steps.images.outputs.anchor_digest }}
+          push-to-registry: true
+      - name: Provenance of the node agent image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/baryon-node-agent
+          subject-digest: ${{ steps.images.outputs.node_agent_digest }}
+          push-to-registry: true
+      - name: Provenance of the controller image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/baryon-controller
+          subject-digest: ${{ steps.images.outputs.controller_digest }}
+          push-to-registry: true
+      - name: Provenance of the host image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/baryon-hadron
+          subject-digest: ${{ steps.host.outputs.digest }}
+          push-to-registry: true
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          gh release create "$VERSION" --verify-tag "${prerelease[@]}" \
+            --title "Baryon $VERSION" \
+            --notes-file "docs/release-notes/$VERSION.md" \
+            _release/*

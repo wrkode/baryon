@@ -216,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-anchor"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "anyhow",
  "baryon-runtime-api",
@@ -241,7 +241,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-api"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "k8s-openapi",
  "kube",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-cloud-hypervisor"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "bytes",
  "http",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-controller"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "anyhow",
  "baryon-api",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-host"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "libc",
  "rustix",
@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-node-agent"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "anyhow",
  "baryon-api",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "baryon-runtime-api"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "prost",
  "protox",
@@ -345,14 +345,14 @@ dependencies = [
 
 [[package]]
 name = "baryon-version"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "baryon-virtd"
-version = "0.1.0"
+version = "0.1.0-rc1"
 dependencies = [
  "anyhow",
  "baryon-cloud-hypervisor",

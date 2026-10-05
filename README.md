@@ -160,6 +160,7 @@ work: [troubleshooting.md](docs/troubleshooting.md).
 |---|---|
 | [installation.md](docs/installation.md) | install, verify, first VM, uninstall, upgrade |
 | [troubleshooting.md](docs/troubleshooting.md) | diagnosing nodes and VMs; observing Baryon with kube-state-metrics |
+| [release.md](docs/release.md) | versioning, release contents, verifying a release |
 | [architecture.md](docs/architecture.md) | components, ownership, request flow |
 | [api.md](docs/api.md) | API reference |
 | [api-stability.md](docs/api-stability.md) | API contract, v0.1 freeze, change log per release |
