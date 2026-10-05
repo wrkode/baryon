@@ -35,11 +35,12 @@ Pods of the previous release, follows ADR 0012.
 
 ## Frozen for v0.1
 
-Status: Designed. This rule takes effect when v0.1.0 is tagged; no
-release is tagged yet.
+Status: in effect from v0.1.0-rc1.
 
-After v0.1.0 is tagged, no breaking API change is made before the next
-minor release unless it fixes a correctness or security problem.
+From v0.1.0-rc1 on, no breaking API change is made before v0.1.0, and
+after v0.1.0 none before the next minor release, unless it fixes a
+correctness or security problem. Such a change is listed in the
+[change log](#change-log-per-release) with its upgrade path.
 
 A breaking change is any of:
 
@@ -181,7 +182,7 @@ Experimental, Designed, Planned, Not supported.
 | Part | Status |
 |---|---|
 | The `v1alpha1` API | Implemented. Its CRD schema and CEL rules are Tested by the API server checks ([testing.md](testing.md#api-server-checks)) |
-| The v0.1 freeze | Designed; takes effect at the v0.1.0 tag |
+| The v0.1 freeze | In effect from v0.1.0-rc1 |
 | Deprecation policy after alpha | Planned |
 
 ## Deprecation after alpha
@@ -192,7 +193,7 @@ rules above apply.
 
 ## Change log per release
 
-### 0.1.0-rc1 (not yet released)
+### 0.1.0-rc1
 
 API changes; the API stays `v1alpha1`. Details are in
 [api.md](api.md).

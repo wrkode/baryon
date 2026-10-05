@@ -7,10 +7,10 @@ integration with a Kairos-managed immutable virtualization host.
 Kubernetes manages the VM. Hadron provides the virtualization host. Cloud
 Hypervisor executes the VM. Kairos manages the machine lifecycle around them.
 
-Status: the first release candidate, v0.1.0-rc1, is in preparation and not
-yet tagged. The API is `v1alpha1` and can change
-([api-stability.md](docs/api-stability.md)). Baryon makes no claim of
-production readiness.
+Status: this tree is version 0.1.0-rc1, the first release candidate
+([release notes](docs/release-notes/v0.1.0-rc1.md)). The API is `v1alpha1`
+and can change ([api-stability.md](docs/api-stability.md)). Baryon makes no
+claim of production readiness.
 
 ## Why Hadron
 
@@ -41,7 +41,7 @@ the [v0.1 support matrix](docs/compatibility.md#v01-support-matrix).
 |---|---|
 | VM lifecycle: create from an HTTP raw image or an existing claim, start, stop, restart, delete | Tested: E2E on the k0s cluster |
 | Root disks on filesystem-mode and raw block-mode claims | Tested: storage and import integrity E2E with OpenEBS LVM LocalPV and Ceph RBD |
-| Pod network: the guest takes the pod IP; Services select VMs by their labels | Tested: multi-node E2E |
+| Pod network: the guest takes the pod IP; Services select a VM's Anchor Pod by its `virtualization.baryon.io/vm-name` label | Tested: multi-node E2E. Services that select the VM's own labels (copied to the Anchor Pod): Inferred |
 | Placement through Kubernetes scheduling fields (`spec.placement`) | Tested: placement E2E |
 | Recovery after a baryon-virtd, baryon-controller, or node agent restart, a VMM crash, and a node reboot | Tested: E2E and manual procedures |
 | Guest network service health (`NetworkReady`) | Tested: network-health E2E |
@@ -58,17 +58,20 @@ labels: [architecture.md](docs/architecture.md).
 - Live migration is currently unsupported. Baryon's network handoff model
   requires destination-side file descriptor injection during Cloud
   Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release ([ADR 0013](docs/adr/0013-live-migration.md)).
+  Cloud Hypervisor release. See [ADR 0013](docs/adr/0013-live-migration.md).
   A drain or node upgrade stops the VMs on the node; they start again
   where their storage allows.
 - Windows guests.
 - GPU passthrough and other VFIO or PCI device passthrough.
 - SR-IOV.
-- Snapshots.
+- Snapshots and cloning.
+- More than one disk or network per VM.
 - Multi-cluster operation: Baryon manages the VMs of one cluster.
 - Also Not supported in v0.1: confidential computing, hugepage-backed
-  guest memory, NUMA placement, aarch64, the kubelet cgroupfs driver, and
-  k3s (kubeadm is Not tested).
+  guest memory, NUMA placement, disk image formats other than raw,
+  aarch64, the kubelet cgroupfs driver, and k3s (kubeadm is Not tested).
+  The full list:
+  [Not supported in v0.1](docs/compatibility.md#not-supported-in-v01).
 
 ## Architecture
 
@@ -115,7 +118,10 @@ kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/downloa
 kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon-classes.yaml
 ```
 
-These URLs resolve once v0.1.0-rc1 is published.
+These URLs resolve once the release workflow has published v0.1.0-rc1,
+and only while the repository is public. A release from the private
+repository needs GitHub access for its files and images
+([installation.md, Private repository](docs/installation.md#private-repository)).
 
 ## First VM
 

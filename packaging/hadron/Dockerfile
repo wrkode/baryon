@@ -16,11 +16,12 @@
 
 ARG HADRON_IMAGE
 ARG KAIROS_INIT_IMAGE
-ARG RUST_BUILDER_IMAGE=rust:1.99-alpine
+ARG RUST_BUILDER_IMAGE
+ARG ALPINE_IMAGE
 
 FROM ${KAIROS_INIT_IMAGE} AS kairos-init
 
-FROM alpine:3.22 AS artifacts
+FROM ${ALPINE_IMAGE} AS artifacts
 ARG CLOUD_HYPERVISOR_VERSION
 ARG CLOUD_HYPERVISOR_URL
 ARG CLOUD_HYPERVISOR_SHA256
@@ -65,7 +66,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --release --target x86_64-unknown-linux-musl -p baryon-virtd \
     && install -D -m 0755 target/x86_64-unknown-linux-musl/release/baryon-virtd /out/baryon-virtd
 
-FROM alpine:3.22 AS manifest
+FROM ${ALPINE_IMAGE} AS manifest
 ARG BARYON_VERSION
 ARG BARYON_GIT_COMMIT=unknown
 ARG HADRON_IMAGE

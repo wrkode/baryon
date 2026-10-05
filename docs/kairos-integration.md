@@ -177,7 +177,7 @@ Who owns what when a node changes:
 - Live migration is currently unsupported. Baryon's network handoff
   model requires destination-side file descriptor injection during Cloud
   Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release ([ADR 0013](adr/0013-live-migration.md)). A
+  Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A
   node event that removes an Anchor Pod stops the VM; it starts again
   where its storage allows.
 
@@ -354,8 +354,8 @@ Baryon has no upgrade controller and does not move running VMs. Live
 migration is currently unsupported. Baryon's network handoff model
 requires destination-side file descriptor injection during Cloud
 Hypervisor migration, which is not available in the currently supported
-Cloud Hypervisor release ([ADR 0013](adr/0013-live-migration.md)). A node
-upgrade therefore stops the VMs on the node, and they start again on a node
+Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A
+node upgrade therefore stops the VMs on the node, and they start again on a node
 that can reach their storage. Baryon only exposes node state that an upgrade
 workflow can read.
 

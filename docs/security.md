@@ -22,7 +22,10 @@ lives, what counts as a completed import, and who can approve one).
 On 2026-10-04 the live migration evaluation (ADR 0013) and its experiment
 were reviewed (see [Live migration](#live-migration-not-supported)), and so
 were the DHCP responder liveness probes and Baryon's seccomp layer (see
-[Baryon seccomp layer](#baryon-seccomp-layer)).
+[Baryon seccomp layer](#baryon-seccomp-layer)). On 2026-10-05 the v0.1 API
+changes were reviewed, and the v0.1.0-rc1 release gate review covered the
+release workflow, the supply chain, and the node agent's privileges (see
+[Release and supply chain](#release-and-supply-chain)).
 Findings and their resolution are listed in
 [Review findings](#review-findings).
 
@@ -44,7 +47,12 @@ From least to most trusted on a node:
    the VM it names, and every resource it asks for is bounded by the pod
    cgroup and by what its uid can open.
 4. baryon-node-agent. DaemonSet pod, uid 0 without capabilities, reaching the
-   host only through two mounts.
+   host only through two mounts. Part of the node's trusted computing
+   base: as the kubelet device plugin, its `Allocate` answer tells kubelet
+   which host devices and host paths to give a container. A compromised
+   node agent can give an Anchor container, and with it a VM identity,
+   host block devices or other host paths, or register another resource
+   name with kubelet. Treat it as root-equivalent on its node.
 5. baryon-controller. Unprivileged Deployment, no host access.
 6. baryon-virtd. Root on the host. The trusted computing base of the node
    runtime. It is not a Kubernetes client.
@@ -262,6 +270,13 @@ on such labels; the baryon-controller Deployment and the baryon-node-agent
 DaemonSet select their own pods by `app.kubernetes.io/name` only within
 `baryon-system`. Do not create VirtualMachines in `baryon-system` or grant
 namespace users rights there; nothing in Baryon enforces this.
+
+The `baryon-system` namespace enforces Pod Security `privileged`
+(`deploy/base/namespace.yaml`), because the node agent mounts host paths.
+Creating or updating pods in `baryon-system`, or exec into its pods, is
+therefore node-root-equivalent: a pod there can mount any host path, and
+the node agent is part of each node's trusted computing base. Grant these
+rights only to cluster administrators. Status: Documented.
 
 ## VMM confinement
 
@@ -550,7 +565,8 @@ Remaining hardening:
   the volume. The importer's log lines and failure messages (which reach
   the `ImportFailed` condition that namespace `view` users can read) show
   URLs and redirect targets as scheme, host, port, and path only, without
-  userinfo or query. URLs must not carry secrets.
+  userinfo or query; since the 2026-10-05 review this covers every
+  importer message. URLs must not carry secrets.
 - API server messages in VM conditions: when the API server refuses a
   claim (`ClaimRejected`) or pod (`PodRejected`) that baryon-controller
   creates for a VM, the message, cut to 1024 bytes, is copied to the VM's
@@ -726,6 +742,26 @@ network namespace, plain TCP without authentication, no Landlock, and a
 shared device outside Baryon's claim and device exclusion. It validates no
 security property.
 
+## Release and supply chain
+
+How a release is built and published ([release.md](release.md)), and what
+protects it. Reviewed in the v0.1.0-rc1 release gate review of 2026-10-05.
+
+| Item | State |
+|---|---|
+| GitHub Actions | Every action in `.github/workflows/` is pinned by commit SHA, with the version in a comment |
+| Workflow token permissions | `contents: read` by default. Only the release job has write permissions: `contents: write` (the GitHub release), `packages: write` (ghcr.io), `id-token: write` and `attestations: write` (provenance). Checkouts do not persist credentials |
+| Dependency gate | CI runs `cargo deny check advisories licenses sources bans` on every change. Implemented |
+| DCO | CI checks the `Signed-off-by` trailer of every commit in a push or pull request (`hack/check-dco.sh`). Implemented |
+| Host component downloads | Cloud Hypervisor, its firmware, and virtiofsd are downloaded by URL and checked against the SHA-256 in `packaging/versions.env`; CI checks that the pinned artifacts are fetchable and match (`hack/fetch-artifacts.sh`). Implemented |
+| Base and builder images | Hadron, kairos-init, the Rust builder image, and Alpine are pinned by digest in `packaging/versions.env` (tag kept for people, digest decides); `components.json` in the host image records the Hadron and kairos-init references with their digests. Implemented |
+| Component images | `FROM scratch` with one static binary; no base image, no package manager. Implemented |
+| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; not yet exercised by a published release |
+| Provenance | GitHub artifact attestations for every release file and image, created only when the repository is public; a release from a private repository has none. Implemented; not yet exercised |
+| Signing | None. No file, image, or tag is signed with a project key |
+| Release gate | The release procedure requires CI to pass on `main` before tagging, but the release workflow does not check CI results or that the tag is on `main`, and tags are not protected. Accepted for v0.1.0-rc1; enforcement Planned |
+| Build isolation | One job builds and publishes, so the build steps run with the write tokens available. Accepted for v0.1.0-rc1; split jobs Planned |
+
 ## Review findings
 
 Findings of the 2026-10-03 review and their state:
@@ -878,6 +914,27 @@ Findings of the 2026-10-05 review of the v0.1 API changes:
 | Explicit nulls passed `has()` checks in CEL rules while the controller saw absent fields | Note | Fixed: `nullable` removed, nulls are pruned; CI case added |
 | Duplicates in `runtime.features` or `status.vms` would fail the node agent's whole status write | Note | Fixed: the node agent removes duplicates before writing |
 
+Findings of the 2026-10-05 v0.1.0-rc1 release gate review:
+
+| Finding | Severity | State |
+|---|---|---|
+| H1: GitHub artifact attestations need a public repository on the current plan; wrkode/baryon is private, so a release has no provenance attestations and its images and files need GitHub access | High | Open: making the repository public is the owner's decision. The workflow attests only when the repository is public, and the docs say what a private release carries ([Release and supply chain](#release-and-supply-chain)) |
+| M1: base and builder images were pinned by tag | Medium | Fixed: pinned by digest in `packaging/versions.env` |
+| M2: baryon-node-agent is node root through the device plugin: its `Allocate` answer decides which host devices and paths a container gets | Medium | Documented ([Trust boundaries](#trust-boundaries)); a separate minimal device plugin process is Planned |
+| L1: the release workflow does not check CI results or `main` ancestry, and tags are not protected | Low | Accepted for v0.1.0-rc1; Planned |
+| L2: build and publish run in one job that holds the write tokens | Low | Accepted for v0.1.0-rc1; Planned |
+| L3: the released baryon-virtd binary came from a separate build, not from the host image | Low | Fixed: the workflow copies it from the host image |
+| L4: `vhost_net` and `vhost_vsock` were loaded on every node although unused | Low | Fixed: no longer listed in `modules-load.d`. virtiofsd is still shipped and unused: Accepted; its removal until used is Planned |
+| L5: `baryon-system` enforces Pod Security `privileged`, so pod create, update, and exec there are node-root-equivalent | Low | Documented ([Kubernetes authorization](#kubernetes-authorization)) |
+| N1: DHCP responder events carry no responder generation, and a killed responder that the reaper stops waiting for after 60 s can remain a zombie | Note | Open |
+| N2: the attach log line carried anchor-supplied names before they were validated | Note | Fixed: VM name and namespace are logged cut to 253 bytes, required features to 16 entries of 253 bytes |
+| N3: one importer refusal message named the full source URL | Note | Fixed: it shows the URL redacted (scheme, host, port, path) |
+
+Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
+report no vulnerabilities in the Rust dependencies. Cloud Hypervisor
+v53.0 is not affected by its published security advisories. k0s
+v1.36.4+k0s.1 includes the fix for GHSA-qjgc-wmg7-3jc3.
+
 ## Future hardening
 
 | Item | Status |
@@ -894,7 +951,12 @@ Findings of the 2026-10-05 review of the v0.1 API changes:
 | Admission policy limiting baryon-controller's PersistentVolume and pod updates (`baryon-controller-writes`) | Implemented, Tested (CI API server checks) |
 | Record and verify the block device identity across VMM recovery | Planned |
 | Feature-aware and capability-aware placement (one placement-only resource per runtime protocol feature or consumed host capability, ADR 0012) | Planned; deferred until Baryon consumes a capability |
-| Dependency gate in CI (cargo-deny or cargo-audit) and a smaller parsing surface in baryon-virtd | Designed |
+| Dependency gate in CI (`cargo deny check advisories licenses sources bans`) | Implemented |
+| A smaller parsing surface in baryon-virtd | Designed |
+| Release workflow check of CI results and `main` ancestry before publishing; protected release tags | Planned |
+| Separate build and publish jobs, so that only the publish job holds write tokens | Planned |
+| The device plugin in a separate minimal process, apart from the node agent's API client | Planned |
+| Remove virtiofsd from the host image until Baryon uses it | Planned |
 | AppArmor or SELinux profiles for baryon-virtd and the VMM | Planned |
 
 ## Not supported
@@ -904,9 +966,8 @@ VFIO and PCI passthrough, SR-IOV, snapshots, and confidential computing
 migration is currently unsupported. Baryon's network handoff model
 requires destination-side file descriptor injection during Cloud
 Hypervisor migration, which is not available in the currently supported
-Cloud Hypervisor release (see [Live migration](#live-migration-not-supported)
-and [ADR 0013](adr/0013-live-migration.md)). The
-current handoff is host-mediated by design: baryon-virtd resolves disks,
+Cloud Hypervisor release. See [Live migration](#live-migration-not-supported)
+and [ADR 0013](adr/0013-live-migration.md). The current handoff is host-mediated by design: baryon-virtd resolves disks,
 creates the TAP, starts the DHCP responder, and writes SMBIOS strings. None
 of that is an attestation boundary, and confidential computing would need a
 different design.

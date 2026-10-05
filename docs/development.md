@@ -74,7 +74,7 @@ repository root:
 
 ```bash
 for c in anchor node-agent controller; do
-  docker build -f "packaging/images/$c.Dockerfile" -t "<registry>/baryon/$c:<tag>" .
+  docker build -f "packaging/images/$c.Dockerfile" -t "<registry>/baryon-$c:<tag>" .
 done
 ```
 
@@ -112,8 +112,11 @@ true` ([compatibility.md](compatibility.md); k0s:
 
 1. Set the image references in `deploy/base/controller/deployment.yaml`
    (the controller image and the `BARYON_ANCHOR_IMAGE` value) and in
-   `deploy/base/node-agent/daemonset.yaml` to the images you pushed (or use
-   a kustomize overlay with an `images:` entry).
+   `deploy/base/node-agent/daemonset.yaml` to the images you pushed. A
+   kustomize `images:` entry replaces only the two container images, not
+   the `BARYON_ANCHOR_IMAGE` value. `hack/release-manifests.sh` renders the
+   manifests with all three references replaced, without editing the files
+   ([installation.md, From a checkout](installation.md#from-a-checkout)).
 2. Apply the manifests (CRDs, namespace, node agent, controller, admission
    policies, roles for namespace users) and the example classes:
 

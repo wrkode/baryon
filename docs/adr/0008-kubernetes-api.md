@@ -291,3 +291,6 @@ PersistentVolumes.
     Allocation, device requests would be per-VM claims.
   - The contract, the v0.1 freeze, and the change log are recorded in
     [api-stability.md](../api-stability.md).
+- 2026-10-05: the v0.1 API freeze (docs/api-stability.md) is in effect
+  from v0.1.0-rc1: no breaking API change before v0.1.0 unless it fixes a
+  correctness or security problem.

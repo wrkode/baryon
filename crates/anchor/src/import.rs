@@ -159,8 +159,10 @@ async fn import_file(
                 return Ok(());
             }
             _ => bail!(
-                "{} exists but was not imported from {url}; refusing to overwrite it",
-                image.display()
+                "{} exists but was not imported from {}; refusing to overwrite it",
+                image.display(),
+                url.parse::<Uri>()
+                    .map_or_else(|_| "the source URL".to_owned(), |u| redacted(&u))
             ),
         }
     }

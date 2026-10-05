@@ -35,15 +35,15 @@ and Not tested rows make no claim. States:
 
 | Component | Version | State |
 |---|---|---|
-| Baryon | 0.1.0-rc1 (workspace version 0.1.0, API `v1alpha1`, runtime protocol 1.2) | Tested on the k0s cluster with the API review change, after an in-place upgrade of the cluster ([testing.md](testing.md#k0s-cluster)): E2E lifecycle, node agent outage, deletion, placement, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, skew with all hosts on one build, and hostile disk. The network health E2E last ran with the runtime hardening change (8db33bb). `tests/e2e/repeat.sh` was not run. VirtualizationNode `status.runtime.virtdGitCommit` and the `host_image` field of the node agent's `host inventory` log line were added after those runs: Implemented, unit tests |
-| Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
-| Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
+| Baryon | 0.1.0-rc1 (workspace version 0.1.0-rc1, API `v1alpha1`, runtime protocol 1.2) | Release validation of the 0.1.0-rc1 release artifacts on the k0s cluster: in progress, no results recorded yet. Tested on the k0s cluster with the API review change, a build before the release commit, after an in-place upgrade of the cluster ([testing.md](testing.md#k0s-cluster)): E2E lifecycle, node agent outage, deletion, placement, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, skew with all hosts on one build, and hostile disk. The network health E2E last ran with the runtime hardening change (8db33bb). `tests/e2e/repeat.sh` was not run. VirtualizationNode `status.runtime.virtdGitCommit` and the `host_image` field of the node agent's `host inventory` log line were added after those runs: Implemented, unit tests |
+| Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`, pinned by digest in `packaging/versions.env`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
+| Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`, pinned by digest in `packaging/versions.env`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
 | Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
 | Cloud Hypervisor | v53.0, static binary, SHA-256 pinned in `packaging/versions.env` | Tested. Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
 | UEFI firmware | CLOUDHV.fd from cloud-hypervisor/edk2 `ch-97eeb7b09`, SHA-256 pinned in `packaging/versions.env` | Tested |
 | virtiofsd | v1.14.0 | Shipped in the image, not used by Baryon |
 | Architecture | x86_64 | Tested. aarch64: Not supported, binaries and firmware are built for x86_64 only (aarch64 support is Planned) |
-| k0s | v1.36.4+k0s.1, one controller that also runs workloads and two workers | Tested. Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). See [Distribution support policy](#distribution-support-policy) for k3s and kubeadm |
+| k0s | v1.36.4+k0s.1, one controller that also runs workloads and two workers | Tested. v1.36.4+k0s.1 is also the minimum 1.36 patch: it is the first k0s 1.36 release with the fix for GHSA-qjgc-wmg7-3jc3. Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). See [Distribution support policy](#distribution-support-policy) for k3s and kubeadm |
 | Kubernetes | 1.36.4 (from k0s v1.36.4+k0s.1) | Tested. Other minor versions: Not tested; see [Kubernetes support policy for v0.1](#kubernetes-support-policy-for-v01) |
 | Container runtime | containerd 2.3.5 and runc 1.4.3 (bundled with k0s v1.36.4+k0s.1) | Tested, with `SystemdCgroup = true` and `device_ownership_from_security_context = true`. CRI-O and crun: Not tested |
 | kubelet cgroup driver | systemd | Tested. cgroupfs: Not supported; baryon-virtd refuses the VM (`CgroupDriverUnsupported`) |
@@ -63,10 +63,33 @@ and Not tested rows make no claim. States:
 | Other Linux guests | any | Expected to work if they meet the [guest requirements](#guest-requirements) (UEFI-bootable raw image, DHCP client or cloud-init). Not tested |
 | Windows guests | any | Not supported; not tested |
 
+## Not supported in v0.1
+
+- Live migration is currently unsupported. Baryon's network handoff model
+  requires destination-side file descriptor injection during Cloud
+  Hypervisor migration, which is not available in the currently supported
+  Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A
+  drain or node upgrade stops the VMs on the node; they start again where
+  their storage allows ([lifecycle contract](kairos-integration.md#lifecycle-contract)).
+- Windows guests.
+- GPU passthrough and other VFIO or PCI device passthrough; SR-IOV.
+- Snapshots and VM cloning.
+- Confidential computing (SEV-SNP, TDX, attestation).
+- Hugepage-backed guest memory and NUMA placement.
+- More than one disk or one network interface per VM.
+- Disk image formats other than raw (qcow2, compressed images).
+- aarch64.
+- The kubelet cgroupfs driver.
+- Kubernetes distributions other than k0s: k3s is Not supported for v0.1;
+  kubeadm is Not tested ([Distribution support policy](#distribution-support-policy)).
+- Multi-cluster management: Baryon manages the VMs of one cluster.
+
 ## Kubernetes support policy for v0.1
 
 - Tested minor version: 1.36, as k0s v1.36.4+k0s.1 on the k0s cluster.
-  The CI API server checks run against the same k0s version.
+  The CI API server checks run against the same k0s version. Earlier 1.36
+  patches are not used: k0s v1.36.4+k0s.1 is the first k0s 1.36 release
+  with the fix for GHSA-qjgc-wmg7-3jc3.
 - Other minor versions are Not tested for v0.1. Earlier commits ran on
   Kubernetes 1.34 (the kind host, historical, not a Baryon environment)
   and 1.36 (k3s v1.36.4+k3s1 on a single Hadron node, historical); this
@@ -452,7 +475,7 @@ clusters that still run one of them:
 
 0.1.0-rc1 is the release of the v0.1 API review; the API stays `v1alpha1`
 and the runtime protocol stays 1.2. The API changes are listed in
-[api-stability.md](api-stability.md#010-rc1-not-yet-released). Upgrade in
+[api-stability.md](api-stability.md#010-rc1). Upgrade in
 this order:
 
 1. Apply the new CRDs:
@@ -480,6 +503,11 @@ this order:
    ```bash
    kubectl apply --server-side -k deploy/base
    ```
+
+The commands above are for an installation from a checkout. With the
+release files, step 1 applies `baryon-crds.yaml`, step 2 applies your
+class manifests, and step 3 applies `baryon.yaml`
+([installation.md, Upgrading](installation.md#10-upgrading)).
 
 What changes for running VMs and nodes:
 

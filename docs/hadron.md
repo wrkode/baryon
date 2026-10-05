@@ -48,10 +48,10 @@ The host layer (`packaging/hadron/Dockerfile`, stage `host-layer`, built
 | `/usr/share/cloud-hypervisor/CLOUDHV.fd` | UEFI firmware for Cloud Hypervisor | cloud-hypervisor/edk2 release, pinned and checksummed |
 | `/usr/libexec/virtiofsd` | virtiofsd static build | upstream release, pinned and checksummed; not used yet |
 | `/usr/bin/baryon-virtd` | Baryon host runtime, static musl | built from this repository |
-| `/usr/share/baryon/components.json` | versions and checksums of the above | generated at build time |
+| `/usr/share/baryon/components.json` | versions and checksums of the above, and the Hadron and kairos-init image references with their digests | generated at build time |
 | `/usr/lib/systemd/system/baryon-virtd.service` | systemd unit, no `[Install]` section | `packaging/hadron/files/` |
 | `/usr/lib/systemd/system/multi-user.target.wants/baryon-virtd.service` | relative symlink that enables the unit | created in the image stage |
-| `/usr/lib/modules-load.d/baryon.conf` | tun, vhost_net, vhost_vsock, sch_ingress, cls_u32, act_mirred, act_gact | `packaging/hadron/files/` |
+| `/usr/lib/modules-load.d/baryon.conf` | tun, sch_ingress, cls_u32, act_mirred, act_gact | `packaging/hadron/files/` |
 | `/usr/lib/tmpfiles.d/baryon.conf` | `/var/log/baryon` (0750, root) and `/var/log/baryon/vms` (0700, root, entries removed after 14 days untouched) | `packaging/hadron/files/` |
 
 Why only `/usr`: on Kairos `/usr` is replaced as a whole by each A/B upgrade,
@@ -102,11 +102,15 @@ Tested ([testing.md](testing.md#what-deletion-removes)).
 hack/build-hadron-image.sh <registry>/baryon-hadron:<tag>
 ```
 
-Stages: verified downloads of the pinned artifacts, a static build of
-baryon-virtd in `rust:1.99-alpine`, the host layer, then the image: the
-Hadron base (`ghcr.io/kairos-io/hadron:v0.5.3`), the host layer, the unit
-symlink with a layout check, and finally kairos-init
-(`quay.io/kairos/kairos-init:v4.3.0`) with the Kubernetes provider:
+Stages: verified downloads of the pinned artifacts (in Alpine), a static
+build of baryon-virtd in `rust:1.99.0-alpine`, the host layer, then the
+image: the Hadron base (`ghcr.io/kairos-io/hadron:v0.5.3`), the host layer,
+the unit symlink with a layout check, and finally kairos-init
+(`quay.io/kairos/kairos-init:v4.3.0`) with the Kubernetes provider. Every
+base and builder image is pinned by digest (`HADRON_IMAGE`,
+`KAIROS_INIT_IMAGE`, `RUST_BUILDER_IMAGE`, `ALPINE_IMAGE` in
+`packaging/versions.env`); the tags above are for reading. kairos-init
+runs:
 
 ```
 /kairos-init -s install -m generic -t false -p k0s --provider-k0s-version <v> --version <baryon version>

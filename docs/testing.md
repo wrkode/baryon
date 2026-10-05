@@ -546,9 +546,8 @@ Results come from three environments:
   traffic to the guest was observed in Experiment B.
 
 Results from the kind host are not results for a Baryon host; they are
-listed because some behavior was observed only there. All runs were on
-2026-10-03, except the runs of the network health change, which were on
-2026-10-04.
+listed because some behavior was observed only there. The runs recorded
+here were made from 2026-10-03 to 2026-10-05.
 
 ### k0s cluster
 
@@ -580,7 +579,7 @@ when a restarted responder is reported Ready (see its row). "API review
 change" is the change on top of 8db33bb for 0.1.0-rc1: the `restartedAt`
 contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 `ClaimRejected`, the trimmed VirtualizationNode status, and
-`NodeAgentStopped` ([api-stability.md](api-stability.md#010-rc1-not-yet-released)).
+`NodeAgentStopped` ([api-stability.md](api-stability.md#010-rc1)).
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|
@@ -605,6 +604,9 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | API review change: E2E suites and the `NodeAgentStopped` transition | API review change | E2E | The k0s cluster was upgraded in place to this change (CRDs, then classes reapplied with `cpu.vcpus`, then the deployment; the running VM kept running). Then: lifecycle 35 of 35, node agent outage 32 of 32 (including the stopping agent marking its node Ready Unknown `NodeAgentStopped`), deletion 19 of 19, placement 65 of 65, storage ceph-rbd Block 47 of 47 and lvm-local Filesystem 36 of 36, import integrity lvm-local 52 of 52 and ceph-rbd 52 of 52, multi-node 69 of 69, skew (all hosts on one build) 33 of 33, hostile disk 4 of 4. The API server checks pass against the k0s API server container that CI uses (run locally; see [API server checks](#api-server-checks)) |
 | Node failure: power loss of the node of a running VM (ceph-rbd, VM pinned to the node) | on top of 66f2cba (`NodeUnreachable` reporting) | manual | `Running`, `Ready`, and `NetworkReady` Unknown (`NodeUnreachable`) once Kubernetes marked the pod not ready; no new Anchor Pod while the node was off, also after taint eviction marked the pod Terminating; after power-on the old pod was removed and the VM was Ready again on its node |
 | API review change: the Kairos runbook check of step 5 and a release-like upgrade from an earlier release | API review change | manual procedure | pending |
+| Release validation of v0.1.0-rc1: the E2E suites and procedures with the published release files and images | v0.1.0-rc1 | E2E and manual procedures | in progress; no results recorded yet |
+| Uninstall from a checkout: VMs deleted first, then `kubectl delete -k deploy/base` ([installation.md](installation.md#9-uninstall)) | on top of 66f2cba (the changes of 743166a) | manual procedure | the `baryon-system` namespace and the CRDs were gone and no runtime directories were left on the nodes; each Node kept the `virtualization.baryon.io/vm` and `virtualization.baryon.io/import` extended resources at 0 after the device plugin unregistered |
+| Kernel settings behind the seccomp layer's rationale ([security.md](security.md#baryon-seccomp-layer)), read on 2026-10-05 on a Hadron v0.5.3 node of the k0s cluster | host image (Hadron v0.5.3 default kernel) | observation | `vm.unprivileged_userfaultfd` 0; `/dev/userfaultfd` owned by root, mode 0600; `kernel.yama.ptrace_scope` 1; `kernel.io_uring_disabled` 0 |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
 | Version skew, 1.1 cluster release (597b637) with mixed hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31; new anchors on 1.0 hosts took the UNIMPLEMENTED path of `Negotiate`; the node agent published `protocolVersion` 1.0 for old hosts and 1.1 with features for new ones |
 | A 1.0 anchor reattached to a 1.1 baryon-virtd after a restart | c8e6c08 and 597b637 | E2E skew | passed |

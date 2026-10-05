@@ -3,9 +3,9 @@
 This guide takes a cluster from bare machines to a running VM with the
 release artifacts of Baryon, and covers uninstalling and upgrading. It is
 written for v0.1.0-rc1, the first release that publishes these artifacts.
-v0.1.0-rc1 is not yet tagged: until it is, the release URLs and image tags
-below do not resolve, and the [from a checkout](#from-a-checkout) path is
-the only one available.
+The release URLs and image tags below resolve only after the release
+workflow has published v0.1.0-rc1; before that, the
+[from a checkout](#from-a-checkout) path is the only one available.
 
 Status labels follow [architecture.md](architecture.md). "Tested" names the
 environment, described in [testing.md](testing.md#results); the k0s
@@ -36,9 +36,15 @@ Where to find the reasons behind each step:
   its admission policies; only 1.36 is tested
   ([Kubernetes support policy](compatibility.md#kubernetes-support-policy-for-v01)).
 - Tools on your workstation: `kubectl`, `docker` (for AuroraBoot), `ssh`,
-  and optionally `gh` (GitHub CLI) to verify provenance.
+  and `gh` (GitHub CLI) to download release files and, for a release from
+  a public repository, to verify attestations.
 - Network: nodes pull images from `ghcr.io`, and VM disk imports download
   the image URL from an import Pod over the pod network.
+- Access: v0.1.0-rc1 is published from the repository wrkode/baryon while
+  it is private. Its release files and ghcr.io images then need a GitHub
+  account with access to the repository, on your workstation and for
+  every image pull on the nodes
+  ([Private repository](#private-repository)).
 
 Read the [v0.1 support matrix](compatibility.md#v01-support-matrix) before
 choosing components. Only rows marked Tested there are support claims.
@@ -54,6 +60,10 @@ Option A, the published image (k0s v1.36.4+k0s.1):
 ```bash
 docker pull ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s
 ```
+
+While the repository is private, log in first with a GitHub account that
+has access to it and a token that can read packages
+(`docker login ghcr.io`).
 
 Option B, build it from a checkout:
 
@@ -74,12 +84,16 @@ hack/build-hadron-image.sh <registry>/baryon-hadron:v0.1.0-rc1-k0s
   stands for a release must come from a clean checkout of its tag.
 - Stages and options: [hadron.md, Build](hadron.md#build).
 
-To verify the published image's build provenance (see
-[Verify the release](#verify-the-release)):
+If the repository is public, verify the published image's build
+provenance (see [Verify the release](#verify-the-release)):
 
 ```bash
 gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s --repo wrkode/baryon
 ```
+
+A release from a private repository has no attestations; compare the
+image digest with the host entry of `images.txt` instead, after verifying
+`images.txt` with `SHA256SUMS`.
 
 ## 3. Provision the nodes
 
@@ -314,6 +328,9 @@ kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/downloa
 kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon-classes.yaml
 ```
 
+These URLs work only while the repository is public; otherwise see
+[Private repository](#private-repository).
+
 `baryon-classes.yaml` holds the example VirtualMachineClasses
 `general-small` (2 vCPUs, 2Gi) and `general-medium` (4 vCPUs, 8Gi). Classes
 are immutable; write your own in the same shape ([api.md](api.md#virtualmachineclass-cluster-scoped-short-name-bvmclass)).
@@ -327,35 +344,41 @@ The GitHub release (a prerelease for `-rc` tags) carries:
 | `baryon.yaml` | everything `deploy/base` installs, component images pinned by digest |
 | `baryon-crds.yaml` | the CRDs alone, for the first step of an upgrade |
 | `baryon-classes.yaml` | the example VirtualMachineClasses |
-| `baryon-virtd-v0.1.0-rc1-x86_64-linux-musl` | the static baryon-virtd binary that the host image contains |
+| `baryon-virtd-v0.1.0-rc1-x86_64-linux-musl` | the static baryon-virtd binary, copied from the host image |
 | `baryon-v0.1.0-rc1-source.tar.gz` | the source tree of the tag |
 | `images.txt` | the controller, node agent, anchor, and host image references with digests |
 | `*.spdx.json` | SPDX SBOMs of the source tree and of each image |
 | `SHA256SUMS` | SHA-256 checksums of the files above |
 
-Nothing is signed with a project key. Integrity rests on the checksums and
-on GitHub build provenance attestations, which tie each file and image to
-the release workflow run in `wrkode/baryon`. To download and verify before
-applying:
+Nothing is signed with a project key. Integrity rests on the checksums
+and, only for a release published while the repository is public, on
+GitHub build provenance attestations, which tie each file and image to the
+release workflow run in `wrkode/baryon` ([release.md](release.md#verifying-a-release)).
+Download the files (`gh release download` works for a public and, with
+access, for a private repository) and check the checksums:
 
 ```bash
-base=https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1
-for f in baryon.yaml baryon-crds.yaml baryon-classes.yaml images.txt SHA256SUMS; do
-  curl -fLO "$base/$f"
-done
-gh attestation verify SHA256SUMS --repo wrkode/baryon
+gh release download v0.1.0-rc1 --repo wrkode/baryon \
+  --pattern baryon.yaml --pattern baryon-crds.yaml --pattern baryon-classes.yaml \
+  --pattern images.txt --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify baryon.yaml --repo wrkode/baryon
 ```
 
-The images, by tag:
+If the repository is public, also verify the attestations of the files
+and the images:
 
 ```bash
+gh attestation verify SHA256SUMS --repo wrkode/baryon
+gh attestation verify baryon.yaml --repo wrkode/baryon
 for c in controller node-agent anchor; do
   gh attestation verify "oci://ghcr.io/wrkode/baryon-$c:v0.1.0-rc1" --repo wrkode/baryon
 done
 gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s --repo wrkode/baryon
 ```
+
+Otherwise there are no attestations: verify `SHA256SUMS` only. The
+checksums come from the same release, so they detect a corrupted
+download, not a substituted release.
 
 Then apply the verified files:
 
@@ -365,8 +388,21 @@ kubectl apply -f baryon-classes.yaml
 ```
 
 Status: the release workflow (`.github/workflows/release.yaml`) and the
-manifest renderer (`hack/release-manifests.sh`) are Implemented; no release
-has been published with them yet (pending: release validation).
+manifest renderer (`hack/release-manifests.sh`) are Implemented. An
+installation from the published release files is part of the v0.1.0-rc1
+release validation, which is in progress (pending: release validation).
+
+### Private repository
+
+While wrkode/baryon is private, the release URLs above answer only to
+GitHub accounts with access, so `kubectl apply -f https://...` fails:
+download the files with `gh release download` and apply them from disk.
+The ghcr.io images are private too. The manifests carry no
+`imagePullSecrets`, and baryon-controller creates Anchor Pods and import
+Pods in the VM's namespace without them, so every node's container
+runtime needs its own credentials for `ghcr.io`, or the images must be
+loaded onto the nodes. Status: Not tested; the release validation in
+progress uses the k0s cluster.
 
 ### From a checkout
 
@@ -421,10 +457,10 @@ Each Baryon node has a VirtualizationNode that is `Ready` with reason
 
 ```
 $ kubectl get virtualizationnodes
-NAME    READY   REASON         VMS   RUNTIME   HYPERVISOR   HEARTBEAT   AGE
-node1   True    RuntimeReady   0     0.1.0     v53.0        12s         12m
-node2   True    RuntimeReady   0     0.1.0     v53.0        9s          12m
-node3   True    RuntimeReady   0     0.1.0     v53.0        21s         12m
+NAME    READY   REASON         VMS   RUNTIME     HYPERVISOR   HEARTBEAT   AGE
+node1   True    RuntimeReady   0     0.1.0-rc1   v53.0        12s         12m
+node2   True    RuntimeReady   0     0.1.0-rc1   v53.0        9s          12m
+node3   True    RuntimeReady   0     0.1.0-rc1   v53.0        21s         12m
 ```
 
 Each Baryon node advertises VM and import slots:
@@ -448,8 +484,8 @@ url=https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-a
 curl -fsSL "$url" | sha256sum
 ```
 
-`examples/debian-vm.yaml` is the same VM without the digest. With the
-digest:
+`examples/debian-vm.yaml` is the same VM without the digest. Save this
+manifest, with the digest, as `debian-vm.yaml`:
 
 ```yaml
 apiVersion: virtualization.baryon.io/v1alpha1
@@ -504,8 +540,14 @@ To stop, start, and restart the VM: set `spec.runPolicy` to `Stopped` or
 
 ## 9. Uninstall
 
-Status: Not tested as a whole. Deleting a VirtualMachine and what that
-removes is Tested ([testing.md](testing.md#what-deletion-removes)).
+Status: Tested on the k0s cluster for an installation from a checkout:
+the VMs were deleted first, then the components with
+`kubectl delete -k deploy/base`; afterwards the `baryon-system` namespace
+and the CRDs were gone and no runtime directories were left on the nodes.
+Deleting a VirtualMachine and what that removes is Tested
+([testing.md](testing.md#what-deletion-removes)). Uninstalling with the
+release file `baryon.yaml` follows the same steps (pending: release
+validation).
 
 1. Delete every VirtualMachine while baryon-controller still runs. Each VM
    carries the finalizer `virtualization.baryon.io/anchor-cleanup`, which
@@ -545,6 +587,10 @@ What remains:
   of the Baryon-enabled Hadron image and keep running without VMs. Removing
   them means moving the node to another image through Kairos.
 - The node label `virtualization.baryon.io/host=true` and the CSI driver.
+- On each Node object, the extended resources `virtualization.baryon.io/vm`
+  and `virtualization.baryon.io/import`, at 0 once the device plugin has
+  unregistered (observed on the k0s cluster). kubelet keeps them; they do
+  not affect other pods.
 
 ## 10. Upgrading
 

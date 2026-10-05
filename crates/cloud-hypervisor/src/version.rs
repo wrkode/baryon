@@ -15,7 +15,9 @@ pub struct Version {
 }
 
 impl Version {
-    /// The release Baryon is developed and tested against.
+    /// The release Baryon is developed and tested against. Informational
+    /// only: a different version is never refused, so the pinned version
+    /// can be changed without a code change.
     pub const TESTED: Version = Version {
         major: 53,
         point: 0,

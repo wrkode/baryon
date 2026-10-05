@@ -73,7 +73,12 @@ impl AnchorService for Anchor {
         anchor_peer(&req)?;
         let req = req.into_inner();
         let theirs = Version::of_peer(req.version.as_ref());
-        tracing::debug!(anchor = %theirs, required = ?req.required_features, "negotiate");
+        // Anchor-supplied: logged bounded.
+        tracing::debug!(
+            anchor = %theirs,
+            required = ?req.required_features.iter().take(16).map(|f| bounded(f)).collect::<Vec<_>>(),
+            "negotiate"
+        );
         Ok(Response::new(NegotiateResponse {
             version: Some(Version::CURRENT.to_proto()),
             features: features(),
@@ -97,7 +102,8 @@ impl AnchorService for Anchor {
         let spec = req
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        tracing::info!(pod = %peer.cgroup.pod_uid, vm = %spec.vm_name, ns = %spec.vm_namespace, pid = peer.pid, "attach");
+        // The names are validated later by the manager; log them bounded.
+        tracing::info!(pod = %peer.cgroup.pod_uid, vm = %bounded(&spec.vm_name), ns = %bounded(&spec.vm_namespace), pid = peer.pid, "attach");
         let (rx, guard) = self.manager.attach(peer, spec).map_err(|e| match e {
             AttachError::InvalidSpec(_) => Status::invalid_argument(e.to_string()),
             AttachError::SpecMismatch | AttachError::IdentityConflict => {
@@ -251,6 +257,16 @@ impl NodeService for Node {
         });
         Ok(Response::new(Box::pin(stream)))
     }
+}
+
+/// An anchor-supplied string for a log line: at most 253 bytes (a
+/// Kubernetes name), cut at a character boundary.
+fn bounded(s: &str) -> &str {
+    let mut end = s.len().min(253);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 #[cfg(test)]

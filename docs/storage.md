@@ -231,7 +231,7 @@ setting and its side effects are in
 - Live migration is currently unsupported. Baryon's network handoff model
   requires destination-side file descriptor injection during Cloud
   Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release ([ADR 0013](adr/0013-live-migration.md)).
+  Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md).
   Snapshots are Not supported.
 - Block mode requires a container runtime that creates granted device nodes
   on the container's `/dev` tmpfs and gives them the pod's `runAsUser` and

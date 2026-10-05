@@ -10,7 +10,13 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-image="${BARYON_BUILD_IMAGE:-rust:${toolchain}-alpine}"
+# shellcheck source=../packaging/versions.env
+. packaging/versions.env
+image="${BARYON_BUILD_IMAGE:-$RUST_BUILDER_IMAGE}"
+case "$image" in
+  *"rust:${toolchain}-alpine"*) ;;
+  *) [ -n "${BARYON_BUILD_IMAGE:-}" ] || { echo "RUST_BUILDER_IMAGE does not match rust-toolchain.toml ($toolchain)" >&2; exit 1; } ;;
+esac
 packages=("$@")
 if [ "${#packages[@]}" -eq 0 ]; then
   packages=(baryon-virtd baryon-anchor baryon-controller baryon-node-agent)
