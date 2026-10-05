@@ -182,6 +182,12 @@ step 2 is set by the unit file):
 4. k3s starts, baryon-node-agent registers the device plugin, and the node
    accepts VMs.
 
+baryon-node-agent logs the host inventory it gets from baryon-virtd
+(architecture, kernel release, OS name, Kairos version, CPU, memory, KVM,
+IOMMU, NUMA and PCI device counts) at start and when it changes; it does
+not publish it on the VirtualizationNode. To check what a node reports,
+see [api.md](api.md#host-inventory).
+
 ## Node configuration
 
 The node needs, through Kairos cloud-config or the provisioning system:

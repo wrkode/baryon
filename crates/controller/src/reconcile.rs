@@ -188,6 +188,16 @@ async fn resolve_class(
             format!("VirtualMachineClass {} does not exist", vm.spec.class_name),
         )));
     };
+    if class.spec.cpu.vcpus == 0 {
+        // Stored before cpu.cores became cpu.vcpus (0.1.0-rc1).
+        return Ok(Err((
+            "InvalidClass".to_owned(),
+            format!(
+                "VirtualMachineClass {} has no cpu.vcpus; apply it again with cpu.vcpus",
+                vm.spec.class_name
+            ),
+        )));
+    }
     let memory = match quantity::to_bytes(&class.spec.memory.size.0) {
         Ok(b) if b >= 64 << 20 && b.is_multiple_of(1 << 20) => b,
         Ok(_) | Err(_) => {
@@ -201,7 +211,7 @@ async fn resolve_class(
         }
     };
     Ok(Ok(Compute {
-        vcpus: class.spec.cpu.cores,
+        vcpus: class.spec.cpu.vcpus,
         memory_bytes: memory,
     }))
 }
@@ -220,6 +230,18 @@ struct Disk {
 /// The root disk claim and whether its disk must be imported. The second
 /// value is the UID of the claim when it holds an imported or used disk,
 /// for `status.rootDiskImport`, also when the disk is refused.
+/// Bytes the root disk claim requests for a disk of `size_bytes`, rounded
+/// up to MiB. A filesystem claim adds 64 MiB for the import marker and the
+/// filesystem's own metadata; a block claim is the disk itself.
+fn claim_request_bytes(size_bytes: u64, volume_mode: &str) -> u64 {
+    let wanted = if volume_mode == "Block" {
+        size_bytes
+    } else {
+        size_bytes.saturating_add(64 << 20)
+    };
+    wanted.div_ceil(1 << 20).saturating_mul(1 << 20)
+}
+
 async fn ensure_claim(
     ctx: &Context,
     vm: &VirtualMachine,
@@ -317,10 +339,7 @@ async fn ensure_claim(
                     resources: Some(VolumeResourceRequirements {
                         requests: Some(BTreeMap::from([(
                             "storage".to_owned(),
-                            // Room for the import marker and filesystem metadata.
-                            Quantity(
-                                ((size_bytes + (64 << 20)).div_ceil(1 << 20) << 20).to_string(),
-                            ),
+                            Quantity(claim_request_bytes(size_bytes, wanted_mode).to_string()),
                         )])),
                         limits: None,
                     }),
@@ -328,7 +347,21 @@ async fn ensure_claim(
                 }),
                 status: None,
             };
-            let created = pvcs.create(&PostParams::default(), &pvc).await?;
+            let created = match pvcs.create(&PostParams::default(), &pvc).await {
+                Ok(c) => c,
+                // The API server refused the claim (quota, admission):
+                // report it on the VM.
+                Err(kube::Error::Api(e)) if e.code == 422 || e.code == 403 => {
+                    return Ok((
+                        Err((
+                            "ClaimRejected".to_owned(),
+                            status::capped(e.message.clone()),
+                        )),
+                        None,
+                    ));
+                }
+                Err(e) => return Err(e.into()),
+            };
             event(
                 ctx,
                 vm,
@@ -545,6 +578,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 .map(|s| s.identity_conflict_nodes.clone())
                 .unwrap_or_default(),
             storage_blocked: None,
+            disk_error: disk.as_ref().err().cloned(),
             root_disk_import: vm.status.as_ref().and_then(|s| s.root_disk_import.clone()),
             node: None,
             node_fresh: false,
@@ -581,7 +615,12 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         }
     }
 
-    let restarted_at = vm.annotations().get(keys::RESTARTED_AT_ANNOTATION).cloned();
+    // An empty value requests nothing.
+    let restarted_at = vm
+        .annotations()
+        .get(keys::RESTARTED_AT_ANNOTATION)
+        .filter(|v| !v.is_empty())
+        .cloned();
     let should_run = vm.spec.run_policy == RunPolicy::Running;
     // Nodes where another VM has the same host identity. Kept while the VM
     // should run; a stopped VM starts over.
@@ -690,7 +729,11 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
 
     if let Some(p) = &pod {
         let terminating = p.metadata.deletion_timestamp.is_some();
-        let pod_restart = p.annotations().get(keys::RESTARTED_AT_ANNOTATION).cloned();
+        let pod_restart = p
+            .annotations()
+            .get(keys::RESTARTED_AT_ANNOTATION)
+            .filter(|v| !v.is_empty())
+            .cloned();
         let finished = matches!(
             p.status.as_ref().and_then(|s| s.phase.as_deref()),
             Some("Succeeded" | "Failed")
@@ -749,16 +792,18 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
                 if let Err(e) = sync_labels(&pods, p, &input.labels).await {
                     tracing::warn!(vm = %vm_name, error = %e, "cannot copy the VM's labels to its Anchor Pod");
                 }
-                restart_reason =
-                    if p.annotations().get(SPEC_HASH_ANNOTATION) != Some(&input.spec_hash()) {
-                        Some(status::RestartReason::Spec)
-                    } else if placement_changed(p, &input) {
-                        Some(status::RestartReason::Placement)
-                    } else if anchor_image_of(p) != Some(ctx.anchor_image.as_str()) {
-                        Some(status::RestartReason::AnchorImage)
-                    } else {
-                        None
-                    };
+                let pod_hash = p.annotations().get(SPEC_HASH_ANNOTATION);
+                let current = pod_hash == Some(&input.spec_hash())
+                    || pod_hash == Some(&input.spec_hash_with(pod_restart.as_deref()));
+                restart_reason = if !current {
+                    Some(status::RestartReason::Spec)
+                } else if placement_changed(p, &input) {
+                    Some(status::RestartReason::Placement)
+                } else if anchor_image_of(p) != Some(ctx.anchor_image.as_str()) {
+                    Some(status::RestartReason::AnchorImage)
+                } else {
+                    None
+                };
             }
         }
         pod = pods.get_opt(&pod_name).await?;
@@ -818,6 +863,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         mac_address: Some(resources::vm_mac(&vm_uid)),
         identity_conflict_nodes: conflict_nodes,
         storage_blocked,
+        disk_error: disk.as_ref().err().cloned(),
         root_disk_import: root_disk_import(vm, imported_claim_uid, claim.as_ref()),
     };
     write_status(vm, ctx, ns, &observed).await?;
@@ -827,12 +873,12 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
         Some("DiskBindingPending") => 30,
         // Refusals that wait for an administrator.
         Some(_) => 120,
-        // A refused pod may be accepted later (quota, a PriorityClass
-        // created afterwards).
+        // A refused pod or claim may be accepted later (quota, a
+        // PriorityClass or StorageClass created afterwards).
         None if observed
             .blocked
             .as_ref()
-            .is_some_and(|(r, _)| r == "PodRejected") =>
+            .is_some_and(|(r, _)| r == "PodRejected" || r == "ClaimRejected") =>
         {
             60
         }
@@ -954,7 +1000,12 @@ fn anchor_input(
         anchor_image: ctx.anchor_image.clone(),
         restarted_at,
         avoid_nodes: avoid_nodes.to_vec(),
-        placement: vm.spec.placement.clone(),
+        // An empty placement places like none.
+        placement: vm
+            .spec
+            .placement
+            .clone()
+            .filter(|p| *p != baryon_api::vm::Placement::default()),
         labels: anchor::vm_labels(&vm.labels().clone()),
     }
 }
@@ -964,7 +1015,12 @@ fn anchor_input(
 /// it matches a VM without placement.
 fn placement_changed(pod: &Pod, input: &AnchorInput) -> bool {
     match pod.annotations().get(anchor::PLACEMENT_HASH_ANNOTATION) {
-        Some(h) => h != &input.placement_hash(),
+        // Pods created before an empty placement was treated as none carry
+        // the hash of the empty placement.
+        Some(h) => {
+            h != &input.placement_hash()
+                && !(input.placement.is_none() && *h == anchor::empty_placement_hash())
+        }
         None => input.placement.is_some(),
     }
 }
@@ -1473,5 +1529,17 @@ mod tests {
         assert!(import_pod_for_claim(&p, "claim-1"));
         assert!(!import_pod_for_claim(&p, "claim-2"));
         assert!(!import_pod_for_claim(&Pod::default(), "claim-1"));
+    }
+
+    #[test]
+    fn claim_requests_add_room_only_for_filesystem_claims() {
+        let gib = 1u64 << 30;
+        assert_eq!(claim_request_bytes(4 * gib, "Block"), 4 * gib);
+        assert_eq!(
+            claim_request_bytes(4 * gib, "Filesystem"),
+            4 * gib + (64 << 20)
+        );
+        // Rounded up to MiB.
+        assert_eq!(claim_request_bytes(gib + 1, "Block"), gib + (1 << 20));
     }
 }

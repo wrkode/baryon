@@ -33,8 +33,8 @@ Baryon is:
 
 - a Kubernetes API for virtual machines (`virtualization.baryon.io`)
 - a controller that turns that API into Kubernetes resources
-- a node agent that publishes host capabilities and serves a kubelet device
-  plugin
+- a node agent that publishes each node's runtime health and versions and
+  serves kubelet device plugins
 - a host runtime, baryon-virtd, that runs Cloud Hypervisor on Hadron nodes
 - a Hadron image layer that delivers the host runtime and its dependencies
 
@@ -83,7 +83,7 @@ depend on AuroraBoot, Kairos Operator, or Cluster API. See
 | Volume attach, mount, and lifecycle | Kubernetes and CSI, through the Anchor Pod | Baryon resolves the result inside the pod (ADR 0006). |
 | Pod network | Kubernetes and CNI, through the Anchor Pod network namespace | Baryon attaches a TAP inside that namespace (ADR 0007). |
 | VM API and reconciliation | baryon-controller | Only writer of VirtualMachine status. |
-| Node virtualization capabilities | baryon-virtd discovers; baryon-node-agent publishes | Only writer of VirtualizationNode. |
+| Node runtime health and versions | baryon-virtd discovers; baryon-node-agent publishes | Only writer of VirtualizationNode. Host inventory is logged by the node agent, not published. |
 | Cloud Hypervisor process lifecycle | baryon-virtd | |
 | Storage and network handoff into the VMM | baryon-virtd | |
 | Guest execution | Cloud Hypervisor | |
@@ -101,8 +101,11 @@ the Rust types in `crates/api` and kept in `deploy/base/crds/`.
 
 - `VirtualMachine` (namespaced): user intent for one VM.
 - `VirtualMachineClass` (cluster-scoped): reusable compute shape.
-- `VirtualizationNode` (cluster-scoped, one per Baryon node): observed host
-  capabilities and runtime health.
+- `VirtualizationNode` (cluster-scoped, one per Baryon node): whether the
+  node can run Baryon VMs, its runtime versions, and its runtime health.
+
+Which parts of the API are contract is in
+[api-stability.md](api-stability.md).
 
 The API describes intent. It never carries Cloud Hypervisor arguments, host
 paths, PIDs, TAP names, or socket paths.
@@ -324,9 +327,16 @@ as uid 0 without capabilities. It reads from baryon-virtd's node socket
   and the anchor socket) and `virtualization.baryon.io/import` (socket
   `baryon-import.sock`; the same slot count and health; grants nothing)
 - writes the VirtualizationNode for its node with a heartbeat (every 30 s
-  by default, 5 to 30 s), including `status.vms`: per Anchor Pod UID, the
-  state of the VM's DHCP responder as baryon-virtd reports it (runtime
-  protocol 1.2)
+  by default, 5 to 30 s): the `Ready` and `RuntimeHealthy` conditions, the
+  baryon-virtd and Cloud Hypervisor versions, the VM count, and
+  `status.vms`: per Anchor Pod UID, the state of the VM's DHCP responder
+  as baryon-virtd reports it (runtime protocol 1.2)
+- on SIGTERM, sets both conditions to Unknown (`NodeAgentStopped`) before
+  it exits; consumers count the conditions only while the heartbeat is
+  within 90 s, because a crashed node agent cannot do this
+- logs the host inventory (architecture, kernel, OS, Kairos version, CPU,
+  memory, KVM, IOMMU, NUMA and PCI device counts) at start and when it
+  changes; it does not publish it ([api.md](api.md#host-inventory))
 
 ### baryon-virtd (Implemented; Tested by the lifecycle E2E on the Hadron node and the kind host)
 
@@ -468,7 +478,7 @@ claim is garbage collected.
 | Host-side guest network state seen by the cluster | VirtualizationNode `status.vms`, written by the node agent from baryon-virtd's report | etcd |
 | Running VMM | the host kernel (process, pidfd) | node |
 | Runtime records | baryon-virtd, reconstructable | `/run/baryon/vms/<pod-uid>/` (tmpfs) |
-| Host capabilities | the host kernel | sysfs, procfs |
+| Host inventory and capabilities | the host kernel; logged by baryon-node-agent | sysfs, procfs |
 
 Runtime records are an index over kernel state. After a restart baryon-virtd
 verifies every record (process start time, executable) and discards records

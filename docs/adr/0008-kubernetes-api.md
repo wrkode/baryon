@@ -1,7 +1,7 @@
 # 0008: v1alpha1 API surface and status ownership
 
 Status: Accepted
-Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
+Date: 2026-10-02, revised 2026-10-03, 2026-10-04, and 2026-10-05
 
 ## Context
 
@@ -17,18 +17,33 @@ Group `virtualization.baryon.io`, version `v1alpha1`, three kinds:
 | Kind | Scope | Writer of status | Purpose |
 |---|---|---|---|
 | VirtualMachine | Namespaced | baryon-controller only | user intent for one VM |
-| VirtualMachineClass | Cluster | none | compute shape: vCPUs, memory |
-| VirtualizationNode | Cluster, named after and owned by the Node | baryon-node-agent on that node only | host capabilities, runtime health, heartbeat, host-side state of each VM by Anchor Pod UID |
+| VirtualMachineClass | Cluster | none | compute shape: vCPUs, memory; immutable |
+| VirtualizationNode | Cluster, named after and owned by the Node | baryon-node-agent on that node only | whether the node can run Baryon VMs: runtime health and versions, heartbeat, host-side state of each VM by Anchor Pod UID |
 
 VirtualMachine spec contains only fields with an implementation:
 `className`, `runPolicy` (`Running` or `Stopped`), `rootDisk` (an HTTP
 source imported into a claim Baryon creates, or an existing claim),
 `networks` (a list-map keyed by a DNS-1123 label name; exactly one, the pod
-network), and `placement`. CEL rules enforce one disk source, a size for imported disks, an
-`http` or `https` URL, a SHA-256 digest when the URL is plain `http`, the
-single pod network, and an immutable `rootDisk` (`self == oldSelf`,
-including `size`): the disk's content and claim are bound to it, so another
-disk means a new VirtualMachine.
+network), and `placement`. CEL rules and schema limits enforce one disk
+source; a size for imported disks, a whole number of bytes from 1Mi to
+1Pi; `size` and `storageClassName` only for an `http` source; DNS-1123
+subdomains for `className`, `storageClassName`, and `claimName`; an `http`
+or `https` URL with a host and without credentials; a SHA-256 digest when
+the URL is plain `http`; the single pod network; and an immutable
+`rootDisk` (`self == oldSelf`, including `size`): the disk's content and
+claim are bound to it, so another disk means a new VirtualMachine.
+`rootDisk.size` is the size the guest sees in filesystem mode, and the
+minimum in block mode: in filesystem mode the image is extended to exactly
+that size and the claim requests 64 MiB more for the import marker and
+filesystem metadata; in block mode the claim requests exactly that size
+and the guest sees the whole device, which the provisioner may round
+up.
+
+VirtualMachineClass has `cpu.vcpus` (1 to 256, no statement about guest
+CPU topology) and `memory.size` (a whole number of Mi from 64Mi to 16Ti).
+Its `spec` is immutable: a new shape is a new class, and VMs move to it by
+changing `className`, which applies at their next start
+(`RestartRequired`).
 
 `placement` uses the Kubernetes core/v1 types with their pod meaning:
 `nodeSelector`, `affinity` (`Affinity`), `tolerations` (at most 32),
@@ -45,7 +60,11 @@ is reported through `RestartRequired`.
 
 Restart is requested
 with the `virtualization.baryon.io/restartedAt` annotation, following the
-`kubectl rollout restart` convention.
+`kubectl rollout restart` convention. A value that differs from the one
+the current Anchor Pod was created with restarts a running VM exactly
+once; the value is opaque; removing the annotation does nothing; a
+stopped VM is not affected. The value is not part of the spec hash that
+decides `SpecChanged`.
 
 Runtime status reaches the controller through the Anchor Pod, written only by
 kubelet:
@@ -100,11 +119,28 @@ newer runtime from a controller upgrade). When the import Pod or the Anchor
 Pod cannot be scheduled, `Scheduled` and `Ready` are False with the
 scheduler's reason and message (cut to 1024 bytes); when the API server
 refuses to create one (HTTP 422 or 403), the reason is `PodRejected` with
-the API server's message.
+the API server's message, and when it refuses the root disk claim Baryon
+creates, `ClaimRejected`. An empty `placement: {}` is treated like no
+placement, for scheduling and for `PlacementChanged`.
 `NetworkReady` is derived from the node's report only while `Running` is
 True, and does not change `Ready`. Its reason comes from the reported
 state, never from the node's text; the node's message is capped at 1024
 bytes. The reasons are listed in [api.md](../api.md#networkready).
+
+VirtualizationNode status holds the conditions `Ready` (baryon-virtd
+reachable, a compatible runtime protocol, KVM usable; True reason
+`RuntimeReady`) and `RuntimeHealthy`, `heartbeatTime`, `runtime`
+(`virtdVersion`, `hypervisorVersion`, and the internal `protocolVersion`
+and `features`), `vmCount`, and the internal `vms`. A node agent that
+stops sets both conditions to Unknown (`NodeAgentStopped`); a crashed one
+cannot, so consumers count the conditions only while `heartbeatTime` is
+within 90 s.
+
+List semantics are declared for every status list: VM `addresses` is
+atomic with `type` limited to `InternalIP`, `identityConflictNodes` and
+`runtime.features` are sets, conditions and VirtualizationNode `vms` are
+maps (keyed by `type` and `anchorPodUID`). Optional fields are not
+nullable: no Baryon field distinguishes null from absent.
 
 Anchor Pods carry the labels `virtualization.baryon.io/vm-name`,
 `virtualization.baryon.io/vm-uid`, and `app.kubernetes.io/managed-by=baryon`;
@@ -154,8 +190,18 @@ PersistentVolumes.
   disks, Multus networks, CPU pinning, hugepages, and VFIO are Designed or
   Planned and are not in the schema.
 - Host capability requirements (IOMMU, hugepages, NUMA, VFIO, runtime
-  protocol features) are not in the schema; when one ships, the requirement
-  belongs on VirtualMachineClass, not in `placement` (ADR 0012).
+  protocol features) are not in the schema. Where a requirement goes in
+  the API is decided by the ADR that ships the capability; it is not
+  committed to VirtualMachineClass in advance. With Dynamic Resource
+  Allocation, device requests would be claims per VM, not a property of
+  a shared class (ADR 0012).
+- VirtualizationNode publishes no host inventory: Kubernetes publishes
+  what the scheduler uses on the Node, devices belong to Dynamic Resource
+  Allocation, and the node agent logs the rest. Its conditions are valid
+  only while its heartbeat is recent (90 s), because a crashed node agent
+  cannot update them.
+- Which parts of the API are contract, the v0.1 freeze, and the change log
+  per release are in [api-stability.md](../api-stability.md).
 - `placement` is bounded by the cluster's own controls: namespace admission
   (PodNodeSelector, PodTolerationRestriction) and ResourceQuota scopes see
   the VM's pods in the VM's namespace.
@@ -203,3 +249,45 @@ PersistentVolumes.
   `status.vms` (host-side state per Anchor Pod UID, read by the controller,
   which stays the only writer of VM status), the 90 s staleness rule on the
   controller's clock, and why the anchor does not report this state.
+- 2026-10-05 (v0.1 API review; the API stays `v1alpha1`):
+  - `restartedAt`: a new non-empty value restarts a running VM exactly
+    once; removing the annotation is a no-op (it reported `SpecChanged`
+    before, a bug); the value is opaque, has no effect on a stopped VM, and
+    does not change `metadata.generation`. The value left the spec hash;
+    Anchor Pods created by a restart request of an earlier release still
+    match.
+  - `rootDisk` validation, `rootDisk` staying immutable: `size` a whole
+    number of bytes from 1Mi to 1Pi; `size` and `storageClassName` only
+    for an `http` source; DNS-1123 subdomains for `storageClassName`,
+    `persistentVolumeClaim.claimName`, and `className`; an `http.url` with
+    a host and without credentials.
+  - The reason `ClaimRejected` for a root disk claim the API server
+    refuses, reported on the VM instead of only logged.
+  - `rootDisk.size` semantics: filesystem claims request `size` plus
+    64 MiB and the image is extended to exactly `size`; block claims
+    request exactly `size` (before, also 64 MiB more).
+  - VirtualMachineClass `cpu.cores` renamed `cpu.vcpus`, `memory.size`
+    validated in the schema, and the class `spec` immutable, with a
+    one-time update allowed for a class stored in the earlier shape.
+  - VirtualizationNode purpose narrowed to whether the node can run
+    Baryon VMs, its runtime versions, and its runtime health. Removed
+    `runtime.protocol`, `runtime.hypervisor`, `architecture`,
+    `kernelRelease`, `osImage`, `kairosVersion`, `cpu`, `memoryBytes`,
+    `kvm`, `iommu`, `vfio`, `numaNodes`, `hugepages`, and `pciDevices`:
+    they repeated Node status or described unsupported features; device
+    inventory belongs to Dynamic Resource Allocation; the node agent logs
+    the host inventory instead.
+  - VirtualizationNode staleness: `NodeAgentStopped` on SIGTERM and the
+    90 s heartbeat rule for consumers; the `Ready` True reason renamed
+    `KvmAvailable` to `RuntimeReady`; an unreadable host report is
+    `ProtocolIncompatible` instead of `RuntimeUnreachable`.
+  - List semantics on every status list, and no nullable optional fields.
+  - An empty `placement: {}` places and hashes like no placement.
+  - `Running` documented as the Anchor container of the current Anchor
+    Pod running, not evidence that the guest runs.
+  - Capability and device requirements are no longer committed to
+    VirtualMachineClass (replacing the 2026-10-03 rule): the ADR that ships
+    a capability decides where its requirement goes; with Dynamic Resource
+    Allocation, device requests would be per-VM claims.
+  - The contract, the v0.1 freeze, and the change log are recorded in
+    [api-stability.md](../api-stability.md).

@@ -30,6 +30,10 @@ pub(crate) struct Observed<'a> {
     pub identity_conflict_nodes: Vec<String>,
     /// The disk is not usable and will not be imported: (reason, message).
     pub storage_blocked: Option<(String, String)>,
+    /// Why the root disk claim could not be resolved (`ClaimNotFound`,
+    /// `ClaimConflict`, `ClaimRejected`, `InvalidSpec`), whatever else
+    /// blocks the VM.
+    pub disk_error: Option<(String, String)>,
     /// The VirtualizationNode of the node the Anchor Pod runs on.
     pub node: Option<&'a baryon_api::VirtualizationNode>,
     /// Whether the controller saw that node's heartbeat recently.
@@ -237,12 +241,19 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
     let storage = if let Some((reason, message)) = &obs.storage_blocked {
         ConditionUpdate::new(vm::STORAGE_READY, false, reason.clone(), message.clone())
     } else if obs.claim.is_none() {
-        ConditionUpdate::new(
-            vm::STORAGE_READY,
-            false,
-            "ClaimMissing",
-            "the root disk claim does not exist",
-        )
+        // A claim problem found while resolving the disk (refused, owned by
+        // something else, missing) is the storage state too.
+        match obs.disk_error.as_ref().filter(|(r, _)| r != "InvalidSpec") {
+            Some((reason, message)) => {
+                ConditionUpdate::new(vm::STORAGE_READY, false, reason.clone(), message.clone())
+            }
+            None => ConditionUpdate::new(
+                vm::STORAGE_READY,
+                false,
+                "ClaimMissing",
+                "the root disk claim does not exist",
+            ),
+        }
     } else if !claim_bound {
         ConditionUpdate::new(
             vm::STORAGE_READY,
@@ -266,6 +277,13 @@ pub(crate) fn derive(vm: &VirtualMachine, obs: &Observed<'_>, now: Time) -> Virt
                 )
             }
             Some(c) => match last_termination(c) {
+                // Killed without a message (for example out of memory).
+                Some((code, msg)) if code != 0 && msg.is_empty() => ConditionUpdate::new(
+                    vm::STORAGE_READY,
+                    false,
+                    "ImportFailed",
+                    format!("the importer exited with code {code} without a message"),
+                ),
                 Some((code, msg)) if code != 0 => {
                     let (reason, detail) = split_reason(&msg);
                     ConditionUpdate::new(vm::STORAGE_READY, false, reason, detail)
@@ -1049,5 +1067,22 @@ mod tests {
         let f = c(&forged);
         assert_eq!(f.reason, "DhcpResponderFailing");
         assert!(f.message.len() <= 1024);
+    }
+
+    #[test]
+    fn storage_ready_names_the_claim_problem_even_behind_a_class_problem() {
+        let s = derive(
+            &vm(),
+            &Observed {
+                blocked: Some(("ClassNotFound".into(), "no class".into())),
+                disk_error: Some(("ClaimNotFound".into(), "no claim disk".into())),
+                ..Default::default()
+            },
+            now(),
+        );
+        assert_eq!(cond(&s, vm::READY).reason, "ClassNotFound");
+        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ClaimNotFound");
+        let s = derive(&vm(), &Observed::default(), now());
+        assert_eq!(cond(&s, vm::STORAGE_READY).reason, "ClaimMissing");
     }
 }

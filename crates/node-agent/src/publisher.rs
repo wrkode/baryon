@@ -19,10 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tonic::transport::Endpoint;
 
 use baryon_api::conditions::{self, ConditionUpdate};
-use baryon_api::node::{
-    CpuStatus, HugepageStatus, IommuStatus, KvmStatus, MAX_NODE_VMS, NodeVmNetwork, NodeVmStatus,
-    NumaNodeStatus, PciDeviceStatus, RuntimeStatus, VfioStatus,
-};
+use baryon_api::node::{MAX_NODE_VMS, NodeVmNetwork, NodeVmStatus, RuntimeStatus};
 use baryon_api::{VirtualizationNode, VirtualizationNodeSpec, VirtualizationNodeStatus};
 use baryon_host::HostReport;
 use baryon_runtime_api::protocol;
@@ -49,6 +46,16 @@ pub(crate) struct Observation {
     /// Status of every VM on the node, as baryon-virtd reports it.
     pub vms: Vec<VmStatus>,
     pub error: Option<String>,
+    /// The error is an incompatible host report, not an unreachable runtime.
+    pub incompatible: bool,
+}
+
+/// A host report schema this node agent does not read.
+#[derive(Debug, thiserror::Error)]
+#[error("baryon-virtd reports host schema version {got}, expected {want}")]
+struct SchemaMismatch {
+    got: u32,
+    want: u32,
 }
 
 pub(crate) async fn run(
@@ -61,12 +68,35 @@ pub(crate) async fn run(
     let nodes: Api<Node> = Api::all(client);
     let mut ticker = tokio::time::interval(cfg.interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut inventory = String::new();
     loop {
         tokio::select! {
-            () = cancel.cancelled() => return Ok(()),
+            () = cancel.cancelled() => {
+                // A stopping agent (upgrade, reboot) says so; a crashed one
+                // leaves a heartbeat that ages (see docs/api.md).
+                let stopped = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    publish_stopped(&api, &cfg.node_name),
+                );
+                match stopped.await {
+                    Ok(Ok(())) => tracing::info!("VirtualizationNode conditions set to Unknown"),
+                    Ok(Err(e)) => tracing::warn!(error = %e, "cannot mark VirtualizationNode as not reporting"),
+                    Err(_) => tracing::warn!("timed out marking VirtualizationNode as not reporting"),
+                }
+                return Ok(());
+            }
             _ = ticker.tick() => {}
         }
         let obs = observe(&cfg.virtd_socket).await;
+        // The host inventory is logged, not published: at start and when
+        // it changes.
+        if let Some(h) = &obs.host {
+            let now = inventory_summary(h);
+            if now != inventory {
+                tracing::info!(inventory = %now, "host inventory");
+                inventory = now;
+            }
+        }
         let status_ok = obs.error.is_none();
         let kvm_ok = obs.host.as_ref().is_some_and(|h| h.kvm.usable);
         let protocol_ok = obs
@@ -77,6 +107,101 @@ pub(crate) async fn run(
         if let Err(e) = publish(&api, &nodes, &cfg.node_name, &obs).await {
             tracing::warn!(error = %e, "publishing VirtualizationNode failed");
         }
+    }
+}
+
+/// One line describing the host for the node agent's log.
+fn inventory_summary(h: &HostReport) -> String {
+    let mut parts = vec![format!(
+        "arch={}",
+        h.architecture.as_deref().unwrap_or("unknown")
+    )];
+    if let Some(os) = &h.os {
+        parts.push(format!("kernel={}", os.kernel_release));
+        if let Some(name) = &os.os_release.pretty_name {
+            parts.push(format!("os={name:?}"));
+        }
+        if let Some(v) = os
+            .kairos_release
+            .as_ref()
+            .and_then(|k| k.get("KAIROS_VERSION"))
+        {
+            parts.push(format!("kairos={v}"));
+        }
+    }
+    if let Some(c) = &h.cpu {
+        parts.push(format!(
+            "cpu={:?} online={} nested={:?}",
+            c.model_name.as_deref().unwrap_or("unknown"),
+            c.online_count,
+            c.nested_virtualization
+        ));
+    }
+    if let Some(m) = &h.memory {
+        parts.push(format!("memory_bytes={}", m.total_bytes));
+    }
+    parts.push(format!("kvm_usable={}", h.kvm.usable));
+    if let Some(i) = &h.iommu {
+        parts.push(format!(
+            "iommu={} iommu_groups={}",
+            i.enabled,
+            i.groups.len()
+        ));
+    }
+    if let Some(n) = &h.numa {
+        parts.push(format!("numa_nodes={}", n.len()));
+    }
+    if let Some(d) = &h.pci_devices {
+        parts.push(format!("pci_devices={}", d.len()));
+    }
+    parts.join(" ")
+}
+
+/// Set `Ready` and `RuntimeHealthy` to Unknown (`NodeAgentStopped`) when the
+/// node agent stops. Keeps the rest of the status, including the heartbeat,
+/// which then ages.
+async fn publish_stopped(api: &Api<VirtualizationNode>, node_name: &str) -> anyhow::Result<()> {
+    let Some(existing) = api.get_opt(node_name).await? else {
+        return Ok(());
+    };
+    let resource_version = existing.metadata.resource_version.clone();
+    let mut status = existing.status.unwrap_or_default();
+    let message =
+        "baryon-node-agent on this node stopped; the node's runtime state is not reported";
+    let updates = [
+        ConditionUpdate::unknown(conditions::node::READY, "NodeAgentStopped", message),
+        ConditionUpdate::unknown(
+            conditions::node::RUNTIME_HEALTHY,
+            "NodeAgentStopped",
+            message,
+        ),
+    ];
+    status.conditions =
+        conditions::merge(&status.conditions, &updates, None, Time(Timestamp::now()));
+    // Only if nothing wrote since the read: a replacement agent on this node
+    // may already have published, and its status must win.
+    let patch = serde_json::json!({
+        "apiVersion": "virtualization.baryon.io/v1alpha1",
+        "kind": "VirtualizationNode",
+        "metadata": {"resourceVersion": resource_version},
+        "status": status,
+    });
+    match api
+        .patch_status(
+            node_name,
+            &PatchParams::apply(FIELD_MANAGER).force(),
+            &Patch::Apply(&patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 409 => {
+            tracing::info!(
+                "VirtualizationNode changed since it was read; not marking it as not reporting"
+            );
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -107,12 +232,14 @@ pub(crate) async fn observe(socket: &Path) -> Observation {
             vm_count: Some(u32::try_from(vms.len()).unwrap_or(u32::MAX)),
             vms,
             error: None,
+            incompatible: false,
         },
         Err(e) => Observation {
             host: None,
             runtime: None,
             vm_count: None,
             vms: Vec::new(),
+            incompatible: e.downcast_ref::<SchemaMismatch>().is_some(),
             error: Some(format!("{e:#}")),
         },
     }
@@ -127,11 +254,11 @@ async fn observe_inner(socket: &Path) -> anyhow::Result<(HostReport, RuntimeInfo
     let mut client = NodeServiceClient::new(channel);
     let info = client.get_host(GetHostRequest {}).await?.into_inner();
     if info.report_version != baryon_runtime_api::HOST_REPORT_VERSION {
-        anyhow::bail!(
-            "baryon-virtd reports host schema version {}, expected {}",
-            info.report_version,
-            baryon_runtime_api::HOST_REPORT_VERSION
-        );
+        return Err(SchemaMismatch {
+            got: info.report_version,
+            want: baryon_runtime_api::HOST_REPORT_VERSION,
+        }
+        .into());
     }
     let host: HostReport = serde_json::from_str(&info.report_json)?;
     let runtime = info.runtime.unwrap_or_default();
@@ -244,95 +371,19 @@ pub(crate) fn build_status(
     let mut updates = Vec::new();
     match (&obs.host, &obs.error) {
         (Some(h), None) => {
-            s.architecture = h.architecture.clone();
-            if let Some(os) = &h.os {
-                s.kernel_release = Some(os.kernel_release.clone());
-                s.os_image = os.os_release.pretty_name.clone();
-                s.kairos_version = os
-                    .kairos_release
-                    .as_ref()
-                    .and_then(|k| k.get("KAIROS_VERSION").cloned());
-            }
-            s.cpu = h.cpu.as_ref().map(|c| CpuStatus {
-                model: c.model_name.clone(),
-                online: c.online_count,
-                virtualization_extension: c.virtualization_extension.map(|e| {
-                    serde_json::to_value(e)
-                        .ok()
-                        .and_then(|v| v.as_str().map(str::to_owned))
-                        .unwrap_or_default()
-                }),
-                nested_virtualization: c.nested_virtualization,
-            });
-            s.memory_bytes = h.memory.as_ref().map(|m| m.total_bytes);
-            s.hugepages = h
-                .memory
-                .as_ref()
-                .map(|m| {
-                    m.hugepages
-                        .iter()
-                        .map(|p| HugepageStatus {
-                            page_size_bytes: p.page_size_bytes,
-                            total: p.total,
-                            free: p.free,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            s.kvm = Some(KvmStatus {
-                available: h.kvm.usable,
-                api_version: h.kvm.api_version,
-                reason: h.kvm.reason.clone(),
-            });
-            s.iommu = h.iommu.as_ref().map(|i| IommuStatus {
-                enabled: i.enabled,
-                groups: u32::try_from(i.groups.len()).unwrap_or(u32::MAX),
-                iommufd: i.iommufd.available(),
-            });
-            s.vfio = h.vfio.as_ref().map(|v| VfioStatus {
-                container_device: v.container.available(),
-                pci_driver: v.vfio_pci_driver,
-            });
-            s.numa_nodes = h
-                .numa
-                .as_ref()
-                .map(|nodes| {
-                    nodes
-                        .iter()
-                        .map(|n| NumaNodeStatus {
-                            id: n.id,
-                            cpus: n.cpus.clone(),
-                            memory_bytes: n.memory_total_bytes,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            s.pci_devices = h
-                .pci_devices
-                .as_ref()
-                .map(|devs| {
-                    devs.iter()
-                        // Bridges are not useful inventory for VM placement.
-                        .filter(|d| d.base_class() != "06")
-                        .map(|d| PciDeviceStatus {
-                            address: d.address.clone(),
-                            vendor_id: d.vendor_id.clone(),
-                            device_id: d.device_id.clone(),
-                            class: d.class.clone(),
-                            driver: d.driver.clone(),
-                            iommu_group: d.iommu_group,
-                            numa_node: d.numa_node,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            s.runtime = obs.runtime.as_ref().map(|r| RuntimeStatus {
-                virtd_version: r.virtd_version.clone(),
-                protocol: r.protocol.clone(),
-                protocol_version: Some(protocol::Version::of_peer(r.version.as_ref()).to_string()),
-                features: protocol::features_of_peer(r.version.as_ref(), &r.features),
-                hypervisor: r.hypervisor.clone(),
-                hypervisor_version: r.hypervisor_version.clone(),
+            s.runtime = obs.runtime.as_ref().map(|r| {
+                // A set in the schema: a duplicate would fail the whole write.
+                let mut features = protocol::features_of_peer(r.version.as_ref(), &r.features);
+                let mut seen = std::collections::HashSet::new();
+                features.retain(|f| seen.insert(f.clone()));
+                RuntimeStatus {
+                    virtd_version: r.virtd_version.clone(),
+                    protocol_version: Some(
+                        protocol::Version::of_peer(r.version.as_ref()).to_string(),
+                    ),
+                    features,
+                    hypervisor_version: r.hypervisor_version.clone(),
+                }
             });
             s.vm_count = obs.vm_count;
             if obs.vms.len() > MAX_NODE_VMS {
@@ -342,9 +393,13 @@ pub(crate) fn build_status(
                     "more VMs than a VirtualizationNode can list; publishing the first"
                 );
             }
+            // A map by Anchor Pod UID in the schema: keep the first entry of
+            // each UID.
+            let mut seen = std::collections::HashSet::new();
             s.vms = obs
                 .vms
                 .iter()
+                .filter(|v| seen.insert(v.pod_uid.clone()))
                 .take(MAX_NODE_VMS)
                 .map(node_vm_status)
                 .collect();
@@ -370,7 +425,7 @@ pub(crate) fn build_status(
             let (ready, reason, message) = if let Err(m) = compatible {
                 (false, "ProtocolIncompatible", m)
             } else if h.kvm.usable {
-                (true, "KvmAvailable", "the node can run VMs".to_owned())
+                (true, "RuntimeReady", "the node can run VMs".to_owned())
             } else {
                 (
                     false,
@@ -390,16 +445,23 @@ pub(crate) fn build_status(
         }
         (_, err) => {
             let message = err.clone().unwrap_or_else(|| "no host report".to_owned());
+            // baryon-virtd answered with a host report this node agent
+            // cannot read: an incompatible runtime, not an unreachable one.
+            let reason = if obs.incompatible {
+                "ProtocolIncompatible"
+            } else {
+                "RuntimeUnreachable"
+            };
             updates.push(ConditionUpdate::new(
                 conditions::node::RUNTIME_HEALTHY,
                 false,
-                "RuntimeUnreachable",
+                reason,
                 message.clone(),
             ));
             updates.push(ConditionUpdate::new(
                 conditions::node::READY,
                 false,
-                "RuntimeUnreachable",
+                reason,
                 message,
             ));
         }
@@ -424,13 +486,34 @@ mod tests {
             vm_count: None,
             vms: Vec::new(),
             error: Some("connection refused".into()),
+            incompatible: false,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
         let ready = conditions::find(&s.conditions, conditions::node::READY).unwrap();
         assert_eq!(ready.status, "False");
         assert_eq!(ready.reason, "RuntimeUnreachable");
         assert!(s.heartbeat_time.is_some());
-        assert!(s.kvm.is_none());
+        assert!(s.runtime.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_host_report_is_incompatible() {
+        let obs = Observation {
+            host: None,
+            runtime: None,
+            vm_count: None,
+            vms: Vec::new(),
+            error: Some("baryon-virtd reports host schema version 9, expected 1".into()),
+            incompatible: true,
+        };
+        let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
+        for t in [conditions::node::READY, conditions::node::RUNTIME_HEALTHY] {
+            let c = conditions::find(&s.conditions, t).unwrap();
+            assert_eq!(
+                (c.status.as_str(), c.reason.as_str()),
+                ("False", "ProtocolIncompatible")
+            );
+        }
     }
 
     #[test]
@@ -451,16 +534,27 @@ mod tests {
             vm_count: Some(2),
             vms: Vec::new(),
             error: None,
+            incompatible: false,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
         assert_eq!(s.vm_count, Some(2));
-        assert_eq!(s.runtime.unwrap().hypervisor_version, "v53.0");
-        assert!(s.architecture.is_some());
+        assert_eq!(s.runtime.as_ref().unwrap().hypervisor_version, "v53.0");
         assert!(
             conditions::find(&s.conditions, conditions::node::RUNTIME_HEALTHY)
                 .is_some_and(|c| c.status == "True")
         );
-        assert!(s.pci_devices.iter().all(|d| !d.class.starts_with("06")));
+        // The host inventory goes to the log, not to the status.
+        let json = serde_json::to_string(&s).unwrap();
+        for absent in [
+            "architecture",
+            "pciDevices",
+            "kvm",
+            "memoryBytes",
+            "kernelRelease",
+        ] {
+            assert!(!json.contains(absent), "{absent} published");
+        }
+        assert!(!inventory_summary(obs.host.as_ref().unwrap()).is_empty());
     }
 
     fn runtime(protocol: &str, version: Option<(u32, u32)>) -> RuntimeInfo {
@@ -499,6 +593,7 @@ mod tests {
             vm_count: Some(0),
             vms: Vec::new(),
             error: None,
+            incompatible: false,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
         for t in [conditions::node::RUNTIME_HEALTHY, conditions::node::READY] {
@@ -527,6 +622,7 @@ mod tests {
             vm_count: Some(0),
             vms: Vec::new(),
             error: None,
+            incompatible: false,
         };
         let s = build_status(&obs, &VirtualizationNodeStatus::default(), now());
         let r = s.runtime.unwrap();

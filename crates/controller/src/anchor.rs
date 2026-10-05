@@ -118,6 +118,13 @@ pub(crate) struct AnchorInput {
     pub labels: BTreeMap<String, String>,
 }
 
+/// The placement hash of an explicitly empty `placement: {}`.
+pub(crate) fn empty_placement_hash() -> String {
+    resources::spec_hash(&[
+        &serde_json::to_string(&Some(baryon_api::vm::Placement::default())).unwrap_or_default(),
+    ])
+}
+
 impl AnchorInput {
     /// Hash of the VM's scheduling constraints; a change is reported, not
     /// applied to a running VM.
@@ -129,13 +136,25 @@ impl AnchorInput {
     /// not part of it: a newer runtime is reported separately. The import
     /// is not part of it: it runs in its own pod. Placement has its own
     /// hash.
+    ///
+    /// The restart request is not part of it: a new `restartedAt` value
+    /// replaces the pod by itself, and removing the annotation changes
+    /// nothing. The fifth element stays empty so the hash of pods created
+    /// without the annotation is unchanged.
     pub(crate) fn spec_hash(&self) -> String {
+        self.spec_hash_with(None)
+    }
+
+    /// The hash as releases before 0.1.0-rc1 computed it, with the pod's
+    /// `restartedAt` value: a pod created by a restart request then still
+    /// matches.
+    pub(crate) fn spec_hash_with(&self, restarted_at: Option<&str>) -> String {
         resources::spec_hash(&[
             &self.vcpus.to_string(),
             &self.guest_memory_bytes.to_string(),
             &self.claim_name,
             &format!("{:?}", self.disk_mode),
-            self.restarted_at.as_deref().unwrap_or(""),
+            restarted_at.unwrap_or(""),
         ])
     }
 
@@ -752,11 +771,16 @@ mod tests {
     }
 
     #[test]
-    fn hash_changes_with_restart() {
+    fn restart_requests_do_not_change_the_hash() {
         let a = input(true).spec_hash();
         let mut i = input(true);
         i.restarted_at = Some("2026-10-03T00:00:00Z".into());
-        assert_ne!(a, i.spec_hash());
+        // Setting or removing restartedAt is not a spec change.
+        assert_eq!(a, i.spec_hash());
+        // Pods created by a restart before 0.1.0-rc1 carry the old hash.
+        let old = i.spec_hash_with(Some("2026-10-03T00:00:00Z"));
+        assert_ne!(old, a);
+        assert_eq!(i.spec_hash_with(None), a);
     }
 
     #[test]
@@ -892,5 +916,14 @@ mod tests {
             copied_label_keys(&pod).into_iter().collect::<Vec<_>>(),
             ["app", "tier"]
         );
+    }
+
+    #[test]
+    fn an_empty_placement_has_its_own_known_hash() {
+        let mut i = input(true);
+        i.placement = Some(baryon_api::vm::Placement::default());
+        assert_eq!(i.placement_hash(), empty_placement_hash());
+        i.placement = None;
+        assert_ne!(i.placement_hash(), empty_placement_hash());
     }
 }

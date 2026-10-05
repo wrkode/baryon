@@ -58,10 +58,25 @@ pub fn crds_yaml() -> Result<String, Box<dyn std::error::Error>> {
     ] {
         let mut value = serde_json::to_value(&crd)?;
         strip_numeric_formats(&mut value);
+        strip_nullable(&mut value);
         out.push_str("---\n");
         out.push_str(&serde_saphyr::to_string(&value)?);
     }
     Ok(out)
+}
+
+/// schemars marks optional fields `nullable`. With it, the API server keeps
+/// explicit nulls and serves them back; without it, nulls are pruned. No
+/// Baryon field distinguishes null from absent.
+fn strip_nullable(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.remove("nullable");
+            map.values_mut().for_each(strip_nullable);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(strip_nullable),
+        _ => {}
+    }
 }
 
 /// schemars annotates integers with formats such as `uint32` that the
@@ -109,7 +124,9 @@ mod tests {
         assert!(node.contains(r#""scope":"Cluster""#));
         let class = serde_json::to_string(&VirtualMachineClass::crd()).unwrap();
         assert!(class.contains(r#""scope":"Cluster""#));
-        assert!(class.contains("cores must be between 1 and 256"));
+        assert!(class.contains(r#""maximum":256.0"#) || class.contains(r#""maximum":256"#));
+        assert!(class.contains("VirtualMachineClass spec is immutable"));
+        assert!(class.contains("memory.size must be a whole number of Mi"));
         assert!(
             crds_yaml()
                 .unwrap()

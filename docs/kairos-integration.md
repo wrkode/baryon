@@ -300,8 +300,9 @@ VirtualizationNode state with semantics for upgrades:
 
 | State | Meaning | Status |
 |---|---|---|
-| `Ready` condition | Host runtime healthy and accepting VMs. | Implemented |
+| `Ready` condition | The node can run Baryon VMs: baryon-virtd reachable, a compatible runtime protocol, and KVM usable (reason `RuntimeReady`). | Implemented |
 | `RuntimeHealthy` condition | baryon-virtd reachable, discovery succeeded, and its runtime protocol major version matches the cluster release (reason `ProtocolIncompatible` otherwise, ADR 0012). | Implemented |
+| `status.heartbeatTime` | Last refresh by the node agent. The conditions count only while it is within 90 s. A node agent stopped for the reboot sets both conditions to Unknown (`NodeAgentStopped`); one that crashes leaves them unchanged ([api.md](api.md#virtualizationnode-cluster-scoped-short-name-vnode)). | Implemented |
 | `status.vmCount` | VMs known to baryon-virtd on the node; 0 answers "no VMs here". | Implemented |
 
 Earlier drafts reserved `Evacuating`, `Evacuated`, and `UpgradeSafe`
@@ -338,7 +339,15 @@ after the previous node and its VMs are back.
    The node agent omits `vmCount` while baryon-virtd is unreachable, so the
    wait does not pass on a node whose runtime is down.
 
-3. Upgrade the node with a `NodeOpUpgrade` that selects only this node,
+3. Record the node's boot ID, for step 5. Kubernetes changes it when the
+   node reboots:
+
+   ```bash
+   node=<node>
+   boot0="$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}')"
+   ```
+
+   Upgrade the node with a `NodeOpUpgrade` that selects only this node,
    with concurrency 1:
 
    ```yaml
@@ -361,17 +370,59 @@ after the previous node and its VMs are back.
    present in each node's containerd under a fixed tag.
 4. If you drained the node in step 1, uncordon it when it is Ready again:
    `kubectl uncordon <node>`.
-5. Before the next node, wait until this node's VirtualizationNode is
-   Ready again and its VMs are back (every VirtualMachine `Ready=True`, or
-   `vmCount` back to its value before the upgrade):
+5. Before the next node, wait until this node has rebooted, its node
+   agent reports `Ready` again, and its VMs are back (every
+   VirtualMachine `Ready=True`, or `vmCount` back to its value before the
+   upgrade). `kubectl wait --for=condition=Ready` on the
+   VirtualizationNode is not enough: a `Ready=True` written before the
+   reboot satisfies it at once. Instead, wait until the Node's boot ID
+   differs from `boot0`, then until the VirtualizationNode's
+   `heartbeatTime` changes and `Ready` is True. The node agent of the
+   previous boot cannot write after the reboot, so a changed heartbeat
+   comes from the new one; no clocks are compared. In the same shell as
+   step 3:
 
    ```bash
-   kubectl wait virtualizationnode/<node> --for=condition=Ready --timeout=15m
-   kubectl wait virtualmachine/<vm> -n <namespace> --for=condition=Ready --timeout=15m
+   (
+     wait_until() {  # wait_until <seconds> <what> <command...>
+       local deadline=$(( $(date +%s) + $1 )) what=$2
+       shift 2
+       until "$@"; do
+         [ "$(date +%s)" -lt "$deadline" ] || { echo "timed out: $what" >&2; exit 1; }
+         sleep 10
+       done
+     }
+     rebooted() {
+       local b
+       b="$(kubectl get node "$node" -o jsonpath='{.status.nodeInfo.bootID}')" &&
+         [ -n "$b" ] && [ "$b" != "$boot0" ]
+     }
+     reporting() {
+       local ready beat
+       read -r ready beat < <(kubectl get virtualizationnode "$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.heartbeatTime}{"\n"}') &&
+         [ "$ready" = True ] && [ -n "$beat" ] && [ "$beat" != "$hb0" ]
+     }
+     wait_until 1800 "node $node did not reboot" rebooted
+     hb0="$(kubectl get virtualizationnode "$node" -o jsonpath='{.status.heartbeatTime}')"
+     wait_until 900 "VirtualizationNode $node is not Ready after the reboot" reporting
+   ) && kubectl wait virtualmachine/<vm> -n <namespace> --for=condition=Ready --timeout=15m
    ```
 
-   Run the second command for each VM that was running on the node. A VM
-   with `runPolicy: Stopped` never becomes Ready.
+   The parentheses run the wait in a subshell, so a timeout ends it with
+   exit status 1 and skips the VM wait without closing your shell; stop
+   there and check the node. Run the `kubectl wait virtualmachine` command
+   for each VM that was running on the node. A VM with
+   `runPolicy: Stopped` never becomes Ready.
+
+   The node agent also sets `Ready` and `RuntimeHealthy` to Unknown
+   (`NodeAgentStopped`) when it is stopped for the reboot. That is a
+   signal for people watching `kubectl get virtualizationnodes`, not
+   something this check relies on: the write is best effort (the node
+   agent reaches the API server over the pod network and gives it 5 s
+   during shutdown), and a node agent that is killed does not write it.
+
+   Status: Designed; not yet run on the k0s cluster. The tested runs
+   below used `kubectl wait --for=condition=Ready`.
 
    Only then create the `NodeOpUpgrade` for the next node.
 

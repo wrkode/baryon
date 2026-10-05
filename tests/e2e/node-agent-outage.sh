@@ -123,6 +123,10 @@ wait_for "both VMs Ready with NetworkReady True" both_healthy
 log "case down-then-restart"
 remove_agent
 wait_for "down-then-restart: node agent gone from $out_node" no_agent
+# The stopping agent marks its node as not reporting (best effort).
+node_cond() { kubectl "${ctx[@]}" get virtualizationnode "$1" -o jsonpath="{.status.conditions[?(@.type==\"$2\")].$3}"; }
+stopped_marked() { [ "$(node_cond "$out_node" Ready status)/$(node_cond "$out_node" Ready reason)" = Unknown/NodeAgentStopped ]; }
+wait_for "down-then-restart: $out_node Ready Unknown NodeAgentStopped" stopped_marked
 saved="$timeout"; timeout=240
 wait_for "down-then-restart: outage VM Unknown before the restart" net_is "$vm_out" Unknown RuntimeUnreachable
 wait_for "down-then-restart: heartbeat of $out_node older than 120 s" heartbeat_older_than "$out_node" 120

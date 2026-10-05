@@ -1,7 +1,7 @@
 # 0012: Runtime protocol versions, features, and negotiation
 
 Status: Accepted
-Date: 2026-10-03, revised 2026-10-04
+Date: 2026-10-03, revised 2026-10-04 and 2026-10-05
 
 ## Context
 
@@ -91,10 +91,11 @@ express a breaking change except changing the package.
   mechanism is the one planned above for features: a per-capability
   placement-only extended resource served by the node agent, not Node
   labels written by a Baryon component (writer identity, staleness, and
-  RBAC: `nodes/patch` cannot be limited to labels, ADR 0004). The
-  requirement then belongs on VirtualMachineClass, not in the VM's
-  `spec.placement` (ADR 0008). Consumable devices (VFIO, GPUs) go to DRA,
-  never to this mechanism. NUMA stays with the node's Topology Manager;
+  RBAC: `nodes/patch` cannot be limited to labels, ADR 0004). Where the
+  requirement goes in the API (for example VirtualMachineClass or the
+  VM) is decided by the ADR that ships the capability, not in advance
+  (ADR 0008). Consumable devices (VFIO, GPUs) go to DRA, where device
+  requests would be per-VM claims, never to this mechanism. NUMA stays with the node's Topology Manager;
   there is no NUMA field.
 - Major transitions: a host of major N+1 keeps serving major N's
   `AnchorService.Negotiate` and `NodeService.GetHost` and `GetRuntimeInfo`
@@ -185,3 +186,9 @@ express a breaking change except changing the package.
   only what a VM needs to run is a feature, and the rule that a consumer
   may use the minor version to decide whether optional status is available
   but never refuses a peer or a VM because of it.
+- 2026-10-05: the placement of capability requirements in the API is no
+  longer committed to VirtualMachineClass; the ADR that ships a
+  capability decides it, and DRA device requests would be per-VM claims
+  (ADR 0008 revision of 2026-10-05). A host report whose schema version
+  the node agent does not read is reported `ProtocolIncompatible`, not
+  `RuntimeUnreachable`.

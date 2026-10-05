@@ -62,6 +62,8 @@ Channels across these boundaries:
 | baryon-anchor | baryon-virtd | gRPC on `/run/baryon/anchor/virtd.sock` |
 | baryon-node-agent | baryon-virtd | gRPC on `/run/baryon/node/virtd.sock` |
 | baryon-controller, baryon-node-agent | API server | HTTPS with service account tokens |
+| baryon-node-agent | API server | On SIGTERM, one write of its own VirtualizationNode setting `Ready` and `RuntimeHealthy` to Unknown (`NodeAgentStopped`), within 5 s, with the read `resourceVersion` as a precondition; same field manager and admission policy as the periodic write |
+| API server | baryon-controller, then the VM's status | The message of a refused claim or pod (`ClaimRejected`, `PodRejected`), cut to 1024 bytes, copied into the VM's conditions in the VM's namespace |
 | baryon-node-agent | API server | VirtualizationNode `status.vms` of its own node: per Anchor Pod UID, the DHCP responder state, a reason (at most 64 bytes), a message (at most 1024 bytes), and two times; no VM names, namespaces, addresses, PIDs, paths, or TAP names; at most 256 entries (CRD validation: `state` enum, `maxLength`, `maxItems`) |
 | API server | baryon-controller | VirtualizationNode watch, read for the `NetworkReady` condition of the VMs on each node; the controller takes the reason from the state, never from the node's text, and caps the message at 1024 bytes |
 
@@ -161,7 +163,7 @@ own VM, because a different spec for the same pod is refused.
 | baryon-controller | virtualmachines: get, list, watch, patch, update; status: patch; finalizers: update; virtualmachineclasses: get, list, watch; virtualizationnodes: get, list, watch; pods: get, list, watch, create, delete, patch; persistentvolumeclaims: get, list, watch, create; persistentvolumes: get, patch; events: create, patch. All cluster-wide. | Pod and claim rights are needed to place Anchor Pods and import Pods in VM namespaces. A compromised controller can create or delete pods in any namespace, but the pods it can give the vm or import resource are only those it creates itself. PersistentVolume `get` is cluster-wide, so a compromised controller can read every PersistentVolume spec (backend volume handles, node affinity, mount options). PersistentVolume `patch` and pod `patch` are safe only with `baryon-controller-writes` installed, which limits them to adding the import record once and, on Baryon pods, to the import approval, the `vm-label-keys` annotation, and labels with keys that are not reserved; without the policy a compromised controller could rebind volumes, change reclaim policies, or relabel workloads. Claim `patch` is no longer granted. |
 | `baryon-vm-edit` (ClusterRole, aggregated into `edit` and `admin`) | virtualmachines: get, list, watch, create, update, patch, delete, deletecollection; virtualmachineclasses: get, list, watch | For namespace users (`deploy/base/tenant/roles.yaml`). No `virtualmachines/status`: baryon-controller is its only writer. Nothing on PersistentVolumes. |
 | `baryon-vm-view` (ClusterRole, aggregated into `view`) | virtualmachines, virtualmachineclasses: get, list, watch | Read access for namespace users. |
-| baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Writes are narrowed per node by admission, below. `get` is not: a node agent can read every node's VirtualizationNode, which holds host inventory and, per VM, Anchor Pod UIDs and the responder state, no VM names or addresses. |
+| baryon-node-agent | nodes: get; virtualizationnodes: get, create; status: get, patch. Cluster-wide. | Writes are narrowed per node by admission, below. `get` is not: a node agent can read every node's VirtualizationNode, which holds runtime versions and health and, per VM, Anchor Pod UIDs and the responder state, no VM names or addresses. Host inventory is no longer published (0.1.0-rc1). |
 
 Tenants cannot read VirtualizationNodes: `baryon-vm-edit` and `baryon-vm-view`
 grant nothing on them, and no Baryon role is aggregated into `view`, `edit`,
@@ -175,6 +177,12 @@ node's VirtualizationNode (`baryon-node-agent-own-node`), so it can affect
 only the `NetworkReady` condition of VMs on its own node, within the
 reasons and message bounds above. It cannot change `Ready` or any other
 condition through this path.
+
+A stopping node agent writes its node's conditions once more as Unknown
+(`NodeAgentStopped`). The write carries the `resourceVersion` it read as a
+precondition, so it does not overwrite a newer write of a replacement
+agent on the same node. It cannot reach another node's object. The write
+is best effort: on a reboot the pod network may already be gone.
 
 ### Admission policies
 
@@ -528,11 +536,37 @@ Remaining hardening:
   too (an egress-deny policy for VMs also blocks their imports); a policy
   that selects VMs by `vm-name` does not. Imported images are mode 0600,
   owned by the VM's identity.
+- Source URL validation: since 0.1.0-rc1 the API server accepts only an
+  `http` or `https` URL with a non-empty host and without userinfo
+  (`user:password@`). The importer also refuses userinfo, in the source
+  URL and in redirect targets, which covers VirtualMachines stored before
+  0.1.0-rc1 (`rootDisk` is immutable and the API server ratchets unchanged
+  values, so they are not revalidated). Besides that, the importer refuses
+  only a redirect from HTTPS to HTTP. Query strings are not checked.
 - Source URL exposure: annotations (the import Pod's `import-source`, the
   PersistentVolume record) and Events carry only a digest of the URL
-  (`sha256:<hex>`). The URL itself remains in the VirtualMachine spec,
-  in the import Pod's arguments, and in the filesystem-mode import marker
-  on the volume. URLs must not carry secrets.
+  (`sha256:<hex>`). The URL itself remains in the VirtualMachine spec, in
+  the import Pod's arguments, and in the filesystem-mode import marker on
+  the volume. The importer's log lines and failure messages (which reach
+  the `ImportFailed` condition that namespace `view` users can read) show
+  URLs and redirect targets as scheme, host, port, and path only, without
+  userinfo or query. URLs must not carry secrets.
+- API server messages in VM conditions: when the API server refuses a
+  claim (`ClaimRejected`) or pod (`PodRejected`) that baryon-controller
+  creates for a VM, the message, cut to 1024 bytes, is copied to the VM's
+  conditions in the same namespace. The refusal was made for the
+  controller's identity, so the text can name the controller's service
+  account, the namespace's ResourceQuota and usage, or the message of an
+  admission policy or webhook evaluated against the controller. Policies
+  that treat baryon-controller differently should not put information in
+  their messages that the namespace's users must not see.
+- Host inventory: since 0.1.0-rc1 VirtualizationNodes carry no host
+  inventory. baryon-node-agent logs one `host inventory` line (counts and
+  versions: no PCI addresses or IDs, no IOMMU group membership, no NUMA
+  CPU lists), readable by whoever can read pod logs in `baryon-system`.
+  Inventory fields written by earlier releases are pruned when read and
+  removed at the node agent's next write; etcd backups taken earlier keep
+  them.
 - Block import contract: after a successful import every byte of the
   device is the image's byte at that offset or zero. The importer opens the
   device with `O_EXCL` and `O_NOFOLLOW`, refuses anything but a block
@@ -831,6 +865,18 @@ Baryon's seccomp layer:
 | The reaper of a killed responder waited without bound | Fixed: it waits at most 60 s, then logs a warning and stops waiting |
 | The DHCP responder has no allowlist seccomp filter and no Landlock rules | Open (Future hardening, Designed) |
 | Cloud Hypervisor's query of the TAP MTU in the VMM's empty network namespace may fail silently | Mitigated: the guest gets the pod interface MTU through DHCP option 26; not verified at runtime |
+
+Findings of the 2026-10-05 review of the v0.1 API changes:
+
+| Finding | Severity | State |
+|---|---|---|
+| Validation of `rootDisk` and `className` is not applied to objects stored earlier, and the importer did not refuse userinfo | Low | Fixed for URLs: the importer refuses userinfo in the source URL and redirect targets. Names and sizes of stored objects are not re-checked by the controller; the API server refuses invalid claims and pods it creates from them |
+| Redirect targets were logged in full and could reach `ImportFailed`; the importer did not refuse userinfo in them | Low | Fixed: logs and messages show scheme, host, port, and path only; userinfo refused |
+| The node agent's stop write could overwrite a newer write of the replacement agent on the same node | Low | Fixed: applied with the read `resourceVersion` as a precondition |
+| `ClaimRejected` copies API server text decided for the controller's identity into the VM's conditions | Note | Documented (Data handling) |
+| Host inventory was readable cluster-wide by every node agent through VirtualizationNodes | Note | Fixed: no longer published; logged by the node agent |
+| Explicit nulls passed `has()` checks in CEL rules while the controller saw absent fields | Note | Fixed: `nullable` removed, nulls are pruned; CI case added |
+| Duplicates in `runtime.features` or `status.vms` would fail the node agent's whole status write | Note | Fixed: the node agent removes duplicates before writing |
 
 ## Future hardening
 

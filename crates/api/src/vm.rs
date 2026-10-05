@@ -5,6 +5,11 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, KubeSchema};
 use serde::{Deserialize, Serialize};
 
+/// CEL rule: the value is a DNS-1123 subdomain (the Kubernetes object name
+/// format). A regex, because CEL's format library needs Kubernetes 1.31.
+pub(crate) const DNS1123_SUBDOMAIN: &str =
+    "self.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*$')";
+
 /// Desired state of a VirtualMachine.
 #[derive(CustomResource, KubeSchema, Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[kube(
@@ -30,15 +35,16 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "camelCase")]
 pub struct VirtualMachineSpec {
     /// Name of the VirtualMachineClass that sets vCPUs and memory.
-    #[x_kube(validation = kube::core::Rule::new("self.size() > 0").message("className is required"))]
+    #[x_kube(validation = kube::core::Rule::new(DNS1123_SUBDOMAIN).message("className must be a DNS-1123 subdomain"))]
+    #[schemars(length(min = 1, max = 253))]
     pub class_name: String,
 
     /// Whether the VM should be running. Changing it starts or stops the VM.
     #[serde(default)]
     pub run_policy: RunPolicy,
 
-    /// The disk the VM boots from. Immutable: the disk's content and claim
-    /// are bound to it; create a new VirtualMachine for another disk.
+    /// The VM's root disk. Immutable: the disk's content and claim are bound
+    /// to it; create a new VirtualMachine for another disk.
     #[x_kube(validation = kube::core::Rule::new("self == oldSelf").message("rootDisk is immutable; create a new VirtualMachine to use another disk"))]
     pub root_disk: RootDisk,
 
@@ -133,15 +139,21 @@ pub enum VolumeMode {
 #[serde(rename_all = "camelCase")]
 #[x_kube(validation = kube::core::Rule::new("!has(self.source.http) || has(self.size)").message("size is required when the source is http"))]
 #[x_kube(validation = kube::core::Rule::new("!has(self.volumeMode) || has(self.source.http)").message("volumeMode applies to claims Baryon creates; an existing claim is used with its own volumeMode"))]
+#[x_kube(validation = kube::core::Rule::new("has(self.source.http) || (!has(self.size) && !has(self.storageClassName))").message("size and storageClassName apply only to the claim Baryon creates for an http source"))]
 pub struct RootDisk {
     pub source: DiskSource,
-    /// Virtual disk size. Required for imported disks; the claim requests
-    /// this size and the image is extended to it.
+    /// Virtual disk size, a whole number of bytes from 1Mi to 1Pi. Required
+    /// for an http source. Filesystem mode: the image is extended to
+    /// exactly this size. Block mode: the guest sees the whole device,
+    /// which is at least this size (the provisioner may round up).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[x_kube(validation = kube::core::Rule::new("isQuantity(string(self)) && quantity(string(self)).isInteger() && quantity(string(self)).compareTo(quantity('1Mi')) >= 0 && quantity(string(self)).compareTo(quantity('1Pi')) <= 0").message("size must be a whole number of bytes between 1Mi and 1Pi"))]
     pub size: Option<Quantity>,
-    /// StorageClass for claims created by Baryon. Defaults to the cluster
+    /// StorageClass for the claim Baryon creates. Defaults to the cluster
     /// default StorageClass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[x_kube(validation = kube::core::Rule::new(DNS1123_SUBDOMAIN).message("storageClassName must be a DNS-1123 subdomain"))]
+    #[schemars(length(min = 1, max = 253))]
     pub storage_class_name: Option<String>,
     /// Volume mode of the claim Baryon creates for an imported disk.
     /// Defaults to Filesystem.
@@ -154,8 +166,8 @@ pub struct RootDisk {
 #[serde(rename_all = "camelCase")]
 #[x_kube(validation = kube::core::Rule::new("(has(self.http) ? 1 : 0) + (has(self.persistentVolumeClaim) ? 1 : 0) == 1").message("exactly one of http or persistentVolumeClaim must be set"))]
 pub struct DiskSource {
-    /// Import a raw disk image from an HTTP or HTTPS URL into a filesystem
-    /// mode claim created and owned by the VM.
+    /// Import a raw disk image from an HTTP or HTTPS URL into a claim
+    /// created and owned by the VM, in `rootDisk.volumeMode`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpSource>,
     /// Use an existing claim that already contains a raw disk. In filesystem
@@ -168,7 +180,7 @@ pub struct DiskSource {
 #[serde(rename_all = "camelCase")]
 #[x_kube(validation = kube::core::Rule::new("self.url.startsWith('https://') || has(self.sha256)").message("sha256 is required when the url is plain http"))]
 pub struct HttpSource {
-    #[x_kube(validation = kube::core::Rule::new("self.startsWith('https://') || self.startsWith('http://')").message("url must be http or https"))]
+    #[x_kube(validation = kube::core::Rule::new("isURL(self) && url(self).getScheme() in ['http', 'https'] && url(self).getHostname() != '' && !self.matches('^[a-zA-Z]+://[^/?#]*@')").message("url must be an http or https URL with a host and without credentials"))]
     #[schemars(length(max = 2048))]
     pub url: String,
     /// Expected SHA-256 of the image, hex encoded. Required for plain HTTP;
@@ -179,9 +191,11 @@ pub struct HttpSource {
     pub sha256: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, schemars::JsonSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, KubeSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimSource {
+    #[x_kube(validation = kube::core::Rule::new(DNS1123_SUBDOMAIN).message("claimName must be a DNS-1123 subdomain"))]
+    #[schemars(length(min = 1, max = 253))]
     pub claim_name: String,
 }
 
@@ -217,7 +231,9 @@ pub struct VirtualMachineStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_pod: Option<String>,
     /// Guest addresses. On the pod network these are the Anchor Pod IPs.
+    /// Replaced as a whole on every status write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[x_kube(merge_strategy = kube::core::ListMerge::Atomic)]
     pub addresses: Vec<VmAddress>,
     /// MAC address of the guest NIC. Stable for the life of the VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,16 +243,19 @@ pub struct VirtualMachineStatus {
     pub root_disk_claim: Option<String>,
     /// Set when the root disk claim held an imported or used disk. It only
     /// prevents another import into the same claim; the record on the
-    /// claim's PersistentVolume is the authority (ADR 0006).
+    /// claim's PersistentVolume is the authority (ADR 0006). Internal: may
+    /// change or disappear in any release.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub root_disk_import: Option<RootDiskImportStatus>,
-    /// Number of times the VM was restarted in the current Anchor Pod.
+    /// Number of times the Anchor container restarted in the current Anchor
+    /// Pod (kubelet's count). Starts again from 0 with a new Anchor Pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_count: Option<i32>,
     /// Nodes where this VM cannot run because another VM there runs with
     /// the same host identity. New Anchor Pods avoid them. Cleared when the
-    /// VM is stopped.
+    /// VM is stopped. Internal: may change or disappear in any release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[x_kube(merge_strategy = kube::core::ListMerge::Set)]
     #[schemars(length(max = 16))]
     pub identity_conflict_nodes: Vec<String>,
 }
@@ -246,6 +265,7 @@ pub struct VirtualMachineStatus {
 pub struct VmAddress {
     /// InternalIP for pod network addresses.
     #[serde(rename = "type")]
+    #[schemars(extend("enum" = ["InternalIP"]))]
     pub type_: String,
     pub address: String,
 }

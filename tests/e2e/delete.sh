@@ -97,7 +97,7 @@ metadata:
   name: $huge_class
 spec:
   cpu:
-    cores: 1
+    vcpus: 1
   memory:
     size: 1Ti
 EOF

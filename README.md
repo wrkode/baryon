@@ -9,7 +9,9 @@ and the Baryon host runtime.
 Kubernetes manages the VM. Hadron provides the virtualization host. Cloud
 Hypervisor executes the VM. Kairos manages the machine lifecycle around them.
 
-Baryon is early, pre-release software. The API is `v1alpha1` and will change.
+Baryon is early, pre-release software. The API is `v1alpha1` and will
+change; which parts are contract, the v0.1 freeze, and the change log are
+in [docs/api-stability.md](docs/api-stability.md).
 
 ## Status
 
@@ -26,7 +28,7 @@ entries name the environment they were observed on, summarized in
 
 | Area | Status |
 |---|---|
-| VirtualMachine, VirtualMachineClass, VirtualizationNode API | Implemented; CRD schema and CEL rules, including the immutable `rootDisk`, checked against a k0s API server in CI |
+| VirtualMachine, VirtualMachineClass, VirtualizationNode API | Implemented; CRD schema and CEL rules (the immutable `rootDisk` and class `spec`, the `rootDisk` and class validation) checked against a k0s API server in CI |
 | Controller: Anchor Pods, import Pods, root disk claims, status, finalizer, stop, start, restart | Tested: lifecycle E2E on the k0s cluster, the Hadron k3s node, and the kind host |
 | Deletion in every phase before Ready (importing, booting, unschedulable, stopped) | Tested: deletion E2E on the k0s cluster, the Hadron k3s node, and the kind host |
 | Multi-node operation: one VM per node, controller restart, baryon-virtd restart and outage on one node, VMM crash, Anchor Pod replacement behind a Service, cordon, deleting one VM | Tested: multi-node E2E on the k0s cluster |
@@ -53,7 +55,7 @@ entries name the environment they were observed on, summarized in
 | baryon-virtd accepts only the Anchor container's disk paths, kinds, and `/dev` device nodes | Tested: hostile-disk E2E on the k0s cluster |
 | Runtime protocol versions and feature negotiation (ADR 0012) | Tested: version skew E2E on the k0s cluster with mixed protocol 1.0 and 1.1 hosts, under both cluster releases |
 | Controller recovery after an API server restart | Implemented (short watch backoff); observed after a control-plane node reboot on the k0s cluster: reconciliation resumed shortly after the in-cluster API path returned |
-| Host capability discovery and VirtualizationNode | Implemented; unit tests in CI; the device plugins are exercised by every E2E run |
+| VirtualizationNode (runtime health and versions, heartbeat; the host inventory is logged by the node agent, not published) | Implemented; unit tests in CI; the device plugins are exercised by every E2E run. `NodeAgentStopped` on node agent shutdown: Tested (node-agent-outage E2E) |
 | Baryon-enabled Hadron image | Tested with k0s (three nodes) and k3s (one node), each provisioned from an AuroraBoot raw EFI disk and a cloud-config |
 | Per-VM log retention (14 days; a running VM's log directory is kept) | Tested: manual procedure on the Hadron k3s node |
 | Node reboot with running VMs | Tested: manual procedure on the k0s cluster and the Hadron k3s node; a clean guest shutdown needs kubelet graceful node shutdown |
@@ -106,7 +108,7 @@ metadata:
   name: general-small
 spec:
   cpu:
-    cores: 2
+    vcpus: 2
   memory:
     size: 2Gi
 ---
@@ -135,6 +137,7 @@ debian   True    GuestBooted   node1   10.244.1.30   62s
 |---|---|
 | [architecture.md](docs/architecture.md) | components, ownership, request flow |
 | [api.md](docs/api.md) | API reference |
+| [api-stability.md](docs/api-stability.md) | API contract, v0.1 freeze, change log per release |
 | [runtime-boundary.md](docs/runtime-boundary.md) | experiments and evidence behind the runtime design |
 | [networking.md](docs/networking.md), [storage.md](docs/storage.md) | data paths |
 | [security.md](docs/security.md) | threat model and privileges |

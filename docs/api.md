@@ -5,14 +5,16 @@ with `cargo run -p baryon-api --bin baryon-crdgen` into
 `deploy/base/crds/virtualization.baryon.io.yaml`; `hack/verify-crds.sh` fails when
 they are stale. Design rationale: ADR 0008.
 
-Status: Implemented. The API is alpha and may change incompatibly.
+Status: Implemented. The API is alpha and may change incompatibly. Which
+parts are contract, the v0.1 freeze, and the change log per release are in
+[api-stability.md](api-stability.md).
 
 ## VirtualMachineClass (cluster-scoped, short name `bvmclass`)
 
 | Field | Type | Description |
 |---|---|---|
-| `spec.cpu.cores` | integer, 1 to 256 | vCPUs. Also the Anchor Pod CPU request and limit. |
-| `spec.memory.size` | quantity | Guest memory. At least 64Mi and a whole number of Mi. |
+| `spec.cpu.vcpus` | integer, 1 to 256, required | Number of virtual CPUs. Also the Anchor Pod CPU request and limit. Says nothing about the guest's CPU topology. |
+| `spec.memory.size` | quantity | Guest memory: a whole number of Mi from 64Mi to 16Ti. |
 
 ```yaml
 apiVersion: virtualization.baryon.io/v1alpha1
@@ -21,10 +23,27 @@ metadata:
   name: general-small
 spec:
   cpu:
-    cores: 2
+    vcpus: 2
   memory:
     size: 2Gi
 ```
+
+`spec` is immutable (CEL rule, message `VirtualMachineClass spec is
+immutable; create a new class and change the VMs' className`). To change
+the shape of VMs, create a new class and set the VMs' `className` to it.
+A running VM whose vCPUs or memory change this way reports
+`RestartRequired` (`SpecChanged`) and gets the new shape at its next
+start.
+
+`cpu.vcpus` replaced `cpu.cores` in 0.1.0-rc1. A class stored before
+that change has no `cpu.vcpus` (the API server drops `cpu.cores` when it
+reads the object). Such a class may be updated once to the current shape,
+for example with `kubectl apply`; after that it is immutable. Until then,
+a VM that starts with it reports `InvalidClass` with the message
+"VirtualMachineClass <name> has no cpu.vcpus; apply it again with
+cpu.vcpus". VMs that already run keep running. A new class without
+`cpu.vcpus` is rejected (`cpu.vcpus is required`). See
+[compatibility.md](compatibility.md#upgrade-to-010-rc1).
 
 ## VirtualMachine (namespaced, short name `bvm`, category `baryon`)
 
@@ -36,13 +55,13 @@ by a CEL rule): it is the guest hostname and the value of the
 
 | Field | Type | Description |
 |---|---|---|
-| `className` | string, required | VirtualMachineClass name. |
+| `className` | string, required, DNS-1123 subdomain, 1 to 253 characters | VirtualMachineClass name. |
 | `runPolicy` | `Running` (default) or `Stopped` | Whether the VM runs. |
-| `rootDisk.source.http.url` | string, at most 2048 characters | Raw disk image to import, `http://` or `https://`. A plain `http://` URL requires `sha256`. Must not carry secrets (tokens, credentials): the URL appears in the VirtualMachine, in the import Pod's arguments, and in the filesystem-mode import marker. Annotations and Events carry only `sha256:` and the hex SHA-256 of the URL. |
-| `rootDisk.source.http.sha256` | string, exactly 64 hex characters | Expected image SHA-256. Required when `url` is plain `http://`; recommended for `https://`. |
-| `rootDisk.source.persistentVolumeClaim.claimName` | string | Existing claim with a raw disk: `disk.img` at the volume root (filesystem mode) or the whole device (block mode). |
-| `rootDisk.size` | quantity | Virtual disk size. Required for `http`. |
-| `rootDisk.storageClassName` | string | StorageClass of the claim Baryon creates. Default StorageClass when unset. |
+| `rootDisk.source.http.url` | string, at most 2048 characters | Raw disk image to import: an `http` or `https` URL with a host and without credentials (`user:password@` is rejected). A plain `http://` URL requires `sha256`. Must not carry secrets such as tokens in the path or query: the URL appears in the VirtualMachine, in the import Pod's arguments, in the filesystem-mode import marker, and can appear in the `ImportFailed` message. Annotations and Events carry only `sha256:` and the hex SHA-256 of the URL. |
+| `rootDisk.source.http.sha256` | string, exactly 64 hex characters | Expected image SHA-256. Required when `url` is plain `http://`; recommended for `https://` (see [Root disk size and import identity](#root-disk-size-and-import-identity)). |
+| `rootDisk.source.persistentVolumeClaim.claimName` | string, DNS-1123 subdomain, 1 to 253 characters | Existing claim with a raw disk: `disk.img` at the volume root (filesystem mode) or the whole device (block mode). |
+| `rootDisk.size` | quantity, a whole number of bytes from 1Mi to 1Pi | Virtual disk size. Required for `http`; rejected with `persistentVolumeClaim`. See [Root disk size and import identity](#root-disk-size-and-import-identity). |
+| `rootDisk.storageClassName` | string, DNS-1123 subdomain, 1 to 253 characters | StorageClass of the claim Baryon creates. Default StorageClass when unset. Rejected with `persistentVolumeClaim`. |
 | `rootDisk.volumeMode` | `Filesystem` (default) or `Block` | Volume mode of the claim Baryon creates for an `http` source. Not allowed with `persistentVolumeClaim`: an existing claim is used in its own volume mode. |
 | `networks` | list-map keyed by `name`, at most 8 entries | `name` is a DNS-1123 label (1 to 63 characters). v1alpha1 accepts exactly one entry, with `pod: {}`. Defaults to `[{name: default, pod: {}}]`. |
 | `placement.nodeSelector` | map of strings | Node labels the node must have. See [Placement](#placement). |
@@ -57,15 +76,56 @@ VirtualMachine to use another disk`). The disk's content and claim are bound
 to it: to use another disk or image, create a new VirtualMachine. Growing a
 disk needs an explicit flow (Planned).
 
-Exactly one of `http` and `persistentVolumeClaim` must be set; the API server
-enforces this, the size requirement, the URL scheme, the digest for plain
-HTTP (`sha256 is required when the url is plain http`), and the single pod
-network with CEL rules. The CI API server checks (a k0s API server, see
+Exactly one of `http` and `persistentVolumeClaim` must be set. The API
+server enforces this and the following with CEL rules and schema limits:
+
+- `size` is required for `http` and is a whole number of bytes from 1Mi to
+  1Pi (`size must be a whole number of bytes between 1Mi and 1Pi`); both
+  `4Gi` and an integer number of bytes are accepted
+- `size` and `storageClassName` apply only to the claim Baryon creates:
+  they are rejected with `persistentVolumeClaim` (`size and
+  storageClassName apply only to the claim Baryon creates for an http
+  source`), and so is `volumeMode`
+- `className`, `storageClassName`, and `claimName` are DNS-1123
+  subdomains, the Kubernetes object name format: lowercase letters,
+  digits, `-`, and `.`, 1 to 253 characters
+- `url` is an `http` or `https` URL with a host and without credentials
+  (`url must be an http or https URL with a host and without credentials`)
+- a plain `http` URL needs `sha256` (`sha256 is required when the url is
+  plain http`)
+- exactly one network, the pod network
+
+The CI API server checks (a k0s API server, see
 [testing.md](testing.md#api-server-checks)) confirm that a VM with two disk
-sources, a plain-HTTP source without `sha256`, a name with a dot, and a
-change of `rootDisk` are rejected, and that a change of `runPolicy` is
+sources, a plain-HTTP source without `sha256`, a name with a dot, a change
+of `rootDisk`, the invalid sizes `0`, `100m`, `512Ki`, `banana`, and
+`2Pi`, an empty or invalid `claimName`, `size` or `storageClassName` with
+an existing claim, an empty `storageClassName`, a URL with credentials, a
+URL without a host, an `ftp` URL, and a `className` that is not a DNS-1123
+subdomain are rejected, and that a change of `runPolicy`, a size of `4Gi`
+or of `4294967296` bytes, and an existing claim named `disk.v1` are
 accepted. The placement rules and their checks are in
 [Placement](#placement).
+
+### Root disk size and import identity
+
+`rootDisk.size` is the size of the disk the guest sees in filesystem
+mode, and the minimum in block mode:
+
+| Volume mode of the claim Baryon creates | Claim request | What the guest sees |
+|---|---|---|
+| `Filesystem` (default) | `size` plus 64 MiB, rounded up to a whole MiB, for the import marker and the filesystem's own metadata | `disk.img`, extended to exactly `size` |
+| `Block` | exactly `size`, rounded up to a whole MiB | the whole device, which is at least `size`; the provisioner may round the volume up |
+
+The importer refuses an image larger than `size`. Releases before
+0.1.0-rc1 also added 64 MiB to block-mode claims.
+
+Baryon identifies an import by the SHA-256 of the URL, not by the image
+content: the import record and the import Pod carry `sha256:` and the hex
+digest of the URL. A URL whose content changes over time, such as a
+`latest` path, gives different VMs different images, and Baryon does not
+notice. Set `sha256` to pin the content; the importer then refuses any
+other image.
 
 The import runs in a separate import Pod, `<vm>-import`, before the VM's
 first Anchor Pod exists (see [architecture.md](architecture.md#import-pod-implemented-tested-by-the-deletion-and-storage-e2e-on-the-k0s-cluster)).
@@ -74,10 +134,12 @@ the same digest rule on its own, refuses a redirect from HTTPS to plain HTTP,
 and resolves relative redirect locations against the current URL path. It
 refuses an image larger than `rootDisk.size` before writing past it.
 
-The root disk claim layout is a stable format of v1alpha1: in filesystem
-mode, `disk.img` at the volume root, plus `.baryon-import.json` (the import
-marker) for imported disks. A claim prepared outside Baryon must follow it.
-In block mode the disk is the whole device.
+The root disk claim layout is contract
+([api-stability.md](api-stability.md#the-contract)): in filesystem mode,
+`disk.img` at the volume root; in block mode, the whole device. A claim
+prepared outside Baryon must follow it and needs nothing else. The
+importer also writes `.baryon-import.json` (the import marker) next to an
+imported `disk.img`; its content is internal.
 
 A completed import is recorded by baryon-controller in the annotation
 `virtualization.baryon.io/disk-import` on the claim's bound
@@ -99,12 +161,39 @@ VirtualMachine with an `http` source imports only into a volume that was
 dynamically provisioned for the claim Baryon created, and refuses
 anything else (see the storage reasons below).
 
-To restart a running VM, set the `virtualization.baryon.io/restartedAt`
-annotation to a new value:
+### Restarting a VM
+
+To restart a running VM, set the annotation
+`virtualization.baryon.io/restartedAt` to a new non-empty value:
 
 ```bash
 kubectl annotate virtualmachine debian --overwrite virtualization.baryon.io/restartedAt="$(date -u +%FT%TZ)"
 ```
+
+The contract:
+
+- A value that differs from the one the current Anchor Pod was created
+  with restarts a running VM exactly once: baryon-controller deletes the
+  Anchor Pod (event `Restarting`) and creates a new one that carries the
+  value.
+- The value is opaque to Baryon; an RFC 3339 time, as above, is
+  recommended. An empty value requests nothing.
+- Removing the annotation does nothing. Releases before 0.1.0-rc1
+  reported `RestartRequired` with reason `SpecChanged` after a removal;
+  that was a bug.
+- Only a difference from the current Anchor Pod's value counts. For
+  example, removing the annotation and then setting it back to the value
+  the current Anchor Pod was created with does nothing.
+- On a stopped VM the annotation has no effect: there is no Anchor Pod to
+  replace, and the next start creates one anyway.
+- It is an annotation, so it does not change `metadata.generation`.
+- Anchor Pods created by a restart request of an earlier release still
+  match after an upgrade and are not reported as `RestartRequired`.
+
+Status: Implemented; unit test for the hash rule
+(`crates/controller/src/anchor.rs`, `restart_requests_do_not_change_the_hash`).
+The restart itself is Tested by the lifecycle E2E (see
+[testing.md](testing.md#e2e-tests)), also with this change.
 
 ### Placement
 
@@ -119,6 +208,14 @@ copies `nodeSelector`, `affinity`, `tolerations`,
 and Anchor Pod, and the Kubernetes scheduler places those pods. Baryon never
 picks a node. Other pod fields, such as `nodeName` and `schedulerName`, are
 not part of the API.
+
+Because the fields are copied to pods, they have the meaning and the
+availability they have in the cluster's Kubernetes version: a field or
+behavior that the cluster's Kubernetes version does not support (for
+example a newer `topologySpreadConstraints` field) behaves on VM pods as
+it does on any pod there. An empty `placement: {}` places the VM like no
+placement, and changing between `placement: {}` and no placement does not
+report `PlacementChanged`.
 
 ```yaml
 apiVersion: virtualization.baryon.io/v1alpha1
@@ -194,8 +291,11 @@ Priority and node failure:
   `node.kubernetes.io/unreachable` only delays the eviction of the VM's pod
   from a failed node, and with it the VM's replacement. It does not change
   fencing: the Anchor Pod object stays until it is deleted, and no new
-  Anchor Pod is created before (ADR 0004). Inferred from the fencing rule;
-  not tested.
+  Anchor Pod is created before (ADR 0004). Such a toleration without
+  `tolerationSeconds` keeps the VM on a dead node indefinitely: the pod is
+  never evicted, so the VM does not start anywhere else until someone
+  deletes the Anchor Pod. Inferred from the fencing rule and the
+  Kubernetes taint-based eviction behavior; not tested.
 
 Changes: placement is not applied to a running VM. The Anchor Pod carries
 the annotation `virtualization.baryon.io/placement-hash`; when the VM's
@@ -226,35 +326,128 @@ Hypervisor features) are not part of placement. Baryon consumes none of
 them today: VFIO, hugepage-backed guest memory, and NUMA pinning are Not
 supported. KVM and runtime health are already enforced by the
 `virtualization.baryon.io/vm` slot. A capability gets a name in the API
-only when Baryon consumes it and it is tested; the Designed direction is
-recorded in ADR 0012. VirtualizationNode reports host capabilities for
-information only.
+only when Baryon consumes it and it is tested; where its requirement goes
+in the API is decided by the ADR that ships it (ADR 0012). VirtualizationNode
+does not publish host inventory; baryon-node-agent logs it
+([VirtualizationNode](#virtualizationnode-cluster-scoped-short-name-vnode)).
 
 ### Status
 
 | Field | Description |
 |---|---|
-| `conditions` | See below. |
+| `conditions` | See [Condition contract](#condition-contract). |
 | `nodeName` | Node of the current Anchor Pod. |
-| `anchorPod` | Name of the current Anchor Pod (`<vm>-anchor`). |
-| `addresses` | Guest addresses, the Anchor Pod IPs, type `InternalIP`. |
+| `anchorPod` | Name of the current Anchor Pod. Use this field instead of deriving the name from the VM name. |
+| `addresses` | Guest addresses: the Anchor Pod IPs. Each entry has `type` (only `InternalIP`) and `address`. An atomic list: every status write replaces it as a whole. |
 | `macAddress` | Guest MAC address, stable for the life of the VM. |
-| `rootDiskClaim` | Claim holding the root disk. |
-| `rootDiskImport.claimUID` | Set by baryon-controller when the root disk claim with this UID held an imported or used disk; reset when the claim is recreated. A one-way marker that only prevents another import into the same claim. It is not an API guarantee and must not be relied on: the record on the PersistentVolume is the authority (ADR 0006). |
-| `restartCount` | Restarts of the current Anchor Pod's anchor container (each one restarts the VM). Resets to 0 when the Anchor Pod is replaced (stop and start, restart request, node reboot). |
-| `identityConflictNodes` | Nodes where this VM cannot run because another VM there has the same host identity (at most 16). New Anchor Pods avoid them. Cleared when the VM is stopped. |
+| `rootDiskClaim` | Claim holding the root disk. Use this field instead of deriving the name from the VM name. |
+| `restartCount` | Restarts of the Anchor container in the current Anchor Pod, as kubelet counts them (each one restarts the VM). Starts again from 0 with a new Anchor Pod (stop and start, restart request, node reboot). |
 | `observedGeneration` | Generation the status was computed for. |
+| `rootDiskImport.claimUID` | Internal; may change or disappear in any release. Set by baryon-controller when the root disk claim with this UID held an imported or used disk; reset when the claim is recreated. A one-way marker that only prevents another import into the same claim; the record on the PersistentVolume is the authority (ADR 0006). |
+| `identityConflictNodes` | Internal; may change or disappear in any release. Nodes where this VM cannot run because another VM there has the same host identity (a set, at most 16). New Anchor Pods avoid them. Cleared when the VM is stopped. |
 
-Conditions:
+Optional fields are not nullable in the CRD schemas: an explicit `null`
+is dropped by the API server, the same as an absent field.
 
-| Type | True when | Typical reasons when False |
+#### Condition contract
+
+Status: Implemented; the derivation is covered by unit tests in
+`crates/controller/src/status.rs` and `crates/node-agent/src/publisher.rs`.
+
+| | VirtualMachine | VirtualizationNode |
 |---|---|---|
-| `Scheduled` | The Anchor Pod is bound to a node. | `Pending`, `Unschedulable`, `PodRejected`, `Stopped`, `ClassNotFound`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and while the disk is not ready the `StorageReady` reason |
-| `StorageReady` | The claim is bound and the disk is in place: for an `http` source, its import is recorded on the PersistentVolume. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict`, and the import refusals `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` |
-| `Running` | The Anchor container is running; it runs or starts the VMM (reason `AnchorRunning`). It does not by itself mean that the VMM runs. | `Starting`, `Stopping`, `Stopped`, `Pending`, and the failure reasons below |
-| `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `PodRejected`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
-| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running and answering liveness probes (reason `AddressServiceRunning`). Derived only while `Running` is True; see [NetworkReady](#networkready). | `DhcpResponderRestarting`, `DhcpResponderFailing`. Unknown: `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning` |
-| `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (`spec.placement` changed, see [Placement](#placement)), or `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` |
+| Only writer | baryon-controller | baryon-node-agent on that node |
+| Types | `Scheduled`, `StorageReady`, `Running`, `Ready`, `NetworkReady`, `RestartRequired` | `Ready`, `RuntimeHealthy` |
+| `observedGeneration` on each condition | the VM generation the status was computed for | not set (no spec) |
+| When the conditions count | always; compare `observedGeneration` with `metadata.generation` after a spec change | only while `status.heartbeatTime` is within 90 s; otherwise treat them as Unknown ([VirtualizationNode](#virtualizationnode-cluster-scoped-short-name-vnode)) |
+
+Rules for every condition:
+
+- Transitions: `lastTransitionTime` changes only when the status
+  (`True`, `False`, `Unknown`) changes. The reason and message can change
+  while the status stays the same.
+- Reasons: the Baryon reasons listed in this section are contract
+  ([api-stability.md](api-stability.md#the-contract)). Reasons that
+  baryon-controller copies from the scheduler and kubelet, such as
+  `Unschedulable`, `SchedulingGated`, `ContainerCreating`,
+  `CrashLoopBackOff`, `ErrImagePull`, and `CreateContainerConfigError`,
+  are not Baryon contract: Kubernetes defines them.
+- Messages are human text, not for parsing, and can change in any
+  release. Messages that baryon-controller copies from the scheduler, the
+  API server (`PodRejected`, `ClaimRejected`), or a node (`NetworkReady`)
+  are cut to at most 1024 bytes. Failure messages from the Anchor
+  container's termination message are at most 4000 bytes (baryon-anchor
+  cuts them); kubelet's waiting messages are copied as kubelet wrote
+  them. Baryon puts no secrets in messages. The `ImportFailed` message can
+  contain the source URL or a redirect location, for example `GET <url>
+  returned 404 Not Found`, which is one reason the URL must not carry
+  secrets. Events never contain the source URL.
+
+VirtualMachine conditions:
+
+| Type | Meaning | True | False | Unknown |
+|---|---|---|---|---|
+| `Scheduled` | The current Anchor Pod is bound to a node. | `Scheduled` | There is no Anchor Pod, or it is not bound; the reasons are in [Not running reasons](#not-running-reasons). | not used |
+| `StorageReady` | The root disk claim exists and is bound, and for an `http` source its import is recorded on the PersistentVolume. For a `persistentVolumeClaim` source, a bound claim; its content is not checked. | `DiskReady` | See [StorageReady reasons](#storageready-reasons). | not used |
+| `Running` | The Anchor container of the current Anchor Pod runs. It runs the VMM or is starting it, and a VMM exit ends the container. It is not evidence that the guest runs; that is `Ready`. | `AnchorRunning` | See [Not running reasons](#not-running-reasons). | not used |
+| `Ready` | The guest produced boot evidence in the current VMM run: it acquired its address over DHCP or showed a console login prompt. | `GuestBooted` | `Booting` while `Running` is True; otherwise the `Running` reason. | not used |
+| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running and answering liveness probes. Derived only while `Running` is True. | `AddressServiceRunning` | `DhcpResponderRestarting`, `DhcpResponderFailing` | `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning`; see [NetworkReady](#networkready) |
+| `RestartRequired` | The current Anchor Pod differs from the pod baryon-controller would create now; the difference applies at the next start. | `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (see [Placement](#placement)), `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` | not used |
+
+How the VM conditions relate:
+
+- `Ready` True implies `Running` True: both come from the same Anchor
+  container.
+- `Ready` is latched per VMM run: once the guest showed boot evidence,
+  `Ready` stays True until the VMM exits or the Anchor Pod stops, also
+  across a reboot inside the guest. It turns False when the anchor cannot
+  reach baryon-virtd for 30 s (ADR 0008).
+- `StorageReady` can be False while a running VM stays `Ready`: an
+  existing Anchor Pod decides `Running` and `Ready`, and a storage problem
+  found later, such as a missing import record, matters for the next
+  start.
+- No condition reports the health of applications in the guest. `Ready`
+  means boot evidence was observed, not that every guest service is up;
+  on a disk's first boot the guest typically becomes reachable a few
+  seconds later.
+
+##### Not running reasons
+
+False reasons of `Scheduled`, `Running`, and `Ready` (for `Ready` also
+`Booting`, above). Reasons marked "no pod" are reported only while there
+is no Anchor Pod; while a pod exists, the pod decides.
+
+| Reason | Conditions | Meaning |
+|---|---|---|
+| `Pending` | all three | Creating the Anchor Pod, or the pod is not bound and the scheduler gave no reason. |
+| `Stopped` | all three, no pod | `runPolicy` is `Stopped`. |
+| `Stopping` | `Running`, `Ready` | The Anchor Pod is being deleted; the guest is shutting down. |
+| `Starting` | `Running`, `Ready` | The Anchor container has not started, or waits without a kubelet reason. |
+| `ClassNotFound` | all three, no pod | The VirtualMachineClass does not exist. |
+| `InvalidClass` | all three, no pod | The class has no `cpu.vcpus` (stored before 0.1.0-rc1) or an unusable `memory.size`. |
+| `InvalidSpec` | all three, no pod; `Running` and `Ready` also with a pod | The spec cannot be used, for example `rootDisk.size` cannot be read. With a pod: baryon-anchor could not use its VM spec. |
+| `ClaimNotFound` | all three, no pod; also `StorageReady` | The claim named in `rootDisk.source.persistentVolumeClaim` does not exist. |
+| `ClaimConflict` | all three, no pod; also `StorageReady` | A claim with the name Baryon uses for this VM's root disk exists and this VM does not own it. |
+| `ClaimRejected` | all three, no pod; also `StorageReady` | The API server refused the root disk claim Baryon creates (HTTP 422 or 403). See below. |
+| `ClaimInUse` | all three, no pod | A Baryon pod of another VirtualMachine uses the root disk claim. See below. |
+| `AnchorPodConflict` | all three | A pod with the Anchor Pod's name exists that this VM does not control. See below. |
+| `ImportPodConflict` | all three, no pod | A pod with the import Pod's name exists that this VM does not control. See below. |
+| `PodRejected` | all three, no pod | The API server refused the import Pod or the Anchor Pod (HTTP 422 or 403). See below. |
+| the `StorageReady` reason | all three | While the disk is not ready and no Anchor container runs, for example `ImportingDisk` or an import refusal. |
+| failure reasons | `Running`, `Ready` | The previous run of the Anchor container ended with a reason from baryon-virtd or baryon-anchor; see [Failure reasons](#failure-reasons). |
+| `VmStopped` | `Running`, `Ready` | The Anchor container's termination message has no `Reason:` prefix; the message is the termination message. |
+
+##### StorageReady reasons
+
+| Reason | Meaning |
+|---|---|
+| `ClaimNotFound`, `ClaimConflict`, `ClaimRejected` | The claim problem found while resolving the disk; the same reason and message as on `Scheduled` and `Ready`. |
+| `ClaimMissing` | There is no root disk claim to report for another reason, for example `InvalidSpec`; the reason on `Scheduled` and `Ready` says why. |
+| `ClaimPending` | The claim is not bound yet. `WaitForFirstConsumer` claims bind when the import Pod or the Anchor Pod is scheduled. |
+| `ImportPending` | The claim is bound and the import Pod has not started its importer. |
+| `ImportingDisk` | The importer runs, or it finished and baryon-controller has not yet recorded the import. |
+| `ImportFailed` | The importer failed; the message says why. An importer that ended without a message (for example killed for exceeding its memory) is reported with its exit code. |
+| `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` | Import refusals; see [Import refusals](#import-refusals). |
 
 Precedence: an existing Anchor Pod decides `Running` and `Ready`. Class or
 spec problems such as `ClassNotFound` are shown only when there is no Anchor
@@ -296,12 +489,27 @@ cut to 1024 bytes. baryon-controller looks at such a VM again every 60 s,
 because a quota that frees up or a PriorityClass created later can make the
 pod acceptable; otherwise fix the placement or the namespace policy.
 
+`ClaimRejected`: the API server refused to create the root disk claim
+for an `http` source (HTTP 422 or 403), for example for an exceeded
+storage quota or an admission policy that does not allow the claim's
+StorageClass. `StorageReady`, `Scheduled`, `Running`, and `Ready` carry
+the reason and the API server's message, cut to 1024 bytes. Releases
+before 0.1.0-rc1 only logged the refusal. As for `PodRejected`,
+baryon-controller tries again every 60 s while `ClaimRejected` is the
+reason on `Ready`, because a quota that frees up or a StorageClass created
+later can make the claim acceptable. Fix the cause, for example the
+namespace's quota; `storageClassName` itself cannot be changed because
+`rootDisk` is immutable, so a wrong StorageClass needs a new
+VirtualMachine.
+
 `ImportingDisk` with the message "the importer finished; recording the
 import": the importer exited 0 and baryon-controller has not yet written
 the record on the PersistentVolume. An importer's exit code alone never
 makes the disk ready.
 
-Import refusals. None of them imports or starts the VM, and their messages
+##### Import refusals
+
+None of them imports or starts the VM, and their messages
 name the adoption path (`rootDisk.source.persistentVolumeClaim` in a new
 VirtualMachine) where it applies. baryon-controller does not watch
 PersistentVolumes; it looks at a refused VM again every 120 s, and at one
@@ -316,26 +524,30 @@ in `DiskBindingPending` every 30 s.
 | `ImportStateUnknown` | A block-mode claim that held an imported or used disk (`status.rootDiskImport`, or a ready disk of an earlier release) has no record on its volume. Restoring the record lets the VM start on the existing disk. |
 | `DiskBindingPending` | A VirtualMachine of an earlier release is being migrated, and the record cannot be written until the claim and the volume are bound to each other. |
 
-Failure reasons come from baryon-virtd through the anchor container's
-termination message (`Reason: detail`). `AttachRefused` means baryon-virtd
-refused the attach without a more specific reason, for example an invalid
-VM spec.
-`IdentityConflict` means baryon-virtd refused the VM on its node because
-another VM there runs with the same host identity (see
-[Host identity](#host-identity)). `ProtocolIncompatible` and
-`UnsupportedFeature` come from the runtime protocol negotiation (ADR 0012).
-`StorageFailed` covers a disk that baryon-virtd refuses to hand to the VMM,
-for example a path or file kind the Anchor container does not use for its
-disk, or a device node outside the container's `/dev`. `DiskInUse`: another
-VM on the node already uses the same block device.
-`BlockDeviceAccessDenied`: the block device node is not readable and
-writable by the VM's host identity; the container runtime must give block
-volume devices the pod's `runAsUser` and `runAsGroup` (containerd:
-`device_ownership_from_security_context = true`, see
-[compatibility.md](compatibility.md#csi-requirements)).
-`Ready=True` means boot evidence was observed, not that every guest service
-is up; on a disk's first boot the guest typically becomes reachable a few
-seconds later.
+##### Failure reasons
+
+Failure reasons reach `Running` and `Ready` through the Anchor
+container's termination message (`Reason: detail`), written by
+baryon-anchor from baryon-virtd's last VM status or from its own checks.
+They describe the previous run of the Anchor container in the current
+Anchor Pod.
+
+| Reason | Source | Meaning |
+|---|---|---|
+| `AttachRefused` | baryon-virtd | baryon-virtd refused the attach without a more specific reason, for example an invalid VM spec. |
+| `IdentityConflict` | baryon-virtd | Another VM on the node runs with the same host identity; baryon-controller places the VM elsewhere (see [Host identity](#host-identity)). |
+| `ProtocolIncompatible`, `UnsupportedFeature` | runtime protocol negotiation | The node's baryon-virtd speaks another major version, or lacks a feature the VM needs (ADR 0012). |
+| `InvalidSpec` | baryon-anchor | The anchor could not use the VM spec it was given. |
+| `StorageFailed` | baryon-virtd | baryon-virtd refuses to hand the disk to the VMM, for example a path or file kind the Anchor container does not use for its disk, or a device node outside the container's `/dev`. |
+| `DiskInUse` | baryon-virtd | Another VM on the node already uses the same block device. |
+| `BlockDeviceAccessDenied` | baryon-virtd | The block device node is not readable and writable by the VM's host identity; the container runtime must give block volume devices the pod's `runAsUser` and `runAsGroup` (containerd: `device_ownership_from_security_context = true`, see [compatibility.md](compatibility.md#csi-requirements)). |
+| `ResourcesInvalid`, `ResourcesUnbounded`, `ResourcesExceedPodLimits` | baryon-virtd | The Anchor container's cgroup limits cannot be read, are not set, or are smaller than the VM needs. |
+| `NetworkFailed` | baryon-virtd | The TAP or the network handoff in the pod network namespace failed. |
+| `CgroupFailed`, `CgroupDriverUnsupported` | baryon-virtd | The VMM could not be placed in the Anchor container's cgroup, or that cgroup is not a systemd scope (kubelet cgroupfs driver, Not supported). |
+| `RuntimeDirFailed` | baryon-virtd | The VM's runtime directory could not be created. |
+| `KvmUnavailable`, `VmmStartFailed` | baryon-virtd | KVM was not usable, or Cloud Hypervisor did not start. |
+| `VmmKilled`, `VmmExited`, `VmmFailed`, `OutOfMemory` | baryon-virtd | The VMM was killed by a signal, exited while baryon-virtd was not its parent, failed with an error, or was killed by the OOM killer in the pod cgroup. |
+| `GuestPoweredOff` | baryon-virtd | The guest shut down; the Anchor container exits and kubelet starts it again, which restarts the VM. |
 
 #### NetworkReady
 
@@ -363,7 +575,7 @@ is down (`tests/e2e/node-agent-outage.sh`: `NetworkReady` stayed Unknown,
 | True | `AddressServiceRunning` | The responder runs and its DHCP serving loop answers liveness probes (message: "the DHCP responder for the guest runs and answers liveness probes"). It does not show that the guest can get or renew a lease, or that the pod network passes traffic. |
 | False | `DhcpResponderRestarting` | The responder stopped serving and baryon-virtd restarts it with backoff of at most 60 s. The message names the cause: it stopped, it stopped answering liveness probes, or it wrote output that breaks its protocol. |
 | False | `DhcpResponderFailing` | The responder failed more than 10 times in a row; baryon-virtd keeps restarting it every 60 s. The message names the cause of the last failure. |
-| Unknown | `RuntimeUnreachable` | The node has no report, its report is stale (the controller has not seen its heartbeat change for 90 s), or its `RuntimeHealthy` condition is not True (its reason is in the message). |
+| Unknown | `RuntimeUnreachable` | The node has no report, its report is stale (the controller has not seen its heartbeat change for 90 s), or its `RuntimeHealthy` condition is not True (its reason is in the message, for example `NodeAgentStopped` right after the node agent was stopped). |
 | Unknown | `RuntimeDoesNotReport` | The node's baryon-virtd speaks runtime protocol 1.1 or earlier and does not report the responder. |
 | Unknown | `NotReported` | The node's report has no entry for the current Anchor Pod. On a VM's first start this lasts until the responder has answered its first liveness probe and the node agent has reported it. |
 | Unknown | `NotRunning` | The VM is not running on a node. |
@@ -399,6 +611,14 @@ baryon-controller emits a Warning event `NetworkNotReady` each time
 `NetworkReady` changes to False, and a Normal event `NetworkReady` only
 when it changes from False to True, not on every start.
 
+During a node agent rollout, the VMs on a node whose node agent is being
+replaced can show `NetworkReady` Unknown with reason `RuntimeUnreachable`
+and the message "the node's Baryon runtime is not healthy
+(NodeAgentStopped); the state of the guest network service is unknown"
+until the new node agent publishes. No Warning event
+is emitted for it, because events fire only on a change to False. `Ready`
+is not affected.
+
 ### kubectl
 
 ```
@@ -428,7 +648,16 @@ spec:
     source:
       http:
         url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.raw
+        # Recommended: pin the image content. Download the image once,
+        # compute its SHA-256 (sha256sum), and set it here.
+        # sha256: <64 hex characters>
 ```
+
+The URL above is a `latest` path, whose content changes when Debian
+publishes a new image. Without `sha256`, two VMs created at different times can
+get different images, because Baryon identifies the import by the URL
+digest, not by the content (see
+[Root disk size and import identity](#root-disk-size-and-import-identity)).
 
 ### Labels on objects Baryon creates
 
@@ -444,6 +673,10 @@ spec:
 |---|---|---|
 | `virtualization.baryon.io/vm-label-keys` | Anchor Pods | comma-separated keys of the VM labels Baryon copied |
 | `virtualization.baryon.io/placement-hash` | Anchor Pods | hash of the placement the pod was created with |
+
+The `vm-name` and `vm-uid` labels and the copy rule below are contract
+([api-stability.md](api-stability.md#the-contract)); the annotations are
+internal and can change in any release.
 
 VM labels: baryon-controller copies the VirtualMachine's labels to the
 Anchor Pod and the import Pod when it creates them, and keeps them in sync
@@ -507,26 +740,78 @@ One object per Baryon node, named after the Node and owned by it, written
 only by the baryon-node-agent on that node (enforced by the
 `baryon-node-agent-own-node` admission policy in `deploy/base/policy/`). No spec.
 
+It reports whether the node can run Baryon VMs, its runtime versions,
+and its runtime health. It does not publish host inventory: Kubernetes
+already publishes what the scheduler uses on the Node object (CPU, memory,
+architecture, kernel, OS image), devices belong to Dynamic Resource
+Allocation, and baryon-node-agent logs the rest (see
+[Host inventory](#host-inventory)).
+
 | Status field | Description |
 |---|---|
-| `conditions` | `Ready` (runtime healthy and KVM usable), `RuntimeHealthy` (baryon-virtd answered and speaks a compatible runtime protocol). Reasons include `RuntimeUnreachable`, `ProtocolIncompatible`, `KvmUnavailable`. |
-| `heartbeatTime` | Last refresh by the node agent: every 30 s by default, 5 to 30 s (`--status-interval-seconds`). baryon-controller treats a node whose heartbeat it has not seen change for 90 s as not reporting. |
-| `architecture`, `kernelRelease`, `osImage`, `kairosVersion` | Host identity. |
-| `runtime` | baryon-virtd version, protocol package, `protocolVersion` (`<major>.<minor>`, `1.0` for a baryon-virtd that does not report one), `features` (runtime protocol features, ADR 0012), hypervisor and its version. |
-| `cpu` | Model, online CPUs, virtualization extension, nested virtualization. |
-| `memoryBytes`, `hugepages`, `numaNodes` | Memory topology. |
-| `kvm` | Usable, API version, reason when not usable. |
-| `iommu` | Enabled, group count, IOMMUFD device present. |
-| `vfio` | Legacy container device present, vfio-pci driver registered. |
-| `pciDevices` | PCI functions except bridges: address, vendor, device, class, driver, IOMMU group, NUMA node. |
-| `vmCount` | VMs known to baryon-virtd. |
-| `vms` | Host-side state of each VM on the node, at most 256 entries (the node agent publishes the first 256 and logs a warning when there are more): `anchorPodUID`, and `network` with `state` (`Ready`, `Restarting`, or `Failing`), `reason` (at most 64 bytes), `message` (at most 1024 bytes), `lastTransitionTime`, and `leaseExpiresTime`. Entries carry no VM names, namespaces, addresses, PIDs, paths, or TAP names. A baryon-virtd before runtime protocol 1.2 gives entries without `network`. |
+| `conditions` | `Ready` and `RuntimeHealthy`; see the table below. Valid only while `heartbeatTime` is recent. |
+| `heartbeatTime` | Last refresh by the node agent: every 30 s by default, 5 to 30 s (`--status-interval-seconds`). |
+| `runtime.virtdVersion` | Version of baryon-virtd on the node. |
+| `runtime.hypervisorVersion` | Version of Cloud Hypervisor on the node. |
+| `runtime.protocolVersion` | Internal. Runtime protocol version of baryon-virtd, `<major>.<minor>`; `1.0` for a baryon-virtd that does not report one. Compatibility is reported by `RuntimeHealthy`. |
+| `runtime.features` | Internal. Runtime protocol features baryon-virtd implements (ADR 0012), a set. |
+| `vmCount` | VMs known to baryon-virtd. Omitted while baryon-virtd is unreachable. |
+| `vms` | Internal: read by baryon-controller for the VMs' `NetworkReady` condition; users read `NetworkReady`. A map keyed by `anchorPodUID`, at most 256 entries (the node agent publishes the first 256 and logs a warning when there are more): `anchorPodUID`, and `network` with `state` (`Ready`, `Restarting`, or `Failing`), `reason` (at most 64 bytes), `message` (at most 1024 bytes), `lastTransitionTime`, and `leaseExpiresTime`. Entries carry no VM names, namespaces, addresses, PIDs, paths, or TAP names. A baryon-virtd before runtime protocol 1.2 gives entries without `network`. |
+
+Conditions:
+
+| Type | Meaning | True | False | Unknown |
+|---|---|---|---|---|
+| `Ready` | The node can run Baryon VMs: baryon-virtd is reachable, speaks a compatible runtime protocol, and KVM is usable. | `RuntimeReady` | `RuntimeUnreachable`, `ProtocolIncompatible`, `KvmUnavailable` | `NodeAgentStopped` |
+| `RuntimeHealthy` | baryon-virtd answered, host discovery succeeded, and its runtime protocol major version matches the cluster release (ADR 0012). | `RuntimeReachable` | `RuntimeUnreachable`, `ProtocolIncompatible` | `NodeAgentStopped` |
+
+| Reason | Meaning |
+|---|---|
+| `RuntimeUnreachable` | The node agent cannot get a host report from baryon-virtd; the message is the error. `runtime`, `vmCount`, and `vms` are omitted. |
+| `ProtocolIncompatible` | baryon-virtd speaks another runtime protocol major version, or answered with a host report whose schema version this node agent does not read. Releases before 0.1.0-rc1 reported the second case as `RuntimeUnreachable`. |
+| `KvmUnavailable` | baryon-virtd is healthy and KVM is not usable on the host; the message is the host's reason. |
+| `NodeAgentStopped` | The node agent was stopped (SIGTERM, for example for an upgrade or a reboot) and set both conditions to Unknown on its way out. The rest of the status, including `heartbeatTime`, is kept, so the heartbeat ages. |
+
+The `Ready` True reason was `KvmAvailable` before 0.1.0-rc1.
+
+Staleness: a node agent that is stopped sets both conditions to Unknown;
+a node agent that crashes, or whose node fails, leaves its last
+conditions as they were. Consumers therefore count the conditions only
+while `heartbeatTime` is within 90 s, three maximum intervals, and treat
+them as Unknown otherwise. `heartbeatTime` is written with the node's
+clock. baryon-controller applies the same rule on its own clock: it
+treats a node whose heartbeat it has not seen change for 90 s as not
+reporting.
+
+Status: Implemented; unit tests in `crates/node-agent/src/publisher.rs`
+(an unreachable runtime, an incompatible host report, inventory not in
+the status). The `NodeAgentStopped` write on SIGTERM has no unit test; it
+is Tested by `tests/e2e/node-agent-outage.sh` on the k0s cluster.
 
 ```
 $ kubectl get virtualizationnodes
-NAME    READY   ARCH     KVM    IOMMU   HYPERVISOR   VMS   AGE
-node1   True    x86_64   true   true    v53.0        1     12m
+NAME    READY   REASON         VMS   RUNTIME   HYPERVISOR   HEARTBEAT   AGE
+node1   True    RuntimeReady   1     0.1.0     v53.0        12s         12m
 ```
+
+### Host inventory
+
+baryon-node-agent logs one line with the message `host inventory` when it
+starts and whenever the inventory changes: the architecture, kernel
+release, OS name, Kairos version, CPU model, online CPU count, nested
+virtualization, memory size, whether KVM is usable, whether the IOMMU is
+enabled and its group count, and the number of NUMA nodes and PCI
+devices. To read it for one node:
+
+```bash
+pod="$(kubectl get pods -n baryon-system -l app.kubernetes.io/name=baryon-node-agent --field-selector spec.nodeName=<node> -o name)"
+kubectl logs -n baryon-system "$pod" | grep '"host inventory"'
+```
+
+The line is logged only at start and on a change, so it is gone once the
+container's log has been rotated; restarting the node agent logs it again.
+The Node object has the architecture, kernel release, and OS image in
+`status.nodeInfo`, and the CPU and memory capacity in `status.capacity`.
 
 ## Extended resources
 
@@ -551,6 +836,26 @@ With the `baryon-vm-resource` admission policy installed
 (`deploy/base/policy/vm-resource.yaml`), only baryon-controller may create
 pods that request either resource, in any container or init container; a
 pod created by any other user that requests one is denied.
+
+The resource names and slot counts are not contract
+([api-stability.md](api-stability.md#not-contract)). A ResourceQuota on
+them, such as `requests.virtualization.baryon.io/vm`, is therefore Not
+supported. To cap the number of VMs in a namespace, use an object count
+quota on VirtualMachines:
+
+```yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: vm-count
+  namespace: <namespace>
+spec:
+  hard:
+    count/virtualmachines.virtualization.baryon.io: "10"
+```
+
+This counts VirtualMachine objects, including stopped ones. Kubernetes
+mechanism; Baryon has no test for it.
 
 ## Access for namespace users
 

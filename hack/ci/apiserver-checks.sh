@@ -14,6 +14,57 @@ reject() {
   if k apply --dry-run=server -f - >/dev/null 2>&1; then echo "accepted but must be rejected: $1" >&2; exit 1; fi
   echo "rejected as expected: $1"
 }
+accept() {
+  if ! out="$(k apply --dry-run=server -f - 2>&1)"; then echo "rejected but must be accepted: $1: $out" >&2; exit 1; fi
+  echo "accepted as expected: $1"
+}
+vm_with_disk() {
+  # vm_with_disk <name> <rootDisk as flow YAML>
+  printf 'apiVersion: virtualization.baryon.io/v1alpha1\nkind: VirtualMachine\nmetadata: {name: %s, namespace: default}\nspec:\n  className: general-small\n  rootDisk: %s\n' "$1" "$2"
+}
+for bad in "0" "100m" "512Ki" "banana" "2Pi"; do
+  vm_with_disk size-bad "{size: \"$bad\", source: {http: {url: \"https://example.org/d.raw\"}}}" | reject "rootDisk.size $bad"
+done
+vm_with_disk size-int "{size: 4294967296, source: {http: {url: \"https://example.org/d.raw\"}}}" | accept "rootDisk.size as an integer number of bytes"
+vm_with_disk size-str "{size: 4Gi, source: {http: {url: \"https://example.org/d.raw\"}}}" | accept "rootDisk.size 4Gi"
+vm_with_disk claim-empty "{source: {persistentVolumeClaim: {claimName: \"\"}}}" | reject "an empty claimName"
+vm_with_disk claim-bad "{source: {persistentVolumeClaim: {claimName: \"Not_A_Name\"}}}" | reject "a claimName that is not a DNS-1123 subdomain"
+vm_with_disk claim-size "{size: 4Gi, source: {persistentVolumeClaim: {claimName: disk}}}" | reject "size with an existing claim"
+vm_with_disk claim-sc "{storageClassName: fast, source: {persistentVolumeClaim: {claimName: disk}}}" | reject "storageClassName with an existing claim"
+vm_with_disk sc-empty "{size: 4Gi, storageClassName: \"\", source: {http: {url: \"https://example.org/d.raw\"}}}" | reject "an empty storageClassName"
+vm_with_disk url-creds "{size: 4Gi, source: {http: {url: \"https://user:secret@example.org/d.raw\"}}}" | reject "a URL with credentials"
+vm_with_disk url-nohost "{size: 4Gi, source: {http: {url: \"https:///d.raw\"}}}" | reject "a URL without a host"
+vm_with_disk url-ftp "{size: 4Gi, source: {http: {url: \"ftp://example.org/d.raw\"}}}" | reject "a URL that is not http or https"
+vm_with_disk claim-ok "{source: {persistentVolumeClaim: {claimName: disk.v1}}}" | accept "an existing claim"
+vm_with_disk url-at-path "{size: 4Gi, source: {http: {url: \"https://example.org/a@b.raw\"}}}" | accept "an @ in the URL path"
+vm_with_disk url-at-query "{size: 4Gi, source: {http: {url: \"https://example.org/d.raw?x=a@b\"}}}" | accept "an @ in the URL query"
+vm_with_disk url-ipv6 "{size: 4Gi, source: {http: {url: \"https://[2001:db8::1]/d.raw\"}}}" | accept "an IPv6 literal host"
+vm_with_disk url-opaque "{size: 4Gi, source: {http: {url: \"https:user@example.org/d.raw\"}}}" | reject "an opaque URL with userinfo"
+vm_with_disk url-upper "{size: 4Gi, source: {http: {url: \"HTTPS://u@example.org/d.raw\"}}}" | reject "an uppercase scheme with userinfo"
+vm_with_disk null-source "{size: 4Gi, source: {http: null}}" | reject "an explicit null source"
+k apply --dry-run=server -f - <<'YAML' >/dev/null 2>&1 && { echo "accepted but must be rejected: a className that is not a DNS-1123 subdomain" >&2; exit 1; } || echo "rejected as expected: a className that is not a DNS-1123 subdomain"
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachine
+metadata: {name: class-bad, namespace: default}
+spec:
+  className: Small_Class
+  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}
+YAML
+reject "a class with 0 vCPUs" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachineClass
+metadata: {name: zero}
+spec: {cpu: {vcpus: 0}, memory: {size: 1Gi}}
+YAML
+for bad in "32Mi" "1500Ki" "1.5Gi" "banana"; do
+  printf 'apiVersion: virtualization.baryon.io/v1alpha1\nkind: VirtualMachineClass\nmetadata: {name: mem-bad}\nspec: {cpu: {vcpus: 1}, memory: {size: "%s"}}\n' "$bad" | reject "class memory.size $bad"
+done
+reject "a change to an existing class" <<'YAML'
+apiVersion: virtualization.baryon.io/v1alpha1
+kind: VirtualMachineClass
+metadata: {name: general-small}
+spec: {cpu: {vcpus: 3}, memory: {size: 2Gi}}
+YAML
 reject "two disk sources" <<'YAML'
 apiVersion: virtualization.baryon.io/v1alpha1
 kind: VirtualMachine

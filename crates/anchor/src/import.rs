@@ -220,12 +220,14 @@ async fn fetch(url: &str) -> anyhow::Result<Download> {
         .enable_http1()
         .build();
     let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
-    let mut uri: Uri = url.parse().with_context(|| format!("invalid URL {url}"))?;
+    // The URL is not repeated in errors: it may carry a token in its query.
+    let mut uri: Uri = url.parse().context("the source URL is not a valid URI")?;
+    refuse_userinfo(&uri)?;
     for _ in 0..MAX_REDIRECTS {
         let resp = client
             .get(uri.clone())
             .await
-            .with_context(|| format!("GET {uri}"))?;
+            .with_context(|| format!("GET {}", redacted(&uri)))?;
         if resp.status().is_redirection() {
             let location = resp
                 .headers()
@@ -233,11 +235,11 @@ async fn fetch(url: &str) -> anyhow::Result<Download> {
                 .and_then(|v| v.to_str().ok())
                 .context("redirect without Location")?;
             uri = resolve_location(&uri, location)?;
-            tracing::info!(%uri, "following redirect");
+            tracing::info!(uri = %redacted(&uri), "following redirect");
             continue;
         }
         if resp.status() != StatusCode::OK {
-            bail!("GET {uri} returned {}", resp.status());
+            bail!("GET {} returned {}", redacted(&uri), resp.status());
         }
         let length = resp
             .headers()
@@ -538,9 +540,39 @@ fn resolve_location(base: &Uri, location: &str) -> anyhow::Result<Uri> {
             .context("invalid redirect location")?
     };
     if base.scheme_str() == Some("https") && target.scheme_str() != Some("https") {
-        bail!("refusing redirect from {base} to non-HTTPS {target}");
+        bail!(
+            "refusing redirect from {} to non-HTTPS {}",
+            redacted(base),
+            redacted(&target)
+        );
     }
+    refuse_userinfo(&target)?;
     Ok(target)
+}
+
+/// Refuse a URI with userinfo (`user:password@`): credentials do not belong
+/// in a VM's source URL or in a redirect target. The API server refuses them
+/// in new VirtualMachines; this also covers older objects and redirects.
+fn refuse_userinfo(uri: &Uri) -> anyhow::Result<()> {
+    if uri.authority().is_some_and(|a| a.as_str().contains('@')) {
+        bail!(
+            "refusing a URL with credentials (user:password@) for {}",
+            redacted(uri)
+        );
+    }
+    Ok(())
+}
+
+/// `uri` for logs and messages: scheme, host, port, and path, without
+/// userinfo or query, which may carry credentials or a signed token.
+fn redacted(uri: &Uri) -> String {
+    format!(
+        "{}://{}{}{}",
+        uri.scheme_str().unwrap_or("?"),
+        uri.host().unwrap_or("?"),
+        uri.port().map(|p| format!(":{p}")).unwrap_or_default(),
+        uri.path()
+    )
 }
 
 fn marker_matches(marker: &str, url: &str) -> bool {
@@ -710,6 +742,16 @@ mod tests {
         assert!(resolve_location(&base, "http://mirror.example.net/a.raw").is_err());
         let plain: Uri = "http://cloud.example.org/x.raw".parse().unwrap();
         assert!(resolve_location(&plain, "https://mirror.example.net/a.raw").is_ok());
+        // Credentials in a redirect target are refused; logs and messages
+        // never show userinfo or the query.
+        assert!(resolve_location(&base, "https://u:p@mirror.example.net/a.raw").is_err());
+        let signed: Uri = "https://h.example.org:8443/d/a.raw?X-Signature=secret"
+            .parse()
+            .unwrap();
+        assert_eq!(redacted(&signed), "https://h.example.org:8443/d/a.raw");
+        let creds: Uri = "https://user:pw@h.example.org/a.raw".parse().unwrap();
+        let err = refuse_userinfo(&creds).unwrap_err().to_string();
+        assert!(!err.contains("pw") && !err.contains("user:pw"), "{err}");
     }
 
     #[test]

@@ -11,7 +11,9 @@ pub mod vm {
     pub const SCHEDULED: &str = "Scheduled";
     /// The root disk claim is bound and its content is in place.
     pub const STORAGE_READY: &str = "StorageReady";
-    /// The VMM process is running for the current Anchor Pod.
+    /// The Anchor container of the current Anchor Pod runs; it runs the VMM
+    /// or is starting it, and a VMM exit ends the container. Not evidence
+    /// that the guest runs (that is `Ready`).
     pub const RUNNING: &str = "Running";
     /// The guest produced boot evidence (DHCP lease or console login prompt).
     pub const READY: &str = "Ready";
@@ -24,7 +26,8 @@ pub mod vm {
 
 /// VirtualizationNode condition types.
 pub mod node {
-    /// The node can run VMs: runtime healthy and KVM usable.
+    /// The node can run VMs: baryon-virtd reachable with a compatible
+    /// protocol, and KVM usable. Valid only while the heartbeat is recent.
     pub const READY: &str = "Ready";
     /// baryon-virtd answers and host discovery succeeded.
     pub const RUNTIME_HEALTHY: &str = "RuntimeHealthy";

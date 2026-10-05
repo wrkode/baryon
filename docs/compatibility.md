@@ -173,7 +173,9 @@ backend is Open. Other CNIs are not tested.
 baryon-virtd ships in the host image and is upgraded with the OS (Kairos);
 baryon-controller, baryon-node-agent, and the anchor image are the cluster
 release, upgraded with the cluster deployment. They communicate through the
-versioned runtime protocol of ADR 0012.
+versioned runtime protocol of ADR 0012. API changes and their upgrade
+steps are listed per release in [api-stability.md](api-stability.md#change-log-per-release);
+for 0.1.0-rc1 see [Upgrade to 0.1.0-rc1](#upgrade-to-010-rc1).
 
 | Rule | Status |
 |---|---|
@@ -258,3 +260,82 @@ migrates them:
   installs them. A VirtualMachine's status must be kept for the migration:
   a VirtualMachine of an earlier release restored without status has no
   evidence of its import.
+
+## Upgrade to 0.1.0-rc1
+
+0.1.0-rc1 is the release of the v0.1 API review; the API stays `v1alpha1`
+and the runtime protocol stays 1.2. The API changes are listed in
+[api-stability.md](api-stability.md#010-rc1-not-yet-released). Upgrade in
+this order:
+
+1. Apply the new CRDs:
+
+   ```bash
+   kubectl apply --server-side -f deploy/base/crds/virtualization.baryon.io.yaml
+   ```
+
+2. Apply every VirtualMachineClass again with `spec.cpu.vcpus` in place of
+   `spec.cpu.cores`. A class stored in the earlier shape shows no vCPUs:
+
+   ```bash
+   kubectl get virtualmachineclasses
+   ```
+
+   Edit each class manifest (`cores: 2` becomes `vcpus: 2`) and apply it,
+   for example `kubectl apply -f examples/classes.yaml` for the example
+   classes. The API server accepts this one update of a class stored in
+   the earlier shape; after it, the class is immutable. A class whose
+   `memory.size` is not a whole number of Mi from 64Mi to 16Ti is
+   rejected and needs a valid size.
+
+3. Upgrade baryon-controller and baryon-node-agent:
+
+   ```bash
+   kubectl apply --server-side -k deploy/base
+   ```
+
+What changes for running VMs and nodes:
+
+- Running VMs keep running through all three steps. A VM that starts
+  while its class is still in the earlier shape reports `InvalidClass`
+  until the class is applied again.
+- Between steps 1 and 3, baryon-controller of the earlier release reads
+  classes with `cpu.cores`, which the new CRD no longer has, so its
+  reconciles of VMs fail and no VM starts or stops. Inferred from the
+  types of the earlier release; not tested. Keep the steps close
+  together.
+- Between steps 1 and 3, baryon-node-agent of the earlier release cannot
+  read VirtualizationNodes either: its types require `runtime.protocol`
+  and `runtime.hypervisor`, which the API server now drops when it reads
+  the objects. Until the new node agents have rolled out, heartbeats stop
+  on every node and the Heartbeat column of `kubectl get
+  virtualizationnodes` grows; the device plugins keep working, so running
+  VMs and their slots are not affected. Inferred from the types of the
+  earlier release; not tested. This is another reason to run the three
+  steps in this order and quickly.
+- VirtualizationNode status loses `runtime.protocol`, `runtime.hypervisor`,
+  `architecture`, `kernelRelease`, `osImage`, `kairosVersion`, `cpu`,
+  `memoryBytes`, `kvm`, `iommu`, `vfio`, `numaNodes`, `hugepages`, and
+  `pciDevices`. The API server drops them from stored objects when it
+  reads them. Scripts or dashboards that read these fields must read the
+  Node object (`status.nodeInfo`, `status.capacity`) or the node agent's
+  `host inventory` log line instead
+  ([api.md](api.md#host-inventory)).
+- A baryon-controller of an earlier release cannot read a
+  VirtualizationNode written by the new node agent, which no longer
+  writes `runtime.protocol` and `runtime.hypervisor`; step 3 upgrades
+  both together. Inferred from the types of the earlier release; not
+  tested.
+- The `Ready` True reason of VirtualizationNode is `RuntimeReady`
+  (before: `KvmAvailable`). Anything that matches the reason must be
+  updated; matching the status is enough to tell whether the node is
+  ready.
+- Anchor Pods created by a `restartedAt` restart request of an earlier
+  release still match and are not reported as `RestartRequired`. Anchor
+  Pods created with `placement: {}` by an earlier release still match a
+  VM with `placement: {}` or without placement.
+- Root disk claims that exist are not changed. New block-mode claims
+  request exactly `rootDisk.size` instead of 64 MiB more.
+
+Status: the upgrade steps are Designed; an upgrade run on the k0s cluster
+is pending.
