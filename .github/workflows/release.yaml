@@ -50,6 +50,8 @@ jobs:
           fi
           test -s "docs/release-notes/$version.md"
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          # The SBOM action does not create the directory of its output file.
+          mkdir -p _sbom _release
 
       # Before anything is built, so it covers the source tree only.
       - name: SBOM of the source tree
