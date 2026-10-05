@@ -38,7 +38,7 @@ with these files, built by `.github/workflows/release.yaml` from the tag:
 | `baryon-virtd-v<version>-x86_64-linux-musl` | The static baryon-virtd binary, copied from the host image |
 | `baryon-v<version>-source.tar.gz` | The source tree of the tag |
 | `images.txt` | The image references with their digests |
-| `*.spdx.json` | SPDX SBOMs of the source tree and of each image |
+| `*.spdx.json` | SPDX SBOMs of the source tree and of each image. The Rust dependencies are in the source tree SBOM; the SBOMs of the component images list the image only, because their static binaries carry no dependency data |
 | `SHA256SUMS` | SHA-256 checksums of the files above |
 
 Images on ghcr.io:

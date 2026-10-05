@@ -392,8 +392,9 @@ manifest renderer (`hack/release-manifests.sh`) are Implemented. An
 installation from release files rendered by the same procedure, applied as
 files, is Tested on the k0s cluster in the v0.1.0-rc1 release validation
 ([testing.md](testing.md#v010-rc1-release-validation)). The published
-release files are rebuilt by the release workflow from the tag; a smoke
-test of them follows the tag (pending).
+release files and images, rebuilt by the release workflow from the tag,
+passed a smoke test on the k0s cluster after the tag
+([testing.md](testing.md#published-artifacts-smoke-test)).
 
 ### Private repository
 
@@ -405,8 +406,30 @@ The ghcr.io images are private too. The manifests carry no
 Pods in the VM's namespace without them, so every node's container
 runtime needs its own credentials for `ghcr.io`, or the images must be
 loaded onto the nodes. Status: pulling the images with node credentials
-is Not tested; the release validation loaded the images into each node's
-containerd.
+is Not tested. Loading the published images onto the nodes is Tested
+(the smoke test of v0.1.0-rc1).
+
+`baryon.yaml` refers to the images by digest, so a loaded image must keep
+the manifest digest of the registry, and containerd must know it under
+that digest reference: an image saved by Docker's classic image store has
+a different manifest, and an image known only by a tag name is not found,
+so kubelet tries to pull and fails with `401 Unauthorized`. One way that
+keeps the digest, with the `oras` CLI on a machine with access and the
+k0s `ctr`; repeat for the node agent and anchor images and for every
+node, with the references from `images.txt`:
+
+```bash
+ref=ghcr.io/wrkode/baryon-controller@sha256:<digest>
+oras copy "$ref" --to-oci-layout controller:v0.1.0-rc1
+(cd controller && tar cf ../controller.tar .)
+ssh <user>@<node-address> sudo k0s ctr -n k8s.io images import \
+  --base-name ghcr.io/wrkode/baryon-controller - < controller.tar
+ssh <user>@<node-address> sudo k0s ctr -n k8s.io images tag \
+  ghcr.io/wrkode/baryon-controller:v0.1.0-rc1 "$ref"
+```
+
+The host image for a Kairos Operator upgrade can be loaded the same way
+under the tag that the `NodeOpUpgrade` names.
 
 ### From a checkout
 

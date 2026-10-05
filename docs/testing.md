@@ -639,8 +639,8 @@ Builds:
   commit stamp of c3a3735.
 
 The published release artifacts are rebuilt by the release workflow from
-the tag; they are not the builds above. A smoke test of the published
-artifacts follows the tag (pending).
+the tag; they are not the builds above. Their smoke test after the tag is
+in [Published artifacts smoke test](#published-artifacts-smoke-test).
 
 Procedure: the component images were loaded into each node's containerd
 (no registry pull), and the host upgrade images were preloaded in
@@ -720,6 +720,24 @@ Uninstall and reinstall with the release files:
 |---|---|
 | Uninstall with `baryon.yaml` ([installation.md](installation.md#9-uninstall)), VMs deleted first | the namespace and the CRDs were gone; no Baryon pods left; no `/run/baryon/vms` entries; baryon-virtd still active as a host service; the vm extended resource at 0 |
 | Clean install from the release files (`baryon.yaml` server-side, `baryon-classes.yaml`) | every VirtualizationNode Ready; a ceph-rbd Block VM and an lvm-local Filesystem VM Ready, with `NetworkReady` True |
+
+#### Published artifacts smoke test
+
+Run on 2026-10-05 after the release workflow published v0.1.0-rc1 from
+the tag (caff228), on the k0s cluster that ran release B:
+
+| Step | Result |
+|---|---|
+| Release files from `gh release download` | `sha256sum --check SHA256SUMS`: every file OK |
+| Images | pulled from ghcr.io by the digests in `images.txt`; the host image's `components.json` records version v0.1.0-rc1 and commit caff22834c4b (no `-dirty`); the released `baryon-virtd` binary is identical (SHA-256) to the one in the host image; the component binaries report 0.1.0-rc1 |
+| First attempt: published `baryon-crds.yaml`, `baryon-classes.yaml`, `baryon.yaml` over release B, with the images loaded on the nodes under a tag name only | the new controller and node agent pods failed with `ImagePullBackOff`: kubelet asked for the digest reference, containerd did not find it, and the anonymous pull from the private registry was refused (`401 Unauthorized`). The old pods kept running until the rollout replaced them, so node agents of two nodes stopped reporting and new VMs got no pods until the images were found. Fixed by naming the loaded images by their digest reference ([installation.md](installation.md#private-repository)) |
+| Published manifests with the images found by digest | controller, node agents, and Anchor Pods ran the published images (image IDs equal to `images.txt`); every VirtualizationNode Ready |
+| Host upgrade of node2 to the published host image (runbook with `kubectl drain`, the image preloaded under its tag) | the `NodeOpUpgrade` completed and node2 booted the published image (commit caff22834c4b). The step 5 wait timed out in the first attempt because the node agent image could not be pulled (row above); it reported once the images were found |
+| VMs on the published artifacts | a ceph-rbd Block VM on node2 (published host image) and an lvm-local Filesystem VM on node3 Ready; `NetworkReady` True for the lvm-local VM; the ceph-rbd VM showed `NotReported` when read right after Ready and was not read again before it was deleted |
+
+Not covered: SBOMs of the component images list the image only, not the
+Rust crates inside the static binaries; the Rust dependencies are in the
+source tree SBOM.
 
 ### Hadron single node and kind host
 
