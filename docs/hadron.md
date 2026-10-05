@@ -127,6 +127,26 @@ raw EFI disk; later images were installed by Kairos A/B upgrade, and a
 freshly provisioned node was upgraded twice more (summary in
 [testing.md](testing.md#results)).
 
+### Updating the pinned Cloud Hypervisor version
+
+Cloud Hypervisor is pinned in `packaging/versions.env`
+(`CLOUD_HYPERVISOR_VERSION`, `CLOUD_HYPERVISOR_URL`,
+`CLOUD_HYPERVISOR_SHA256`) and reaches nodes only with a new image
+(ADR 0002). For every version change:
+
+1. Update the three variables, with the checksum of the upstream release
+   asset.
+2. Check Baryon's seccomp layer against the new version: for each call in
+   the deviation table in
+   [security.md](security.md#baryon-seccomp-layer), confirm that Cloud
+   Hypervisor still needs it only for a feature Baryon does not support,
+   and update the filter and the table otherwise.
+3. Run `tests/e2e/lifecycle.sh` with `NODE_SHELL` set on nodes running the
+   new image. It checks the per-thread seccomp state of the VMM and the
+   DHCP responder, and it resets the guest with Landlock enforced, which
+   exercises the `/proc/self/fd/N` disk reopen (ADR 0006).
+4. Update the version in [compatibility.md](compatibility.md).
+
 ## Bootable artifacts
 
 AuroraBoot turns the image into bootable media. A raw EFI disk from an

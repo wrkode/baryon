@@ -20,7 +20,9 @@ day by a review of block-mode storage, the image import, and the disk
 handoff, and by a review of import integrity (where the import record
 lives, what counts as a completed import, and who can approve one).
 On 2026-10-04 the live migration evaluation (ADR 0013) and its experiment
-were reviewed (see [Live migration](#live-migration-not-supported)).
+were reviewed (see [Live migration](#live-migration-not-supported)), and so
+were the DHCP responder liveness probes and Baryon's seccomp layer (see
+[Baryon seccomp layer](#baryon-seccomp-layer)).
 Findings and their resolution are listed in
 [Review findings](#review-findings).
 
@@ -33,8 +35,9 @@ From least to most trusted on a node:
    firmware) and through the DHCP responder, a separate unprivileged
    process.
 2. Cloud Hypervisor (the VMM). One process per VM, running as the VM's own
-   unprivileged host identity with no capabilities, `no_new_privs`, an empty network
-   namespace, seccomp, and Landlock. Assumed compromisable by its guest; the
+   unprivileged host identity with no capabilities, `no_new_privs`, an
+   empty network namespace, Baryon's and Cloud Hypervisor's seccomp
+   filters, and Landlock. Assumed compromisable by its guest; the
    confinement below is what limits that.
 3. baryon-anchor. Unprivileged process in the Anchor Pod. Untrusted by
    baryon-virtd: every field it sends is validated, its identity must match
@@ -53,7 +56,8 @@ Channels across these boundaries:
 |---|---|---|
 | guest | VMM | virtio devices, serial, ACPI, SMBIOS, firmware |
 | guest | DHCP responder | DHCP frames on the TAP |
-| DHCP responder | baryon-virtd | one JSON event line per acknowledged lease (length-limited, checked against the lease); the responder reports at most one per 60 s, and baryon-virtd processes at most one per 60 s |
+| baryon-virtd | DHCP responder | stdin pipe: the lease as one JSON line, then a liveness probe line `{"probe":<n>}` every 10 s. The pipe is non-blocking on baryon-virtd's side and a probe line is at most 31 bytes, below `PIPE_BUF`, so a write either completes or fails; a failed write counts as a missing answer. The responder reads lines of at most 256 bytes and ignores lines it cannot parse |
+| DHCP responder | baryon-virtd | stdout pipe: JSON event lines of at most 4 KiB. An acknowledged lease, checked against the lease (the responder reports at most one per 60 s, and baryon-virtd processes at most one per 60 s), and one `Alive` answer per probe, sent by the DHCP serving loop and accepted only for probes sent to the current responder. Any other line (overlong, unparseable, an acknowledgement for another address, an answer to a probe not sent or a second answer) is a protocol violation: baryon-virtd stops reading, kills the responder, and restarts it with backoff |
 | VMM | baryon-virtd | process exit, the Cloud Hypervisor REST API (baryon-virtd is the client), serial socket, event file |
 | baryon-anchor | baryon-virtd | gRPC on `/run/baryon/anchor/virtd.sock` |
 | baryon-node-agent | baryon-virtd | gRPC on `/run/baryon/node/virtd.sock` |
@@ -265,10 +269,18 @@ between `fork` and `execve`:
 5. drop every capability from the bounding set
 6. `setgroups`, `setgid`, `setuid` to the VM's identity
 7. `PR_SET_NO_NEW_PRIVS`
+8. install Baryon's seccomp filter (see
+   [Baryon seccomp layer](#baryon-seccomp-layer)), built before `fork` so
+   that installing it allocates nothing
 
-Cloud Hypervisor then applies its own seccomp filters (`--seccomp true`) and
-Landlock rules (`--landlock`). baryon-virtd adds one Landlock rule: read and
-write access, including creating and removing files, beneath the VM's own
+The DHCP responder is started through the same code path
+(`crates/virtd/src/vmm.rs`, `spawn`), so it gets every step above; it does
+not get the kvm group.
+
+Cloud Hypervisor then applies its own seccomp filters (`--seccomp true`),
+which stack on top of Baryon's, and Landlock rules (`--landlock`).
+baryon-virtd adds one Landlock rule: read and write access, including
+creating and removing files, beneath the VM's own
 runtime directory `/run/baryon/vms/<pod-uid>/vmm` (owned by the VM's identity,
 holding only the VMM's log, event file, and serial socket). Without it, a
 guest reboot failed: Cloud Hypervisor could not remove and re-create its
@@ -300,6 +312,17 @@ seccomp: mode 2 (filter) on 13 of 14 threads; the main thread has none
 cgroup: /kubepods.slice/kubepods-pod<uid>.slice/cri-containerd-<id>.scope
 ```
 
+That measurement predates Baryon's seccomp layer. Measured on the k0s
+cluster, 2026-10-04, for a running VM with Baryon's filter
+(`Seccomp` and `Seccomp_filters` in `/proc/<pid>/task/<tid>/status`):
+
+```
+VMM main thread:         Seccomp 2, Seccomp_filters 1   (Baryon's filter only)
+every other VMM thread:  Seccomp 2, Seccomp_filters 2 or 3
+                         (device threads inherit the VMM thread's filter)
+every responder thread:  Seccomp 2, Seccomp_filters 1   (Baryon's filter only)
+```
+
 What this gives:
 
 - A distinct host identity per VM: one VMM cannot signal, trace, or read
@@ -309,12 +332,19 @@ What this gives:
 - No capabilities and `no_new_privs`: setuid binaries and file capabilities
   cannot raise privileges.
 - Empty network namespace: a compromised VMM cannot open connections to host,
-  node-local, or cluster addresses. Cloud Hypervisor's seccomp profile still
+  node-local, or cluster addresses. Cloud Hypervisor's seccomp profile
   allows `socket` for AF_UNIX, AF_INET, and AF_INET6 and `connect` without
-  conditions (v53.0 `vmm/src/seccomp_filters.rs`, read on 2026-10-03);
-  it is the empty namespace, not seccomp, that leaves nothing to connect to.
-  Its only network path is the TAP fd, which carries guest frames to the pod
-  interface, where the pod's NetworkPolicy applies as for any pod.
+  conditions (v53.0 `vmm/src/seccomp_filters.rs`, read on 2026-10-03).
+  Baryon's filter denies `socket` for every family other than AF_UNIX on
+  every thread; `connect` stays unconditioned, and the empty namespace
+  leaves no inet peer to reach. Its only network path is the TAP fd, which
+  carries guest frames to the pod interface, where the pod's NetworkPolicy
+  applies as for any pod.
+- Baryon's seccomp filter on every thread of the VMM and the responder:
+  `userfaultfd`, `ptrace`, `process_vm_readv`, `process_vm_writev`,
+  `pidfd_getfd`, x32 calls, and non-AF_UNIX sockets fail with `EPERM`, and a
+  system call of another architecture kills the process. On the VMM's main
+  thread and in the responder it is the only filter.
 - Container cgroup: the pod's memory and CPU limits and any per-container
   cpuset apply to the VMM.
 
@@ -322,14 +352,120 @@ What it does not give:
 
 - The VMM runs in the host mount namespace. File access is limited by DAC
   (its own identity) and by Cloud Hypervisor's Landlock rules, which are
-  filesystem rules only. Baryon adds no seccomp policy and no Landlock
-  policy of its own beyond the one writable-directory rule above.
+  filesystem rules only. Baryon adds no Landlock policy of its own beyond
+  the one writable-directory rule above.
+- Baryon's seccomp filter is a short denylist, not an allowlist. Every
+  other system call is left to Cloud Hypervisor's filters; on the VMM's
+  main thread and in the DHCP responder nothing else restricts it.
+- The DHCP responder has no allowlist filter and no Landlock rules; both
+  are Designed (see [Baryon seccomp layer](#baryon-seccomp-layer)).
 - Path-based Unix sockets are reachable by path from any network namespace.
   The sockets above are protected by their modes, except the anchor socket,
   whose peer check applies.
-- seccomp and Landlock profiles are Cloud Hypervisor's. Their contents are
-  pinned by the pinned Cloud Hypervisor version, not reviewed by Baryon line
-  by line.
+- Cloud Hypervisor's seccomp and Landlock profiles are fixed by the pinned
+  Cloud Hypervisor version, not reviewed by Baryon line by line. Only the
+  calls in the deviation table below were checked against v53.0, and they
+  must be checked again on every Cloud Hypervisor upgrade.
+
+### Baryon seccomp layer
+
+Status: Implemented (`crates/virtd/src/seccomp.rs`, installed last in the
+`pre_exec` closure of `crates/virtd/src/vmm.rs`, after
+`PR_SET_NO_NEW_PRIVS`, for both Cloud Hypervisor and the DHCP responder),
+with unit tests that run in CI (below). E2E: `tests/e2e/lifecycle.sh`
+checks the per-thread seccomp state of the VMM and the responder; Tested
+on the k0s cluster (results below).
+
+Cloud Hypervisor installs its own seccomp filter per thread and none on its
+main thread, and its configuration offers no way to narrow the filters.
+Seccomp filters stack and the strictest result wins, so a filter installed
+before `execve` is the floor of every thread of both processes. On the
+VMM's main thread and in the responder it is the only filter. The filter:
+
+- kills the process on a system call of another architecture (for example
+  an i386 call through `int 0x80` in an x86_64 process);
+- fails x32 system calls with `EPERM`;
+- fails `userfaultfd`, `ptrace`, `process_vm_readv`, `process_vm_writev`,
+  and `pidfd_getfd` with `EPERM`;
+- fails `socket` with `EPERM` for every address family other than
+  `AF_UNIX`;
+- allows everything else, which Cloud Hypervisor's filters then decide.
+
+Each denied call, why Cloud Hypervisor allows it, and why Baryon does not
+need it (checked against Cloud Hypervisor v53.0):
+
+| System call | Why Cloud Hypervisor allows it | Feature that needs it | Baryon support status | Baryon filter |
+|---|---|---|---|---|
+| `userfaultfd` | the VMM thread filter allows it, with the `UFFDIO` ioctls (`vmm/src/uffd.rs`) | `vm.restore` with `memory_restore_mode=ondemand` (`memory_manager.rs`, `restore_by_uffd`) and the receive side of post-copy migration (`start_postcopy_serving`) | snapshots and live migration: Not supported; Baryon's Cloud Hypervisor client cannot call those endpoints | `EPERM` |
+| `socket` for families other than `AF_UNIX` | the VMM thread filter allows `AF_INET` and `AF_INET6`; the migration thread filter allows any family | TAP creation with an address (`ip=`, `Tap::set_ip_addr`); the TCP and TLS migration transports | not used: baryon-virtd passes TAP fds without `ip=`, and the TAP ioctls on that path use `AF_UNIX` sockets; live migration: Not supported. The responder creates no sockets; its packet socket is inherited | `EPERM` unless the family is `AF_UNIX` |
+| `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd` | no Cloud Hypervisor thread filter allows them; the main thread has no Cloud Hypervisor filter | none | not needed | `EPERM` |
+| System calls of another ABI | the main thread has no Cloud Hypervisor filter | none | not needed | another architecture (i386): the process is killed (`SIGSYS`); x32: `EPERM` |
+
+Why each denial matters:
+
+- `userfaultfd`: Cloud Hypervisor's own call, without
+  `UFFD_USER_MODE_ONLY`, already fails on Hadron, because the image sets
+  `vm.unprivileged_userfaultfd` to 0 and `/dev/userfaultfd` is root-only
+  (mode 0600). The user-mode-only variant is available to any process
+  whatever the sysctl says, and the filter removes it. That variant cannot
+  handle faults in kernel mode, so the gain is a smaller reachable kernel
+  surface, not the removal of a known exploitation primitive.
+- `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`: the VMM
+  and the responder of a VM run as the same uid. The filter keeps them from
+  reaching into each other through threads that have no Cloud Hypervisor
+  filter. Hadron's Yama `ptrace_scope` is 1 (checked on a node), which
+  already blocks a ptrace attach between the two, since neither descends
+  from the other; the filter is defense in depth.
+- `socket`: see VMM confinement above. The filter fails `socket(2)` for
+  every family but `AF_UNIX`. `io_uring` (allowed, see Kept) can still
+  create sockets with `IORING_OP_SOCKET`, which seccomp does not see, so
+  the inet socket surface is reduced, not removed; the empty network
+  namespace remains the control that leaves no inet peer.
+- Foreign ABIs: a filter that checks system call numbers is only meaningful
+  for the ABI it was written for.
+
+Kept: `io_uring`. Cloud Hypervisor's block backend may use it, and
+`kernel.io_uring_disabled` is 0 on Hadron. Operations submitted through
+`io_uring` are not checked by seccomp, including socket creation
+(`IORING_OP_SOCKET`). Narrowing it needs a measurement of Cloud
+Hypervisor's use first (Planned, below); the DHCP responder never uses it
+and its Designed allowlist filter would deny it.
+
+Every update of the pinned Cloud Hypervisor version must check the filter
+again: for each denied call, confirm that the new version still uses it
+only for a feature Baryon does not support, and run
+`tests/e2e/lifecycle.sh` with `NODE_SHELL` set (see [hadron.md](hadron.md#updating-the-pinned-cloud-hypervisor-version)).
+
+Unit tests (`crates/virtd/src/seccomp.rs`; each runs in a forked child with
+`no_new_privs` and the filter installed):
+
+- a user-mode-only `userfaultfd` fails with `EPERM`; an unfiltered control
+  child must succeed, so the test cannot pass on a host that refuses the
+  call anyway (skipped on a kernel without `userfaultfd`);
+- `ptrace`, `process_vm_readv`, `process_vm_writev`, and `pidfd_getfd` fail
+  with `EPERM` while `getpid` works;
+- an `AF_UNIX` socket can be created; `AF_INET`, `AF_INET6`, `AF_NETLINK`,
+  and `AF_PACKET` sockets fail with `EPERM`;
+- an x32 `getpid` fails with `EPERM`;
+- an i386 `getpid` through `int 0x80` kills the child with `SIGSYS`
+  (skipped when IA32 emulation is disabled);
+- every jump in the program stays inside it, and the program ends in a
+  return.
+
+E2E checks (`tests/e2e/lifecycle.sh`, with `NODE_SHELL` set): every
+responder thread has seccomp mode 2 with exactly one filter; the VMM's main
+thread has mode 2 with exactly one filter, and every other VMM thread mode
+2 with at least two. Tested on the k0s cluster: every responder thread had
+mode 2 with one filter; the VMM's main thread had one filter and every
+other VMM thread two or three ([testing.md](testing.md#k0s-cluster)).
+
+Remaining hardening:
+
+| Item | Status |
+|---|---|
+| A strict allowlist seccomp filter for the DHCP responder | Designed |
+| Landlock rules for the DHCP responder | Designed |
+| Narrowing `io_uring`, after measuring Cloud Hypervisor's use | Planned |
 
 ## Guest attack surface
 
@@ -338,15 +474,24 @@ What it does not give:
 - DHCP: guest-sent DHCP frames are parsed by the DHCP responder process,
   not by baryon-virtd. The responder runs with the VMM's confinement (the
   VM's identity, no capabilities, `no_new_privs`, empty network namespace, Anchor
-  container cgroup) and holds only the packet socket, its stdin and stdout
-  pipes, and its log file. A guest that exploits the parser gains that
-  identity, which it could reach through the VMM anyway. baryon-virtd reads
-  the responder's events as untrusted input: lines are limited to 4 KiB and
-  an event is ignored unless its address and MAC match the lease. The
-  responder exits when its stdin closes, so it never outlives the
-  baryon-virtd that started it. A responder that exits while the VM runs
+  container cgroup, Baryon's seccomp filter as its only filter) and holds
+  only the packet socket, its stdin and stdout pipes, and its log file. A
+  guest that exploits the parser gains that identity, which it could reach
+  through the VMM anyway. baryon-virtd reads the responder's events as
+  untrusted input: lines are limited to 4 KiB, and an overlong or
+  unparseable line, an acknowledgement for another address or MAC, or an
+  answer to a probe that was not sent (or a second answer) is a protocol
+  violation, after which baryon-virtd stops reading, kills the responder,
+  and restarts it with backoff. A compromised responder can therefore add
+  at most one warning per restart to baryon-virtd's log, whatever it
+  writes. The responder exits when its stdin closes, so it never outlives
+  the baryon-virtd that started it. A responder that exits, that answers
+  no liveness probe for 25 s, or that breaks its protocol while the VM runs
   is restarted for as long as the VM runs, with backoff from 1 s doubling
-  to at most 60 s (ADR 0007, revision of 2026-10-04). Accepted trade-off: a
+  to at most 60 s (ADR 0007, revisions of 2026-10-04). A killed responder
+  is waited for at most 60 s. Probe answers are a health signal, not a
+  security control: a compromised responder can answer probes without
+  serving the guest. Accepted trade-off: a
   guest that can crash the responder's parser gets a fresh responder about
   once a minute for as long as the VM runs, instead of 11 in total. Each
   restart is a new exec with the same confinement, the responder holds no
@@ -652,7 +797,7 @@ restart policy, runtime protocol 1.2, VirtualizationNode `status.vms`, and
 | Unbounded responder restarts: a guest that can crash the responder's parser gets a new responder about once a minute for as long as the VM runs, instead of 11 in total | Accepted (Guest attack surface; ADR 0007 revision of 2026-10-04): each restart is a fresh exec with the VMM's confinement, the responder holds no state, and without it the guest loses its address when its lease expires |
 | Node-sourced text in VM conditions: a node agent writes the reason and message that reach `NetworkReady` | Mitigated: baryon-controller sets the reason from the state, never from the node's text, and caps the node's message at 1024 bytes; the CRD limits `state` to an enum and `reason` and `message` to 64 and 1024 bytes; `baryon-node-agent-own-node` limits a node agent to its own node's VMs |
 | Repeated guest DHCP requests driving the responder log and baryon-virtd's work | Mitigated: at most one acknowledgement per 60 s reported by the responder and processed by baryon-virtd; repeats are logged at debug level. The log is not size-capped while the VM runs |
-| A responder that hangs without exiting | Open: not detected, because supervision sees only the exit (pidfd); `NetworkReady` stays True |
+| A responder that hangs without exiting | Fixed (2026-10-04): baryon-virtd probes the serving loop every 10 s through the responder's stdin and kills and restarts a responder that answered no probe for 25 s; `NetworkReady` is True only after the first answer, and after a failure only once the new responder has kept answering for 25 s (review of probes and seccomp below). Tested: unit tests and the hang cases of `tests/e2e/network-health.sh` on the k0s cluster |
 
 Findings of the 2026-10-04 review of the live migration evaluation
 (ADR 0013). Live migration is Not supported, so no finding applies to the
@@ -668,8 +813,24 @@ running system; each is recorded as an entry criterion for a future design
 | Disk locks are host-local and released before the switchover; `ClaimInUse` and `DiskInUse` do not cover two copies of one VM on different nodes, so fencing must be enforced on the data path | Medium | Not applicable; entry criterion 3 |
 | Memory payload sizes are chosen by the peer | Low | Not applicable; entry criterion 5 |
 | The destination checks CPU compatibility by CPUID only; MSRs and mitigation-relevant enumeration are unverified | Low | Not applicable; entry criterion 9 |
-| Cloud Hypervisor's seccomp profile allows `userfaultfd` and inet sockets that Baryon does not use | Low | Open (Future hardening) |
+| Cloud Hypervisor's seccomp profile allows `userfaultfd` and inet sockets that Baryon does not use | Low | Fixed (2026-10-04): Baryon's seccomp filter denies `userfaultfd` and every socket family other than `AF_UNIX` on every thread of the VMM and the responder ([Baryon seccomp layer](#baryon-seccomp-layer)) |
 | The experiment ran outside Baryon's confinement (root VMM, host network namespace, plain TCP, no Landlock, shared device outside claim exclusion) | Note | Documented (ADR 0013 and above); validates no security property |
+
+Findings of the 2026-10-04 review of the DHCP responder liveness probes and
+Baryon's seccomp layer:
+
+| Finding | State |
+|---|---|
+| The unit test for `userfaultfd` did not set `UFFD_USER_MODE_ONLY`, so it passed on hosts that refuse the privileged call anyway | Fixed: the test uses the user-mode-only flag and requires an unfiltered control child to succeed |
+| The E2E seccomp check read only the main thread of each process | Fixed: `lifecycle.sh` reads every thread of the VMM and the responder |
+| `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, and sockets other than `AF_UNIX` were reachable from threads without a Cloud Hypervisor filter | Fixed: denied by Baryon's filter |
+| Every bad responder output line produced a warning in baryon-virtd's log, without bound | Fixed: the first protocol violation stops reading and restarts the responder, so warnings are bounded by the restart backoff |
+| The outage scripts overwrote any existing affinity of the node agent DaemonSet | Fixed: `network-health.sh` and `node-agent-outage.sh` refuse to run if the DaemonSet already has an affinity |
+| A responder that hung while its VM was stopping was restarted | Fixed: no probes and no restart while the VM stops |
+| The kill on a foreign architecture was not tested | Fixed: unit test (i386 call through `int 0x80` ends in `SIGSYS`) |
+| The reaper of a killed responder waited without bound | Fixed: it waits at most 60 s, then logs a warning and stops waiting |
+| The DHCP responder has no allowlist seccomp filter and no Landlock rules | Open (Future hardening, Designed) |
+| Cloud Hypervisor's query of the TAP MTU in the VMM's empty network namespace may fail silently | Mitigated: the guest gets the pod interface MTU through DHCP option 26; not verified at runtime |
 
 ## Future hardening
 
@@ -677,7 +838,10 @@ running system; each is recorded as an entry criterion for a future design
 |---|---|
 | Verify the anchor through the kubelet pod resources API (pod was allocated the vm resource), in addition to the identity check | Designed |
 | Reduce baryon-virtd's capability set; seccomp and Landlock for baryon-virtd | Designed |
-| A Baryon-owned seccomp or Landlock layer for the VMM on top of Cloud Hypervisor's, denying at least `userfaultfd` and AF_INET and AF_INET6 sockets, which Baryon does not use (Cloud Hypervisor v53 allows both). The Hadron image sets `vm.unprivileged_userfaultfd` to 0 and `/dev/userfaultfd` is root-only (checked on a node on 2026-10-04), which still lets an unprivileged process create a user-mode-only userfaultfd | Designed |
+| Baryon seccomp layer for the VMM and the DHCP responder, under Cloud Hypervisor's filters: denies `userfaultfd`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd`, sockets other than `AF_UNIX`, and foreign ABIs ([Baryon seccomp layer](#baryon-seccomp-layer)) | Tested: unit tests in CI; lifecycle E2E on the k0s cluster |
+| A strict allowlist seccomp filter for the DHCP responder | Designed |
+| Landlock rules for the DHCP responder | Designed |
+| A Baryon-owned Landlock layer for the VMM beyond the writable-directory rule | Designed |
 | Kubernetes user namespaces (`hostUsers: false`) as additional hardening for the Anchor container; not the VM identity contract (ADR 0011) | Planned (evaluation) |
 | A `/dev` check that works with runtime bind-mounted device nodes before user namespaces are adopted | Planned |
 | `ReadWriteOncePod` for claims Baryon creates where the CSI driver supports it | Planned |

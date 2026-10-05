@@ -150,24 +150,74 @@ from the host's and contained only loopback. See [security.md](security.md).
 
 ## Guest network service health
 
-baryon-virtd supervises each VM's DHCP responder through its pidfd
-(`crates/virtd/src/vm.rs`). Status: Tested by unit tests and by the E2E
-test `tests/e2e/network-health.sh` on the k0s cluster with ceph-rbd and
-lvm-local, covering a restart after one kill, `DhcpResponderFailing` under
-repeated kills, a guest without an address, Anchor Pod replacement, a
-baryon-virtd restart, the node agent removed from the VM's node, and a node
-reboot ([testing.md](testing.md#k0s-cluster)). A responder that hangs
-without exiting is not tested; see Limits.
+baryon-virtd supervises each VM's DHCP responder through its pidfd and
+through liveness probes (`crates/virtd/src/vm.rs`,
+`crates/virtd/src/dhcp_helper.rs`). Status: Tested by unit tests and by
+the E2E test `tests/e2e/network-health.sh` on the k0s cluster with
+ceph-rbd and lvm-local, covering a restart after one kill,
+`DhcpResponderFailing` under repeated kills, a guest without an address
+while its responder was killed from the start, Anchor Pod replacement, a
+baryon-virtd restart, the node agent removed from the VM's node, and a
+node reboot ([testing.md](testing.md#k0s-cluster)). Hang detection is
+Tested by unit tests and by the cases hang, hang-repeated, and
+before-lease (which hangs the responder with SIGSTOP instead of killing it)
+of the same script on the k0s cluster with ceph-rbd and lvm-local.
 
-- A responder that exits while the VM runs is restarted for as long as the
-  VM runs, with backoff from 1 s, doubling to at most 60 s. The count of
-  consecutive failures resets after a responder ran for 5 minutes, not when
-  the anchor reattaches.
-- State reported by baryon-virtd (runtime protocol 1.2): `Ready` when a
-  responder has started, `Restarting` after a failure, and `Failing` from
-  the 11th consecutive failure on. baryon-virtd also reports the time of
-  the last lease acknowledgement and the lease expiry (acknowledgement plus
-  86400 s), and clears the state when the VM stops.
+Health contract, three levels:
+
+| Level | Evidence | Measured by baryon-virtd |
+|---|---|---|
+| The process exists | its pidfd | yes |
+| The process is responsive | an answer to a liveness probe from the DHCP serving loop | yes |
+| The network infrastructure is usable: the guest can get or renew a lease, and the pod network passes its traffic | none, apart from the time of the last lease acknowledgement | no |
+
+Liveness probes:
+
+- The control channel is the responder's existing stdin and stdout pipes;
+  there is no extra socket. Every 10 s baryon-virtd writes a line
+  `{"probe":<n>}` to the responder's stdin. The pipe is non-blocking on
+  baryon-virtd's side, and a probe line is at most 31 bytes, below
+  `PIPE_BUF`, so a write either completes or fails; a failed write counts
+  as a missing answer.
+- The responder's DHCP serving loop answers each probe between packets
+  with an `Alive` event on stdout, whether or not the guest sends
+  anything. A responder whose loop is stuck stops answering although its
+  process exists.
+- baryon-virtd accepts answers only to probes it sent to the current
+  responder. A responder that answers no probe for 25 s is killed through
+  its pidfd and restarted with the restart backoff below, and the hang
+  counts as a failure. A hang is therefore detected within about 35 s.
+- Any responder output that breaks the protocol (a line longer than
+  4 KiB, an unparseable line, an acknowledgement for another address, an
+  answer to a probe that was not sent, or a second answer to one probe)
+  makes baryon-virtd stop reading, kill the responder, and restart it
+  with backoff. baryon-virtd logs one warning per restart, so its log
+  output per responder is bounded by the restart backoff.
+- A killed responder is waited for at most 60 s. While the VM stops, no
+  probes are sent and no responder is restarted.
+- Probe answers are a health signal, not a security control: a compromised
+  responder can answer probes without serving the guest
+  ([security.md](security.md#guest-attack-surface)).
+
+Restarts and reported state:
+
+- A responder that exits, hangs, or breaks its protocol while the VM runs
+  is restarted for as long as the VM runs, with backoff from 1 s, doubling
+  to at most 60 s. The count of consecutive failures resets after a
+  responder ran for 5 minutes (for a hung responder, until its last probe
+  answer), not when the anchor reattaches.
+- State reported by baryon-virtd (runtime protocol 1.2): `Ready` once a
+  responder has answered its first liveness probe (after a failure: once a
+  new responder has kept answering for 25 s, so a responder that answers
+  once and hangs again does not show `Ready` between its failures),
+  `Restarting` after a failure, and `Failing` from the 11th consecutive
+  failure on. Until then the VM shows `NetworkReady` Unknown
+  (`NotReported`) on a first start, or keeps `Restarting` or `Failing`. The `Restarting` and
+  `Failing` messages name the cause: the responder stopped, stopped
+  answering liveness probes, or wrote output that breaks its protocol.
+  baryon-virtd also reports the time of the last lease acknowledgement and
+  the lease expiry (acknowledgement plus 86400 s), and clears the state
+  when the VM stops.
 - The responder reports at most one acknowledgement per 60 s to
   baryon-virtd and logs repeats within that interval at debug level only;
   baryon-virtd processes at most one acknowledgement per 60 s. The
@@ -184,10 +234,10 @@ without exiting is not tested; see Limits.
 
 Limits:
 
-- A responder that hangs without exiting is not detected: supervision sees
-  only its exit.
 - The state `Ready`, and with it `NetworkReady=True`, means that the
-  responder process started, not that it served a request.
+  responder runs and its serving loop answers liveness probes, not that it
+  served a request, that the guest can renew its lease, or that the pod
+  network passes traffic.
 - The node agent reports every 30 s by default (at most 30 s), which adds
   up to that much latency to `NetworkReady`.
 - The responder log (`ctl/dhcp.log` in the VM's runtime directory, see
@@ -220,10 +270,9 @@ Limits:
   baryon-virtd is back and the anchor has reattached; a running guest keeps
   its 24 h lease. See [Guest network service health](#guest-network-service-health)
   for restarts while the VM runs.
-- The separate responder process is Tested on the kind host (confinement,
-  crash restart, one new responder after a baryon-virtd restart, a new lease
-  after a guest reset) and on the Hadron node (confinement after a node
-  reboot, replacement after a baryon-virtd restart), and on the k0s cluster
-  (restart after kills, replacement after a baryon-virtd restart and after
-  a node reboot, by `tests/e2e/network-health.sh`); see
+- The separate responder process is Tested on the k0s cluster (restart
+  after kills, replacement after a baryon-virtd restart and after a node
+  reboot, by `tests/e2e/network-health.sh`) and on the Hadron node
+  (confinement after a node reboot, replacement after a baryon-virtd
+  restart, a new lease after a guest reset); see
   [testing.md](testing.md#results).

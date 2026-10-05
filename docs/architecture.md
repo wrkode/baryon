@@ -356,7 +356,11 @@ Hadron image, running as root, not a Kubernetes client (ADR 0005). It:
   VMM's confinement; baryon-virtd does not parse guest frames itself
   (Tested on the Hadron node and the kind host); restarts the responder
   with backoff for as long as the VM runs and reports its state in the VM
-  status (ADR 0007; Implemented, unit tests)
+  status (ADR 0007; Implemented, unit tests); probes the responder's
+  serving loop for liveness every 10 s over its stdin and stdout pipes and
+  restarts a responder that answers no probe for 25 s or whose output
+  breaks the protocol (ADR 0007 revision of 2026-10-04; Tested: unit
+  tests and `tests/e2e/network-health.sh` on the k0s cluster)
 - resolves the disk inside the pod mount namespace, accepting only the two
   Anchor container disk paths with their kind (`/var/lib/baryon/disks/root/disk.img`
   as a regular file, `/dev/baryon/root` as a block device on the
@@ -364,7 +368,10 @@ Hadron image, running as root, not a Kubernetes client (ADR 0005). It:
   node uses (`DiskInUse`, kept in the runtime record across restarts)
 - starts Cloud Hypervisor as the VM's host identity, without capabilities and with
   an empty bounding set, in a new, empty network namespace, in the Anchor
-  container's cgroup, with seccomp and Landlock; the only extra Landlock
+  container's cgroup, with Baryon's seccomp filter installed before
+  `execve` (also for the DHCP responder; see
+  [security.md](security.md#baryon-seccomp-layer)) under Cloud
+  Hypervisor's own filters, and with Landlock; the only extra Landlock
   rule makes the VM's own `vmm` runtime directory writable, which a guest
   reset needs (Tested on the Hadron node and the kind host)
 - mounts a private tmpfs on that `vmm` directory (32 MiB, 256 inodes, mode
@@ -477,7 +484,7 @@ that no longer match.
 | baryon-anchor | baryon-virtd | gRPC over `/run/baryon/anchor/virtd.sock` (0666; peer checks per connection and per attach) | attach, stop, VM status |
 | baryon-node-agent | baryon-virtd | gRPC over `/run/baryon/node/virtd.sock` (0600 in a 0700 directory; peer uid 0 required) | host info, VM list with each VM's network status |
 | baryon-virtd | Cloud Hypervisor | command line, inherited fds, HTTP over its API socket in the root-only `ctl` directory of the VM runtime directory | VM operations |
-| baryon-virtd | DHCP responder | inherited packet socket; lease as one JSON line on stdin; acknowledged leases as JSON lines on stdout, checked against the lease | guest addressing |
+| baryon-virtd | DHCP responder | inherited packet socket; lease as one JSON line on stdin, then a liveness probe line every 10 s; acknowledged leases, checked against the lease, and probe answers as JSON lines on stdout; any other output restarts the responder | guest addressing, liveness |
 
 No component listens on TCP. The Cloud Hypervisor API is never exposed
 outside baryon-virtd. The protocol is defined in `crates/runtime-api/proto/`

@@ -253,7 +253,7 @@ Conditions:
 | `StorageReady` | The claim is bound and the disk is in place: for an `http` source, its import is recorded on the PersistentVolume. | `ClaimPending`, `ImportPending`, `ImportingDisk`, `ImportFailed`, `ClaimNotFound`, `ClaimConflict`, and the import refusals `DiskNotProvisionedForClaim`, `DiskInitializedForAnotherClaim`, `DiskSourceMismatch`, `DiskImportRecordInvalid`, `ImportStateUnknown`, `DiskBindingPending` |
 | `Running` | The Anchor container is running; it runs or starts the VMM (reason `AnchorRunning`). It does not by itself mean that the VMM runs. | `Starting`, `Stopping`, `Stopped`, `Pending`, and the failure reasons below |
 | `Ready` | The guest acquired its address over DHCP or showed a console login prompt (reason `GuestBooted`). | `Booting`, `ImportPending`, `ImportingDisk`, `ImportFailed`, the import refusals, `Pending`, `Unschedulable`, `PodRejected`, `Stopping`, `Stopped`, `AnchorPodConflict`, `ImportPodConflict`, `ClaimInUse`, and failure reasons such as `VmmKilled`, `VmmExited`, `ResourcesUnbounded`, `StorageFailed`, `DiskInUse`, `BlockDeviceAccessDenied`, `NetworkFailed`, `CgroupDriverUnsupported`, `AttachRefused`, `ProtocolIncompatible`, `UnsupportedFeature`, `IdentityConflict` |
-| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running (reason `AddressServiceRunning`). Derived only while `Running` is True; see [NetworkReady](#networkready). | `DhcpResponderRestarting`, `DhcpResponderFailing`. Unknown: `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning` |
+| `NetworkReady` | baryon-virtd on the VM's node reports the VM's DHCP responder running and answering liveness probes (reason `AddressServiceRunning`). Derived only while `Running` is True; see [NetworkReady](#networkready). | `DhcpResponderRestarting`, `DhcpResponderFailing`. Unknown: `RuntimeUnreachable`, `RuntimeDoesNotReport`, `NotReported`, `NotRunning` |
 | `RestartRequired` | The VM must be restarted to apply a change: `SpecChanged` (the class, or a spec field other than `placement`, changed after the Anchor Pod was created), `PlacementChanged` (`spec.placement` changed, see [Placement](#placement)), or `AnchorImageChanged` (baryon-controller now uses a different anchor image). When several apply, the first in this order is reported. | `UpToDate` |
 
 Precedence: an existing Anchor Pod decides `Running` and `Ready`. Class or
@@ -352,18 +352,30 @@ node agent of the VM's node is gone for longer than 90 s), with `Ready`
 staying True ([testing.md](testing.md#k0s-cluster)). `tests/e2e/skew.sh`
 checks True from hosts at runtime protocol 1.2 and Unknown
 (`RuntimeDoesNotReport`) from a host at 1.1, on a cluster with mixed
-hosts. A baryon-controller restart while
-a node agent is down is covered by unit tests only.
+hosts. Tested on the k0s cluster: responder hangs (`network-health.sh`
+cases hang, hang-repeated, and before-lease, which hangs the responder
+instead of killing it), and a baryon-controller restart while a node agent
+is down (`tests/e2e/node-agent-outage.sh`: `NetworkReady` stayed Unknown,
+`RuntimeUnreachable`, and never read True from the stale report).
 
 | Status | Reason | Meaning |
 |---|---|---|
-| True | `AddressServiceRunning` | The responder process started. It does not show that it served a request. |
-| False | `DhcpResponderRestarting` | The responder stopped; baryon-virtd restarts it with backoff of at most 60 s. |
-| False | `DhcpResponderFailing` | The responder failed more than 10 times in a row; baryon-virtd keeps restarting it every 60 s. |
+| True | `AddressServiceRunning` | The responder runs and its DHCP serving loop answers liveness probes (message: "the DHCP responder for the guest runs and answers liveness probes"). It does not show that the guest can get or renew a lease, or that the pod network passes traffic. |
+| False | `DhcpResponderRestarting` | The responder stopped serving and baryon-virtd restarts it with backoff of at most 60 s. The message names the cause: it stopped, it stopped answering liveness probes, or it wrote output that breaks its protocol. |
+| False | `DhcpResponderFailing` | The responder failed more than 10 times in a row; baryon-virtd keeps restarting it every 60 s. The message names the cause of the last failure. |
 | Unknown | `RuntimeUnreachable` | The node has no report, its report is stale (the controller has not seen its heartbeat change for 90 s), or its `RuntimeHealthy` condition is not True (its reason is in the message). |
 | Unknown | `RuntimeDoesNotReport` | The node's baryon-virtd speaks runtime protocol 1.1 or earlier and does not report the responder. |
-| Unknown | `NotReported` | The node's report has no entry for the current Anchor Pod. |
+| Unknown | `NotReported` | The node's report has no entry for the current Anchor Pod. On a VM's first start this lasts until the responder has answered its first liveness probe and the node agent has reported it. |
 | Unknown | `NotRunning` | The VM is not running on a node. |
+
+baryon-virtd sends a liveness probe to the responder every 10 s and
+reports it as running only after its first answer; after a failure, only
+after a new responder has kept answering for 25 s. A responder that
+answers no probe for 25 s is killed and restarted, which counts as a
+failure. baryon-virtd therefore detects a hang within about 35 s, and the
+condition shows it at most one node agent interval later. Before the first
+answer, a first start shows Unknown (`NotReported`), and a restart keeps
+`DhcpResponderRestarting` or `DhcpResponderFailing`.
 
 baryon-controller sets the reason from the reported state, never from the
 node's text, and caps the node's message at 1024 bytes. When False, the
@@ -377,9 +389,9 @@ Reading `Ready` and `NetworkReady` together:
 
 | Ready | NetworkReady | Meaning |
 |---|---|---|
-| False, `Booting` | True | A normal start: the responder runs, and the guest has not yet acquired its address or shown a login prompt. |
-| False, `Booting` | Unknown, `NotReported` | Early in a start, until the node agent's next report. |
-| True | True | The guest booted and its address service runs. |
+| False, `Booting` | True | A normal start: the responder runs and answers liveness probes, and the guest has not yet acquired its address or shown a login prompt. |
+| False, `Booting` | Unknown, `NotReported` | Early in a start, until the responder has answered its first liveness probe and the node agent has reported it. |
+| True | True | The guest booted and its address service runs and answers liveness probes. |
 | True | False | The guest has its address and keeps it until the time in the message; it loses it after that unless the responder recovers. |
 | any | Unknown, `NotRunning` | The VM is not running. |
 

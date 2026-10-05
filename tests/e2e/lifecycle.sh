@@ -79,6 +79,31 @@ wait_for "VM becomes Ready" ready_is True
 first_pod="$(pod_uid)"
 first_node="$(node_of_pod "$vm-anchor")"
 "${k[@]}" get virtualmachine "$vm"
+if [ -n "${NODE_SHELL:-}" ]; then
+  # thread_filters <node> <pod-uid> <process>: "<tid> <seccomp mode>
+  # <filters>" for every thread of the VM's process (cloud-hypervisor or
+  # baryon-dhcp), leader first. The name has a bracketed first letter so the
+  # pattern does not match this scan itself.
+  thread_filters() {
+    host "$1" "for c in /proc/[0-9]*/cmdline; do l=\$(tr '\\0' ' ' < \$c 2>/dev/null); case \"\$l\" in *$3*$2*) p=\${c%/cmdline}; p=\${p#/proc/}; for t in \$p \$(ls /proc/\$p/task | grep -vx \$p); do echo \$t \$(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/\$p/task/\$t/status) \$(sed -n 's/^Seccomp_filters:[[:space:]]*//p' /proc/\$p/task/\$t/status); done; break;; esac; done"
+  }
+  # Baryon's filter is the floor on every thread; Cloud Hypervisor adds its
+  # own on every thread but the main one; the responder has only Baryon's.
+  t="$(thread_filters "$first_node" "$first_pod" "[b]aryon-dhcp")"
+  log "responder threads (tid mode filters): $(tr '\n' ';' <<<"$t")"
+  if [ -n "$t" ] && awk '$2 != 2 || $3 != 1 { bad = 1 } END { exit bad }' <<<"$t"; then
+    ok "every DHCP responder thread runs under Baryon's seccomp filter only"
+  else
+    bad "DHCP responder seccomp state unexpected"
+  fi
+  t="$(thread_filters "$first_node" "$first_pod" "[c]loud-hypervisor")"
+  log "VMM threads (tid mode filters): $(tr '\n' ';' <<<"$t")"
+  if [ -n "$t" ] && awk 'NR == 1 && ($2 != 2 || $3 != 1) { bad = 1 } NR > 1 && ($2 != 2 || $3 < 2) { bad = 1 } END { exit bad || NR < 2 }' <<<"$t"; then
+    ok "VMM main thread under Baryon's filter, every other thread under Baryon's and Cloud Hypervisor's"
+  else
+    bad "VMM seccomp state unexpected"
+  fi
+fi
 network_check "guest reachable over the pod network"
 if [ "${SKIP_NETWORK:-0}" != 1 ]; then
   "${k[@]}" apply -f - >/dev/null <<YAML

@@ -171,3 +171,8 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
 - 2026-10-04: the live migration consequences now link ADR 0013, which
   evaluates the TCP transport, the relay through baryon-virtd, and a
   different network attachment. The decision is unchanged.
+- 2026-10-04: baryon-virtd adds its own seccomp filter as the last step
+  before exec of the VMM and the DHCP responder, under Cloud Hypervisor's
+  filters (see [security.md](../security.md#baryon-seccomp-layer)). It
+  denies only what Baryon's supported features never need, and is the only
+  filter on Cloud Hypervisor's main thread. The decision is unchanged.

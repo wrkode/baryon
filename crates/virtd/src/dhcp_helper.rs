@@ -11,14 +11,21 @@
 //!
 //! Protocol between the two processes:
 //!
-//! - stdin: one line of JSON, the [`LeaseConfig`]. The parent keeps the pipe
-//!   open afterwards. End of file means the parent stopped the responder or
-//!   exited, and the responder exits. A responder therefore never outlives
-//!   the baryon-virtd that started it; after a restart, baryon-virtd starts
-//!   a new one when the anchor reattaches.
-//! - stdout: one line of JSON per [`DhcpEvent`]. The parent treats these as
-//!   untrusted: lines are length-limited and events that do not match the
-//!   lease are ignored.
+//! - stdin: one line of JSON, the [`LeaseConfig`], then one line per
+//!   liveness probe, `{"probe":<n>}`. End of file means the parent stopped
+//!   the responder or exited, and the responder exits. A responder
+//!   therefore never outlives the baryon-virtd that started it; after a
+//!   restart, baryon-virtd starts a new one when the anchor reattaches.
+//! - stdout: one line of JSON per [`DhcpEvent`]. The DHCP serving loop
+//!   answers each probe with [`DhcpEvent::Alive`], so a responder whose loop
+//!   is stuck stops answering although its process exists. The parent
+//!   treats all events as untrusted. A legitimate responder writes only
+//!   well-formed events for its lease, at most one answer per probe; any
+//!   other output (an overlong or unparseable line, an acknowledgement for
+//!   another address, an answer to a probe not sent) is a protocol
+//!   violation: the parent stops reading, and the supervisor kills and
+//!   restarts the responder. Its log output is therefore bounded by the
+//!   restart backoff, whatever a compromised responder writes.
 //! - stderr: log lines, appended to a root-only file.
 
 use std::ffi::OsString;
@@ -46,6 +53,18 @@ const MAX_CONFIG_BYTES: u64 = 64 * 1024;
 
 /// Longest event line the parent accepts from the responder.
 const MAX_EVENT_LINE: usize = 4096;
+
+/// How long a stopped responder is waited for after SIGKILL.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Longest probe line the responder reads from the parent.
+const MAX_PROBE_LINE: u64 = 256;
+
+/// A liveness probe line on the responder's stdin.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Probe {
+    probe: u64,
+}
 
 /// A running responder process, from the parent's side.
 #[derive(Debug)]
@@ -124,6 +143,17 @@ pub fn start(req: StartRequest<'_>) -> Result<Responder, VmmError> {
         Some(out) => tokio::process::ChildStdout::from_std(out),
         None => Err(io::Error::other("responder stdout is not a pipe")),
     };
+    // Probes are written later from the VM supervisor's task: never block
+    // it on a responder that does not read. A probe line is shorter than
+    // PIPE_BUF, so a write either completes or fails with EAGAIN.
+    let written = written.and_then(|()| match responder.stdin.as_ref() {
+        Some(stdin) => {
+            let flags = rustix::fs::fcntl_getfl(stdin)?;
+            rustix::fs::fcntl_setfl(stdin, flags | rustix::fs::OFlags::NONBLOCK)
+                .map_err(io::Error::from)
+        }
+        None => Ok(()),
+    });
     let stdout = match written.and(stdout) {
         Ok(out) => out,
         Err(e) => {
@@ -136,6 +166,16 @@ pub fn start(req: StartRequest<'_>) -> Result<Responder, VmmError> {
 }
 
 impl Responder {
+    /// Send liveness probe `probe`. An error (including a full pipe) means
+    /// the responder does not read its probes.
+    pub fn probe(&mut self, probe: u64) -> io::Result<()> {
+        let Some(stdin) = self.stdin.as_mut() else {
+            return Err(io::Error::other("responder stdin is closed"));
+        };
+        let line = serde_json::to_string(&Probe { probe }).map_err(io::Error::other)?;
+        stdin.write_all(format!("{line}\n").as_bytes())
+    }
+
     /// Stop the responder: close its stdin, kill it, and reap it in the
     /// background.
     pub fn stop(mut self) {
@@ -148,8 +188,17 @@ impl Responder {
         );
         let process = self.process;
         tokio::spawn(async move {
-            let _ = vmm::wait_exit(&process.pidfd).await;
-            vmm::reap(process.pidfd.as_fd(), process.is_child);
+            // SIGKILL ends it unless it is stuck in the kernel; do not hold
+            // a task and a descriptor for it forever.
+            match tokio::time::timeout(REAP_TIMEOUT, vmm::wait_exit(&process.pidfd)).await {
+                Ok(_) => {
+                    vmm::reap(process.pidfd.as_fd(), process.is_child);
+                }
+                Err(_) => tracing::warn!(
+                    pid = process.pid,
+                    "a killed DHCP responder has not exited; no longer waiting for it"
+                ),
+            }
         });
     }
 
@@ -161,7 +210,7 @@ impl Responder {
 }
 
 /// Read event lines from the responder and pass on the ones that match the
-/// lease.
+/// lease. Stops at the first protocol violation and reports it.
 async fn forward_events<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     lease: LeaseConfig,
@@ -169,6 +218,9 @@ async fn forward_events<R: tokio::io::AsyncRead + Unpin>(
 ) {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut line = Vec::with_capacity(256);
+    let violation = |what: &str| DhcpEvent::ProtocolViolation {
+        what: what.to_owned(),
+    };
     loop {
         line.clear();
         let limit = u64::try_from(MAX_EVENT_LINE).unwrap_or(u64::MAX) + 1;
@@ -177,7 +229,7 @@ async fn forward_events<R: tokio::io::AsyncRead + Unpin>(
             Ok(_) => {}
         }
         if line.last() != Some(&b'\n') {
-            tracing::warn!("DHCP responder wrote an overlong line; ignoring its output");
+            let _ = events.send(violation("an overlong line")).await;
             return;
         }
         match serde_json::from_slice::<DhcpEvent>(&line) {
@@ -188,10 +240,24 @@ async fn forward_events<R: tokio::io::AsyncRead + Unpin>(
                     return;
                 }
             }
-            Ok(other) => {
-                tracing::warn!(event = ?other, "DHCP responder reported an event that does not match the lease");
+            // The supervisor accepts only answers to probes it sent to this
+            // responder.
+            Ok(ev @ DhcpEvent::Alive { .. }) => {
+                if events.send(ev).await.is_err() {
+                    return;
+                }
             }
-            Err(e) => tracing::warn!(error = %e, "unparseable DHCP responder event"),
+            Ok(DhcpEvent::Acknowledged { .. }) => {
+                let _ = events
+                    .send(violation("an acknowledgement for another address"))
+                    .await;
+                return;
+            }
+            // Not deserializable; listed for completeness.
+            Ok(DhcpEvent::ProtocolViolation { .. }) | Err(_) => {
+                let _ = events.send(violation("an unparseable line")).await;
+                return;
+            }
         }
     }
 }
@@ -219,12 +285,27 @@ pub fn run_child(socket_fd: RawFd) -> anyhow::Result<()> {
         .context("building tokio runtime")?;
     rt.block_on(async move {
         let cancel = CancellationToken::new();
-        // End of file on stdin: the parent stopped us or is gone.
+        // Probes from the parent, answered by the serving loop. End of file
+        // on stdin: the parent stopped us or is gone.
+        let (probe_tx, probe_rx) = mpsc::channel(4);
         let on_eof = cancel.clone();
         std::thread::spawn(move || {
-            let mut buf = [0u8; 256];
             let mut stdin = io::stdin().lock();
-            while matches!(stdin.read(&mut buf), Ok(n) if n > 0) {}
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match (&mut stdin).take(MAX_PROBE_LINE).read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                // An unreadable line is ignored; a missing answer is what the
+                // parent acts on.
+                if let Ok(p) = serde_json::from_str::<Probe>(&line) {
+                    // A full channel means the serving loop is not taking
+                    // probes; dropping more of them changes nothing.
+                    let _ = probe_tx.try_send(p.probe);
+                }
+            }
             on_eof.cancel();
         });
         let (tx, mut rx) = mpsc::channel(8);
@@ -239,7 +320,7 @@ pub fn run_child(socket_fd: RawFd) -> anyhow::Result<()> {
                 }
             }
         });
-        let result = dhcp::serve(socket, lease, tx, cancel).await;
+        let result = dhcp::serve(socket, lease, tx, probe_rx, cancel).await;
         writer.abort();
         result
     })
@@ -327,7 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwards_only_events_matching_the_lease() {
+    async fn forwards_events_and_stops_at_a_protocol_violation() {
         let good = DhcpEvent::Acknowledged {
             ip: Ipv4Addr::new(10, 42, 0, 13),
             mac: lease().client_mac,
@@ -336,13 +417,51 @@ mod tests {
             ip: Ipv4Addr::new(10, 42, 0, 99),
             mac: lease().client_mac,
         };
+        let good_line = serde_json::to_string(&good).unwrap();
+        // Everything after the first violation is ignored.
         let input = format!(
-            "{}\n{}\nnot json\n{}\n",
-            serde_json::to_string(&wrong_ip).unwrap(),
-            serde_json::to_string(&good).unwrap(),
-            serde_json::to_string(&good).unwrap(),
+            "{good_line}\n{}\n{good_line}\n",
+            serde_json::to_string(&wrong_ip).unwrap()
         );
-        assert_eq!(forwarded(input.as_bytes()).await, vec![good.clone(), good]);
+        assert_eq!(
+            forwarded(input.as_bytes()).await,
+            vec![
+                good.clone(),
+                DhcpEvent::ProtocolViolation {
+                    what: "an acknowledgement for another address".into()
+                }
+            ]
+        );
+        let input = format!("not json\n{good_line}\n");
+        assert_eq!(
+            forwarded(input.as_bytes()).await,
+            vec![DhcpEvent::ProtocolViolation {
+                what: "an unparseable line".into()
+            }]
+        );
+        // The supervisor's own event cannot be sent by the responder.
+        let input = "{\"protocolViolation\":{\"what\":\"x\"}}\n";
+        assert_eq!(
+            forwarded(input.as_bytes()).await,
+            vec![DhcpEvent::ProtocolViolation {
+                what: "an unparseable line".into()
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn forwards_probe_answers() {
+        let alive = DhcpEvent::Alive { probe: 7 };
+        let input = format!("{}\n", serde_json::to_string(&alive).unwrap());
+        assert_eq!(forwarded(input.as_bytes()).await, vec![alive]);
+    }
+
+    #[test]
+    fn probe_lines_are_short_json() {
+        let line = serde_json::to_string(&Probe { probe: u64::MAX }).unwrap();
+        assert_eq!(line, format!("{{\"probe\":{}}}", u64::MAX));
+        assert!((line.len() as u64) < MAX_PROBE_LINE);
+        assert!(serde_json::from_str::<Probe>("{\"probe\":3}\n").is_ok());
     }
 
     #[tokio::test]
@@ -353,6 +472,11 @@ mod tests {
         })
         .unwrap();
         let input = format!("{}\n{}\n", "x".repeat(MAX_EVENT_LINE + 10), good);
-        assert!(forwarded(input.as_bytes()).await.is_empty());
+        assert_eq!(
+            forwarded(input.as_bytes()).await,
+            vec![DhcpEvent::ProtocolViolation {
+                what: "an overlong line".into()
+            }]
+        );
     }
 }

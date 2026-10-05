@@ -51,13 +51,17 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   the pod's resolv.conf, and the VM name as hostname.
 - baryon-virtd restarts a responder that exits for as long as the VM runs,
   with backoff from 1 s, doubling to at most 60 s. The count of consecutive
-  failures resets after a responder ran for 5 minutes. It reports the
-  responder's state: Ready when a responder has started, Restarting after
-  a failure, and Failing from the 11th consecutive failure on. The state
-  reaches the cluster as the VM's `NetworkReady` condition (ADR 0008,
-  runtime protocol 1.2 in ADR 0012). The responder reports at most one
-  lease acknowledgement per 60 s, and baryon-virtd keeps the time of the
-  last one in the VM's runtime record.
+  failures resets after a responder ran for 5 minutes. baryon-virtd probes
+  the responder's DHCP serving loop for liveness every 10 s over the
+  responder's stdin and stdout pipes and treats a responder that answers no
+  probe for 25 s, or whose output breaks the protocol, like one that
+  exited: it kills and restarts it with the same backoff. It reports the
+  responder's state: Ready once a responder has answered its first
+  liveness probe, Restarting after a failure, and Failing from the 11th
+  consecutive failure on. The state reaches the cluster as the VM's
+  `NetworkReady` condition (ADR 0008, runtime protocol 1.2 in ADR 0012).
+  The responder reports at most one lease acknowledgement per 60 s, and
+  baryon-virtd keeps the time of the last one in the VM's runtime record.
 - The SMBIOS system serial number is `ds=nocloud;i=<VM UID>;h=<VM name>`,
   which enables cloud-init's NoCloud datasource and its fallback DHCP
   configuration in cloud images without a metadata server.
@@ -97,8 +101,12 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
 - A guest whose responder keeps failing keeps its address until its lease
   expires; `NetworkReady` is False from the first failure (within one node
   agent interval) and its message
-  gives the lease expiry. A responder that hangs without exiting is not
-  detected: baryon-virtd sees only its exit (pidfd).
+  gives the lease expiry. A responder that hangs without exiting is
+  detected within about 35 s and restarted. A probe answer shows that the
+  serving loop runs, not that the guest can get or renew a lease or that
+  the pod network passes traffic, and it is a health signal, not a
+  security control: a compromised responder can answer without serving
+  ([networking.md](../networking.md#guest-network-service-health)).
 - The guest routes exactly like the pod: same-node and cross-node traffic
   both worked with kindnet, which routes the pod subnet through the gateway.
   With flannel (a bridge, `cni0`), guest ping and SSH from other pods worked,
@@ -195,4 +203,16 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   (it is not; a new one is started when the anchor reattaches).
 - 2026-10-04: the migration lines now link ADR 0013 (live migration Not
   supported) and its guest address entry criterion. The decision is
+  unchanged.
+- 2026-10-04: DHCP responder liveness probes. baryon-virtd writes a probe
+  line to the responder's stdin every 10 s; the DHCP serving loop answers
+  each on stdout. No new socket is added. A responder that answers no
+  probe for 25 s is killed through its pidfd and restarted with the
+  existing backoff, counted as a failure; any responder output that breaks
+  the protocol does the same. The responder is reported Ready only after
+  its first answer, not when its process has started; after a failure, only
+  after a new responder has kept answering for 25 s, so a responder that
+  answers once and hangs again does not show Ready. Rationale: a
+  responder that hung without exiting was not detected and `NetworkReady`
+  stayed True. The restart policy and the rest of the decision are
   unchanged.

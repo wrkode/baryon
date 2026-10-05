@@ -11,6 +11,7 @@ pub mod handoff;
 pub mod peer;
 pub mod podcgroup;
 pub mod record;
+pub mod seccomp;
 pub mod serial;
 pub mod services;
 pub mod vm;

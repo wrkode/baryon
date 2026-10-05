@@ -160,6 +160,7 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned, VmmError> {
         cmd.stdout(Stdio::piped());
     }
 
+    let mut seccomp_filter = crate::seccomp::filter();
     // SAFETY: the closure runs in the child between fork and execve, where
     // only async-signal-safe operations are allowed. It makes only direct
     // system calls (write, fcntl, setsid, unshare, prctl, setgroups, setgid,
@@ -167,9 +168,11 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned, VmmError> {
     // async-signal-safe list, but glibc and musl implement them as plain
     // system call wrappers without locks or allocation. The closure only
     // reads values computed before the fork (`inherit` and `groups` are
-    // never modified, so they are not reallocated) and allocates nothing.
-    // Every failure is reported as an io::Error, which std turns into a
-    // failed spawn in the parent.
+    // never modified, so they are not reallocated; the seccomp program is
+    // built before the fork, moved into the closure, and only read) and
+    // allocates nothing. Every
+    // failure is reported as an io::Error, which std turns into a failed
+    // spawn in the parent.
     unsafe {
         cmd.pre_exec(move || {
             // Move into the VMM cgroup first, while still privileged, so the
@@ -213,6 +216,9 @@ pub fn spawn(req: SpawnRequest<'_>) -> Result<Spawned, VmmError> {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
+            // Last: Baryon's seccomp layer (see `crate::seccomp`), under the
+            // filters Cloud Hypervisor installs itself.
+            crate::seccomp::install(&mut seccomp_filter)?;
             Ok(())
         });
     }

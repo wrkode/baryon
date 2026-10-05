@@ -88,6 +88,21 @@ const DHCP_FAILING_AFTER: u32 = 10;
 const DHCP_STABLE: Duration = Duration::from_secs(300);
 /// Upper bound of the restart backoff.
 const DHCP_MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How often a running responder is probed for liveness.
+const DHCP_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+/// A responder that answered no probe for this long is hung: it is killed
+/// and restarted. Two and a half probe intervals, so one late answer does
+/// not count.
+const DHCP_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Why the last responder stopped serving, for status messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DhcpFailure {
+    StartFailed,
+    Exited,
+    Unresponsive,
+    ProtocolViolation,
+}
 
 /// A reference to an anchor process, owned by the supervisor.
 #[derive(Debug)]
@@ -525,7 +540,12 @@ fn now_ms() -> i64 {
 /// `failures` since it last ran stably, and the last lease acknowledgement
 /// (Unix ms, 0 if none). Messages hold no relative times: they stay in the
 /// VM's condition until the state changes.
-fn network_status(state: (NetworkState, i64), failures: u32, last_ack: i64) -> NetworkStatus {
+fn network_status(
+    state: (NetworkState, i64),
+    failures: u32,
+    cause: DhcpFailure,
+    last_ack: i64,
+) -> NetworkStatus {
     let lease_expires = if last_ack > 0 {
         last_ack.saturating_add(i64::from(crate::handoff::dhcp::LEASE_SECONDS) * 1000)
     } else {
@@ -540,18 +560,30 @@ fn network_status(state: (NetworkState, i64), failures: u32, last_ack: i64) -> N
         "baryon-virtd restarts it with backoff of at most {} s",
         DHCP_MAX_BACKOFF.as_secs()
     );
+    let stopped = match cause {
+        DhcpFailure::StartFailed => "the DHCP responder could not be started",
+        DhcpFailure::Exited => "the DHCP responder stopped",
+        DhcpFailure::Unresponsive => {
+            "the DHCP responder stopped answering liveness probes and was stopped"
+        }
+        DhcpFailure::ProtocolViolation => {
+            "the DHCP responder wrote output that breaks its protocol and was stopped"
+        }
+    };
     let (reason, message) = match state.0 {
         NetworkState::Ready => (
             "AddressServiceRunning",
-            "the DHCP responder for the guest runs".to_owned(),
+            "the DHCP responder for the guest runs and answers liveness probes".to_owned(),
         ),
         NetworkState::Restarting => (
             "DhcpResponderRestarting",
-            format!("the DHCP responder stopped; {retry}; {lease}"),
+            format!("{stopped}; {retry}; {lease}"),
         ),
         NetworkState::Failing => (
             "DhcpResponderFailing",
-            format!("the DHCP responder failed {failures} times in a row; {retry}; {lease}"),
+            format!(
+                "the DHCP responder failed {failures} times in a row (last: {stopped}); {retry}; {lease}"
+            ),
         ),
         NetworkState::Unspecified => ("Unknown", String::new()),
     };
@@ -628,6 +660,16 @@ struct Supervisor {
     /// The DHCP responder process, while it runs.
     dhcp: Option<dhcp_helper::Responder>,
     dhcp_failures: u32,
+    dhcp_last_failure: DhcpFailure,
+    /// Liveness probes: the last probe number sent, the last one sent
+    /// before the current responder started, when the current responder
+    /// last answered (or started), and whether it has been reported Ready.
+    dhcp_probe_seq: u64,
+    dhcp_probe_base: u64,
+    /// The last probe the current responder answered.
+    dhcp_probe_answered: u64,
+    dhcp_alive_at: Option<std::time::Instant>,
+    dhcp_answered: bool,
     /// Reported state of the responder and when it last changed.
     dhcp_state: (NetworkState, i64),
     /// Last DHCP acknowledgement to the guest, Unix ms, 0 if none.
@@ -676,6 +718,12 @@ impl Supervisor {
             helpers: CancellationToken::new(),
             dhcp: None,
             dhcp_failures: 0,
+            dhcp_last_failure: DhcpFailure::Exited,
+            dhcp_probe_seq: 0,
+            dhcp_probe_base: 0,
+            dhcp_probe_answered: 0,
+            dhcp_alive_at: None,
+            dhcp_answered: false,
             dhcp_state: (NetworkState::Unspecified, 0),
             dhcp_last_ack: 0,
             dhcp_ack_processed: None,
@@ -1064,7 +1112,7 @@ impl Supervisor {
             Some(Ok(p)) => p,
             Some(Err(e)) => {
                 tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot open the VMM cgroup for the DHCP responder");
-                self.schedule_dhcp_restart();
+                self.schedule_dhcp_restart(DhcpFailure::StartFailed);
                 return;
             }
             None => return,
@@ -1092,11 +1140,17 @@ impl Supervisor {
             Ok(r) => {
                 tracing::info!(pod = %self.pod_uid(), pid = r.process.pid, "DHCP responder started");
                 self.dhcp = Some(r);
-                self.publish_network(NetworkState::Ready);
+                // Ready only once it answers a probe: a running process is
+                // not evidence that it serves.
+                self.dhcp_probe_base = self.dhcp_probe_seq;
+                self.dhcp_probe_answered = self.dhcp_probe_seq;
+                self.dhcp_alive_at = Some(std::time::Instant::now());
+                self.dhcp_answered = false;
+                self.probe_dhcp();
             }
             Err(e) => {
                 tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot start the DHCP responder");
-                self.schedule_dhcp_restart();
+                self.schedule_dhcp_restart(DhcpFailure::StartFailed);
             }
         }
     }
@@ -1116,10 +1170,74 @@ impl Supervisor {
         if ran >= DHCP_STABLE {
             self.dhcp_failures = 0;
         }
-        self.schedule_dhcp_restart();
+        self.schedule_dhcp_restart(DhcpFailure::Exited);
     }
 
-    fn schedule_dhcp_restart(&mut self) {
+    /// Probe the running responder, or restart it if it answered no probe
+    /// for [`DHCP_PROBE_TIMEOUT`].
+    fn probe_dhcp(&mut self) {
+        // While the VM stops, the responder is stopped with it.
+        if self.stopping.is_some() {
+            return;
+        }
+        let Some(r) = self.dhcp.as_mut() else {
+            return;
+        };
+        let alive_at = self.dhcp_alive_at.unwrap_or(r.started);
+        if alive_at.elapsed() >= DHCP_PROBE_TIMEOUT {
+            let Some(r) = self.dhcp.take() else {
+                return;
+            };
+            tracing::warn!(
+                pod = %self.pod_uid(),
+                pid = r.process.pid,
+                silent_s = alive_at.elapsed().as_secs(),
+                "DHCP responder stopped answering liveness probes; restarting it"
+            );
+            // Count only the time it served, not the time it hung.
+            if alive_at.saturating_duration_since(r.started) >= DHCP_STABLE {
+                self.dhcp_failures = 0;
+            }
+            r.stop();
+            self.schedule_dhcp_restart(DhcpFailure::Unresponsive);
+            return;
+        }
+        self.dhcp_probe_seq += 1;
+        if let Err(e) = r.probe(self.dhcp_probe_seq) {
+            // Counted as a missing answer.
+            tracing::debug!(pod = %self.pod_uid(), error = %e, "cannot probe the DHCP responder");
+        }
+    }
+
+    /// An answer to probe `probe`. Answers to probes sent before the current
+    /// responder started are ignored; an answer to a probe not sent, or a
+    /// second answer, is a protocol violation.
+    fn on_dhcp_alive(&mut self, probe: u64) {
+        if self.dhcp.is_none() || probe <= self.dhcp_probe_base {
+            return;
+        }
+        if probe > self.dhcp_probe_seq || probe <= self.dhcp_probe_answered {
+            self.on_dhcp_violation("an answer to a probe it was not sent");
+            return;
+        }
+        self.dhcp_probe_answered = probe;
+        self.dhcp_alive_at = Some(std::time::Instant::now());
+        // After a failure, one answer is not enough: a responder that answers
+        // once and then hangs again would show Ready between its failures.
+        // It must keep answering for a full probe timeout first.
+        let proven = self.dhcp_failures == 0
+            || self
+                .dhcp
+                .as_ref()
+                .is_some_and(|r| r.started.elapsed() >= DHCP_PROBE_TIMEOUT);
+        if !self.dhcp_answered && proven {
+            self.dhcp_answered = true;
+            self.publish_network(NetworkState::Ready);
+        }
+    }
+
+    fn schedule_dhcp_restart(&mut self, cause: DhcpFailure) {
+        self.dhcp_last_failure = cause;
         self.dhcp_failures = self.dhcp_failures.saturating_add(1);
         let backoff =
             Duration::from_secs(1u64 << (self.dhcp_failures - 1).min(6)).min(DHCP_MAX_BACKOFF);
@@ -1135,12 +1253,31 @@ impl Supervisor {
         self.publish_network(state);
     }
 
+    /// The current responder broke its protocol: kill and restart it, with
+    /// one log line per restart whatever it wrote.
+    fn on_dhcp_violation(&mut self, what: &str) {
+        let Some(r) = self.dhcp.take() else {
+            return;
+        };
+        tracing::warn!(pod = %self.pod_uid(), pid = r.process.pid, what, "DHCP responder broke its protocol; restarting it");
+        r.stop();
+        if self.stopping.is_some() {
+            return;
+        }
+        self.schedule_dhcp_restart(DhcpFailure::ProtocolViolation);
+    }
+
     /// Report the responder state to the anchor and node agent.
     fn publish_network(&mut self, state: NetworkState) {
         if self.dhcp_state.0 != state {
             self.dhcp_state = (state, now_ms());
         }
-        let n = network_status(self.dhcp_state, self.dhcp_failures, self.dhcp_last_ack);
+        let n = network_status(
+            self.dhcp_state,
+            self.dhcp_failures,
+            self.dhcp_last_failure,
+            self.dhcp_last_ack,
+        );
         self.publish(|s| s.network = Some(n));
     }
 
@@ -1156,14 +1293,14 @@ impl Supervisor {
             return;
         };
         let Ok(anchor) = AnchorRef::try_clone(anchor) else {
-            self.schedule_dhcp_restart();
+            self.schedule_dhcp_restart(DhcpFailure::StartFailed);
             return;
         };
         match self.reopen_dhcp(&anchor).await {
             Ok(socket) => self.start_dhcp(socket, &anchor),
             Err(e) => {
                 tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot reopen the DHCP socket");
-                self.schedule_dhcp_restart();
+                self.schedule_dhcp_restart(DhcpFailure::StartFailed);
             }
         }
     }
@@ -1271,6 +1408,8 @@ impl Supervisor {
         tokio::pin!(exit);
         let mut liveness = tokio::time::interval(POD_LIVENESS_INTERVAL);
         liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut dhcp_probes = tokio::time::interval(DHCP_PROBE_INTERVAL);
+        dhcp_probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             let deadline = self.detach_deadline;
@@ -1292,6 +1431,7 @@ impl Supervisor {
                 () = wait_process(dhcp_fd) => self.on_dhcp_exit(),
                 () = sleep_until(dhcp_restart) => self.restart_dhcp().await,
                 _ = liveness.tick(), if check_pod => self.check_pod_alive(),
+                _ = dhcp_probes.tick(), if self.dhcp.is_some() => self.probe_dhcp(),
                 r = &mut exit => {
                     if let Err(e) = r {
                         tracing::warn!(error = %e, "waiting on VMM pidfd failed; treating the VMM as exited");
@@ -1319,6 +1459,8 @@ impl Supervisor {
                             self.on_guest_evidence(Some((ip, mac)), false);
                         }
                     }
+                    DhcpEvent::Alive { probe } => self.on_dhcp_alive(probe),
+                    DhcpEvent::ProtocolViolation { what } => self.on_dhcp_violation(&what),
                 },
                 Some(SerialEvent::LoginPrompt) = self.serial_rx.recv() => self.on_guest_evidence(None, true),
                 () = sleep_until(deadline) => {
@@ -1406,7 +1548,7 @@ impl Supervisor {
                 Ok(socket) => self.start_dhcp(socket, &anchor),
                 Err(e) => {
                     tracing::warn!(pod = %self.pod_uid(), error = %e, "cannot restore the DHCP responder");
-                    self.schedule_dhcp_restart();
+                    self.schedule_dhcp_restart(DhcpFailure::StartFailed);
                 }
             }
         }
@@ -1989,13 +2131,19 @@ mod tests {
 
     #[test]
     fn network_status_reports_the_responder_and_the_lease() {
-        let ready = network_status((NetworkState::Ready, 5), 0, 0);
+        let ready = network_status((NetworkState::Ready, 5), 0, DhcpFailure::Exited, 0);
         assert_eq!(ready.state, NetworkState::Ready as i32);
         assert_eq!(ready.reason, "AddressServiceRunning");
         assert_eq!((ready.since_unix_ms, ready.lease_expires_unix_ms), (5, 0));
 
-        let restarting = network_status((NetworkState::Restarting, 7), 2, 1_000);
+        let restarting =
+            network_status((NetworkState::Restarting, 7), 2, DhcpFailure::Exited, 1_000);
         assert_eq!(restarting.reason, "DhcpResponderRestarting");
+        assert!(
+            restarting
+                .message
+                .starts_with("the DHCP responder stopped;")
+        );
         assert!(restarting.message.contains("at most 60 s"));
         assert!(restarting.message.contains("lease stays valid"));
         assert_eq!(
@@ -2003,8 +2151,13 @@ mod tests {
             1_000 + i64::from(crate::handoff::dhcp::LEASE_SECONDS) * 1000
         );
 
-        let failing = network_status((NetworkState::Failing, 9), 11, 0);
+        let failing = network_status((NetworkState::Failing, 9), 11, DhcpFailure::Unresponsive, 0);
         assert_eq!(failing.reason, "DhcpResponderFailing");
+        assert!(
+            failing
+                .message
+                .contains("stopped answering liveness probes")
+        );
         assert_eq!(failing.consecutive_failures, 11);
         assert!(failing.message.contains("has not acquired an address"));
         assert!(failing.message.contains("failed 11 times"));

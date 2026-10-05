@@ -80,6 +80,12 @@ pub enum DhcpEvent {
         #[serde(with = "mac_string")]
         mac: MacAddr,
     },
+    /// Answer to liveness probe `probe`, sent by the serving loop itself.
+    Alive { probe: u64 },
+    /// Raised by baryon-virtd, never sent by the responder: its output broke
+    /// the protocol (see `crate::dhcp_helper`).
+    #[serde(skip)]
+    ProtocolViolation { what: String },
 }
 
 mod mac_string {
@@ -97,18 +103,33 @@ mod mac_string {
 }
 
 /// Serve DHCP on `socket` until `cancel` fires.
+///
+/// Liveness probes from `probes` are answered from this loop, between
+/// packets, so an answer shows that the loop that serves the guest runs,
+/// whether or not the guest sends anything.
 pub async fn serve(
     socket: OwnedFd,
     lease: LeaseConfig,
     events: mpsc::Sender<DhcpEvent>,
+    mut probes: mpsc::Receiver<u64>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let socket = AsyncFd::new(socket)?;
     let mut buf = vec![0u8; 2048];
     let mut last_reported: Option<std::time::Instant> = None;
+    let mut probing = true;
     loop {
         let received = tokio::select! {
             () = cancel.cancelled() => return Ok(()),
+            probe = probes.recv(), if probing => {
+                match probe {
+                    Some(probe) => {
+                        let _ = events.send(DhcpEvent::Alive { probe }).await;
+                    }
+                    None => probing = false,
+                }
+                continue;
+            }
             r = socket.readable() => {
                 let mut guard = r?;
                 match guard.try_io(|fd| recv_packet(fd.get_ref(), &mut buf)) {
@@ -653,5 +674,30 @@ mod tests {
         assert_eq!(prefix_to_mask(0), Ipv4Addr::new(0, 0, 0, 0));
         assert_eq!(prefix_to_mask(16), Ipv4Addr::new(255, 255, 0, 0));
         assert_eq!(prefix_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+    }
+
+    #[tokio::test]
+    async fn the_serving_loop_answers_probes_without_guest_traffic() {
+        // Any socket works while no frame arrives: the loop only waits on it.
+        let (a, _b) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        let (events, mut rx) = mpsc::channel(8);
+        let (probes, probe_rx) = mpsc::channel(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve(
+            OwnedFd::from(a),
+            lease(24, Ipv4Addr::new(10, 244, 1, 1)),
+            events,
+            probe_rx,
+            cancel.clone(),
+        ));
+        for n in [1, 2] {
+            probes.send(n).await.unwrap();
+            assert_eq!(rx.recv().await, Some(DhcpEvent::Alive { probe: n }));
+        }
+        // Without probes the loop keeps serving until cancelled.
+        drop(probes);
+        cancel.cancel();
+        task.await.unwrap().unwrap();
     }
 }

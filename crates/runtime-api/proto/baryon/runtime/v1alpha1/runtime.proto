@@ -159,7 +159,7 @@ message VmStatus {
 
 enum NetworkState {
   NETWORK_STATE_UNSPECIFIED = 0;
-  // The DHCP responder runs.
+  // The DHCP responder runs and answers liveness probes.
   NETWORK_STATE_READY = 1;
   // The DHCP responder stopped and is being restarted.
   NETWORK_STATE_RESTARTING = 2;

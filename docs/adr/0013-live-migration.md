@@ -312,9 +312,10 @@ record stays out of the repository; no timings are published.
 - Cloud Hypervisor's migration endpoints remain in the pinned binary. They
   are unreachable today: the API socket is reachable only by host root, the
   Baryon client cannot call them, and a VMM's network namespace is empty.
-  Cloud Hypervisor's seccomp profile still allows `userfaultfd` and inet
-  sockets, which Baryon does not use; denying them is Future hardening in
-  [security.md](../security.md#future-hardening).
+  Cloud Hypervisor's seccomp profile allows `userfaultfd` and inet
+  sockets, which Baryon does not use; since 2026-10-04 Baryon's own
+  seccomp filter denies both on every VMM thread
+  ([security.md](../security.md#baryon-seccomp-layer)).
 
 ## Alternatives considered
 
@@ -357,3 +358,6 @@ record stays out of the repository; no timings are published.
   runtime paths, guest address, version, CPU, and Kairos Operator entry
   criteria were added, vhost-user-net was added to the alternatives, and
   the hard questions left open were recorded.
+- 2026-10-04: the consequence on Cloud Hypervisor's seccomp profile now
+  records that Baryon's seccomp filter denies `userfaultfd` and inet
+  sockets. The decision is unchanged.

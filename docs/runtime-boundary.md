@@ -287,7 +287,11 @@ separate responder process).
   reports its state to the cluster as the VM's `NetworkReady` condition
   (ADR 0007 and ADR 0008 revisions; Tested: `tests/e2e/network-health.sh`
   on the k0s cluster, see [testing.md](testing.md#k0s-cluster) and
-  [networking.md](networking.md#guest-network-service-health)).
+  [networking.md](networking.md#guest-network-service-health)). It also
+  probes the responder's serving loop for liveness over its stdin and
+  stdout pipes every 10 s and restarts a responder that answers no probe
+  for 25 s (ADR 0007 revision; Tested: unit tests and the hang cases of
+  `tests/e2e/network-health.sh` on the k0s cluster).
 
 ### Decision
 
@@ -543,6 +547,13 @@ main thread, and the Anchor container scope. The DHCP responder (after a
 node reboot) had the VM's uid and gid without the kvm group,
 `CapEff` and `CapBnd` 0, `NoNewPrivs` 1, its own network namespace, and the
 Anchor container cgroup.
+
+These values were measured before Baryon's seccomp layer. Since
+2026-10-04 baryon-virtd installs its own seccomp filter on both processes
+before `execve`, so the VMM's main thread and every responder thread run
+under one filter, and every other VMM thread under Baryon's and Cloud
+Hypervisor's (measured on the k0s cluster; see
+[security.md](security.md#baryon-seccomp-layer)).
 
 ### Recovery and reboot (Tested, manual procedures)
 
