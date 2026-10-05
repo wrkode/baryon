@@ -99,7 +99,7 @@ Tested ([testing.md](testing.md#what-deletion-removes)).
 ## Build
 
 ```bash
-hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
+hack/build-hadron-image.sh <registry>/baryon-hadron:<tag>
 ```
 
 Stages: verified downloads of the pinned artifacts, a static build of
@@ -159,7 +159,7 @@ image in the local Docker daemon, with the cloud-config and the output in
 docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v "<work-dir>:/work" \
   quay.io/kairos/auroraboot:v0.27.1 \
   --set disable_http_server=true --set disable_netboot=true \
-  --set disk.efi=true --set container_image=docker:<registry>/baryon/hadron:<tag> \
+  --set disk.efi=true --set container_image=docker:<registry>/baryon-hadron:<tag> \
   --set state_dir=/work/aurora --cloud-config /work/cloud-config.yaml
 ```
 
@@ -232,9 +232,12 @@ stages:
 A k0s example for the controller node, which also runs workloads, the form
 used for the k0s cluster (add users, SSH keys, the API address, and the rest
 of your node configuration). Workers use the same containerd stage, a
-join token from the controller written to a file under `/etc/k0s`, and a
-`k0s-worker:` block (`enabled: true`, `args: [--labels=virtualization.baryon.io/host=true]`);
-they take the `default` worker profile from the controller.
+join token from the controller (`k0s token create --role=worker`) written
+to `/etc/k0s/token`, and a `k0s-worker:` block (`enabled: true`,
+`args: [--token-file=/etc/k0s/token, --labels=virtualization.baryon.io/host=true]`);
+they take the `default` worker profile from the controller. Complete
+controller and worker cloud-configs are in
+[installation.md](installation.md#cloud-config).
 
 ```yaml
 #cloud-config

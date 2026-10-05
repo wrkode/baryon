@@ -1,0 +1,88 @@
+# kube-state-metrics custom resource state configuration for Baryon.
+#
+# Baryon components do not serve metrics (no Baryon component listens on
+# TCP; see docs/security.md). The state operators need is in the Kubernetes
+# objects; kube-state-metrics turns it into Prometheus metrics. Pass this
+# file with --custom-resource-state-config-file, and give kube-state-metrics
+# list and watch on virtualmachines and virtualizationnodes in the
+# virtualization.baryon.io group. See docs/troubleshooting.md.
+kind: CustomResourceStateMetrics
+spec:
+  resources:
+    - groupVersionKind:
+        group: virtualization.baryon.io
+        version: v1alpha1
+        kind: VirtualMachine
+      metricNamePrefix: baryon_vm
+      labelsFromPath:
+        name: [metadata, name]
+        namespace: [metadata, namespace]
+      metrics:
+        - name: condition
+          help: VirtualMachine conditions (1 when the condition has the status in the status label).
+          each:
+            type: StateSet
+            stateSet:
+              path: [status, conditions]
+              labelsFromPath:
+                condition: [type]
+                reason: [reason]
+              labelName: status
+              valueFrom: [status]
+              list: ["True", "False", "Unknown"]
+        - name: anchor_restarts
+          help: Restarts of the Anchor container in the current Anchor Pod.
+          each:
+            type: Gauge
+            gauge:
+              path: [status, restartCount]
+        - name: info
+          help: Node and class of a VirtualMachine.
+          each:
+            type: Info
+            info:
+              labelsFromPath:
+                node: [status, nodeName]
+                class: [spec, className]
+                run_policy: [spec, runPolicy]
+    - groupVersionKind:
+        group: virtualization.baryon.io
+        version: v1alpha1
+        kind: VirtualizationNode
+      metricNamePrefix: baryon_node
+      labelsFromPath:
+        node: [metadata, name]
+      metrics:
+        - name: condition
+          help: VirtualizationNode conditions (Ready, RuntimeHealthy).
+          each:
+            type: StateSet
+            stateSet:
+              path: [status, conditions]
+              labelsFromPath:
+                condition: [type]
+                reason: [reason]
+              labelName: status
+              valueFrom: [status]
+              list: ["True", "False", "Unknown"]
+        - name: vms
+          help: VMs known to baryon-virtd on the node.
+          each:
+            type: Gauge
+            gauge:
+              path: [status, vmCount]
+        - name: heartbeat_timestamp_seconds
+          help: Last status refresh by the node agent (Unix seconds); alert when it is older than 90 s.
+          each:
+            type: Gauge
+            gauge:
+              path: [status, heartbeatTime]
+        - name: runtime_info
+          help: Runtime versions of the node.
+          each:
+            type: Info
+            info:
+              labelsFromPath:
+                virtd_version: [status, runtime, virtdVersion]
+                virtd_git_commit: [status, runtime, virtdGitCommit]
+                hypervisor_version: [status, runtime, hypervisorVersion]

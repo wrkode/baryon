@@ -77,6 +77,8 @@ the provider had written their systemd override (arguments, token file), so
 the controller ran without `--enable-worker` and the workers failed for
 lack of a join token. A `systemctl daemon-reload` and a restart of the k0s
 service fixed it; later boots were not affected. Not yet reported upstream.
+The commands are in
+[troubleshooting.md](troubleshooting.md#k0s-starts-without-its-configuration-on-the-first-boot).
 
 Baryon does not depend on which path was used. The three differ in kubelet
 root directory, CRI socket path, and cgroup driver; baryon-virtd avoids all
@@ -172,8 +174,11 @@ Who owns what when a node changes:
   publishes the VirtualizationNode state that an upgrade workflow can read
   (`Ready`, `RuntimeHealthy`, `heartbeatTime`, `vmCount`; see
   [Cooperation with upgrades](#cooperation-with-upgrades)).
-- Live migration is Not supported ([ADR 0013](adr/0013-live-migration.md)).
-  A node event that removes an Anchor Pod stops the VM; it starts again
+- Live migration is currently unsupported. Baryon's network handoff
+  model requires destination-side file descriptor injection during Cloud
+  Hypervisor migration, which is not available in the currently supported
+  Cloud Hypervisor release ([ADR 0013](adr/0013-live-migration.md)). A
+  node event that removes an Anchor Pod stops the VM; it starts again
   where its storage allows.
 
 Upgrade procedure for v0.1: one `NodeOpUpgrade` per node with Kairos
@@ -253,7 +258,7 @@ the new image in its local Docker daemon and SSH access to the node
 1. Stream the new image to the persistent partition of the node:
 
    ```bash
-   docker save <registry>/baryon/hadron:<tag> | ssh <node> 'sudo sh -c "cat > /usr/local/baryon-upgrade.tar"'
+   docker save <registry>/baryon-hadron:<tag> | ssh <node> 'sudo sh -c "cat > /usr/local/baryon-upgrade.tar"'
    ```
 
 2. Upgrade the active system, remove the archive, and reboot:
@@ -345,10 +350,13 @@ VirtualizationNode Ready=True, device plugin slots healthy again
 
 ## Cooperation with upgrades
 
-Baryon has no upgrade controller and does not move running VMs: live
-migration is Not supported ([ADR 0013](adr/0013-live-migration.md)), so a
-node upgrade stops the VMs on the node and they start again on a node that
-can reach their storage. Baryon only exposes node state that an upgrade
+Baryon has no upgrade controller and does not move running VMs. Live
+migration is currently unsupported. Baryon's network handoff model
+requires destination-side file descriptor injection during Cloud
+Hypervisor migration, which is not available in the currently supported
+Cloud Hypervisor release ([ADR 0013](adr/0013-live-migration.md)). A node
+upgrade therefore stops the VMs on the node, and they start again on a node
+that can reach their storage. Baryon only exposes node state that an upgrade
 workflow can read.
 
 VirtualizationNode state with semantics for upgrades:
@@ -414,7 +422,7 @@ Node's boot ID, recorded in step 3, and the VirtualizationNode heartbeat.
      name: upgrade-<node>
      namespace: default
    spec:
-     image: <registry>/baryon/hadron:<tag>
+     image: <registry>/baryon-hadron:<tag>
      nodeSelector:
        matchLabels:
          kubernetes.io/hostname: <node>

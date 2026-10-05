@@ -524,5 +524,9 @@ What changes for running VMs and nodes:
 - Root disk claims that exist are not changed. New block-mode claims
   request exactly `rootDisk.size` instead of 64 MiB more.
 
-Status: the upgrade steps are Designed; an upgrade run on the k0s cluster
-is pending.
+Status: the three steps were run in this order when the k0s cluster was
+upgraded in place to the API review change from a checkout, and the
+running VM kept running (Tested, [testing.md](testing.md#k0s-cluster)).
+The states between the steps described above are inferred, not tested. A
+release-like upgrade from an earlier release is pending in the release
+validation.

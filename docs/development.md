@@ -83,7 +83,7 @@ Push them to a registry that the cluster nodes can pull from.
 ### Baryon-enabled Hadron image
 
 ```bash
-hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
+hack/build-hadron-image.sh <registry>/baryon-hadron:<tag>
 ```
 
 The script reads the pinned versions from `packaging/versions.env` and
@@ -94,7 +94,7 @@ distribution, version from `K0S_VERSION`), `k3s` (version from
 without Kubernetes. `KUBERNETES_VERSION` overrides the pinned version:
 
 ```bash
-KUBERNETES_DISTRO=k3s hack/build-hadron-image.sh <registry>/baryon/hadron:<tag>
+KUBERNETES_DISTRO=k3s hack/build-hadron-image.sh <registry>/baryon-hadron:<tag>
 ```
 
 Turning the image into bootable media with AuroraBoot, node configuration,

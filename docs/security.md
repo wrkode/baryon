@@ -899,10 +899,13 @@ Findings of the 2026-10-05 review of the v0.1 API changes:
 
 ## Not supported
 
-VFIO and PCI passthrough, SR-IOV, live migration (see
-[Live migration](#live-migration-not-supported) and
-[ADR 0013](adr/0013-live-migration.md)), snapshots, and confidential
-computing (SEV-SNP, TDX, measured boot, attestation) are not supported. The
+VFIO and PCI passthrough, SR-IOV, snapshots, and confidential computing
+(SEV-SNP, TDX, measured boot, attestation) are not supported. Live
+migration is currently unsupported. Baryon's network handoff model
+requires destination-side file descriptor injection during Cloud
+Hypervisor migration, which is not available in the currently supported
+Cloud Hypervisor release (see [Live migration](#live-migration-not-supported)
+and [ADR 0013](adr/0013-live-migration.md)). The
 current handoff is host-mediated by design: baryon-virtd resolves disks,
 creates the TAP, starts the DHCP responder, and writes SMBIOS strings. None
 of that is an attestation boundary, and confidential computing would need a

@@ -71,3 +71,10 @@ for VMs, no virtiofsd, and no `tc` binary.
   NET_ACT_GACT, which the implementation uses); a common host layer was
   qualified as not implying support for every provider.
 - 2026-10-03: the tested providers were updated (k0s on three nodes).
+- 2026-10-05: the Decision's sentence that Baryon "will expose node
+  evacuation state and perform VM evacuation" is superseded in that part:
+  v0.1 exposes no evacuation state and evacuates no VMs. A node upgrade or
+  drain stops the node's VMs and baryon-controller starts them again where
+  their storage allows (ADR 0004); live migration is not supported (ADR
+  0013). The rest of the decision is unchanged: Baryon does not drive
+  upgrades.
