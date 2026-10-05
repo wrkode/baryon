@@ -35,7 +35,7 @@ and Not tested rows make no claim. States:
 
 | Component | Version | State |
 |---|---|---|
-| Baryon | 0.1.0-rc1 (workspace version 0.1.0-rc1, API `v1alpha1`, runtime protocol 1.2) | Release validation of the 0.1.0-rc1 release artifacts on the k0s cluster: in progress, no results recorded yet. Tested on the k0s cluster with the API review change, a build before the release commit, after an in-place upgrade of the cluster ([testing.md](testing.md#k0s-cluster)): E2E lifecycle, node agent outage, deletion, placement, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, skew with all hosts on one build, and hostile disk. The network health E2E last ran with the runtime hardening change (8db33bb). `tests/e2e/repeat.sh` was not run. VirtualizationNode `status.runtime.virtdGitCommit` and the `host_image` field of the node agent's `host inventory` log line were added after those runs: Implemented, unit tests |
+| Baryon | 0.1.0-rc1 (workspace version 0.1.0-rc1, API `v1alpha1`, runtime protocol 1.2) | Tested on the k0s cluster in the [v0.1.0-rc1 release validation](testing.md#v010-rc1-release-validation), with release-like builds of c3a3735, which differs from the release commit only in the release workflow and documentation: upgrade from a release-like build of 8db33bb, host upgrades of all three nodes with Kairos Operator, rollback cases, uninstall and reinstall from the release files, and the E2E suites lifecycle, node agent outage, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, placement, hostile disk, deletion, skew with all hosts on one build, and network health with node reboot (ceph-rbd and lvm-local): 536 of 536 checks. `tests/e2e/repeat.sh` was not run. The published release artifacts are rebuilt by the release workflow from the tag; their smoke test is pending |
 | Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`, pinned by digest in `packaging/versions.env`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
 | Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`, pinned by digest in `packaging/versions.env`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
 | Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
@@ -58,7 +58,7 @@ and Not tested rows make no claim. States:
 | local-path provisioner | k3s default | Not tested with v0.1; it ran only on the single-node k3s Hadron node with an earlier release (historical evidence) |
 | Other CSI drivers | any | Expected to work if they meet the [CSI requirements](#csi-requirements): Baryon consumes claims only through the Anchor Pod and the import Pod, as ordinary pod volumes. Not tested |
 | `ReadWriteMany` block claims shared across nodes | any | Not supported: one running VM per claim (`ClaimInUse`) |
-| Kairos Operator | v0.2.2, `NodeOpUpgrade` | Tested with the earlier step 5: the upgrade of one node with its own `NodeOpUpgrade`, the procedure of the [runbook](kairos-integration.md#runbook-upgrade-one-node-with-kairos-operator) and the [lifecycle contract](kairos-integration.md#lifecycle-contract), with a wait for the VirtualizationNode `Ready` condition in place of the current step 5, which is Designed. One `NodeOpUpgrade` for several nodes completed in one test, with overlapping node outages (with v0.2.2, `concurrency` does not prevent them); use one `NodeOpUpgrade` per node. Other versions: Not tested |
+| Kairos Operator | v0.2.2, `NodeOpUpgrade` | Tested: the upgrade of all three nodes, one `NodeOpUpgrade` per node, with the current [runbook](kairos-integration.md#runbook-upgrade-one-node-with-kairos-operator) including its step 5 check, in the v0.1.0-rc1 release validation; see also the [lifecycle contract](kairos-integration.md#lifecycle-contract). One `NodeOpUpgrade` for several nodes completed in one test, with overlapping node outages (with v0.2.2, `concurrency` does not prevent them); use one `NodeOpUpgrade` per node. Other versions: Not tested |
 | Guest OS | Debian 13 genericcloud raw image (amd64) | Tested |
 | Other Linux guests | any | Expected to work if they meet the [guest requirements](#guest-requirements) (UEFI-bootable raw image, DHCP client or cloud-init). Not tested |
 | Windows guests | any | Not supported; not tested |
@@ -313,8 +313,10 @@ The commits before 0.1.0-rc1 are listed in
 Within a major version, either order works:
 
 - cluster release first, then the host images node by node. Tested: the
-  1.1 cluster release with mixed 1.0 and 1.1 hosts, and the 1.2 cluster
-  release with one 1.1 host.
+  1.1 cluster release with mixed 1.0 and 1.1 hosts, the 1.2 cluster
+  release with one 1.1 host, and the 0.1.0-rc1 release validation: the
+  cluster release first, then the hosts one at a time, with a new VM
+  started while the hosts were mixed (every host on runtime protocol 1.2).
 - host images first, node by node, then the cluster release. Tested: the
   1.0 cluster release with mixed 1.0 and 1.1 hosts.
 
@@ -516,8 +518,14 @@ What changes for running VMs and nodes:
   until the class is applied again.
 - Between steps 1 and 3, baryon-controller of the earlier release reads
   classes with `cpu.cores`, which the new CRD no longer has, so its
-  reconciles of VMs fail and no VM starts or stops. Inferred from the
-  types of the earlier release; not tested. Keep the steps close
+  reconciles of VMs fail and no VM starts or stops. Tested in the
+  release validation (earlier release: a build of 8db33bb): between the
+  steps its watch of VirtualizationNodes failed
+  (`` missing field `protocol` ``). The reconcile failures
+  (`` missing field `cores` ``) and a VM created meanwhile that got no
+  status and no pods were observed in the controller rollback case, the
+  same state of an earlier controller with the new CRDs
+  ([testing.md](testing.md#v010-rc1-release-validation)). Keep the steps close
   together.
 - Between steps 1 and 3, baryon-node-agent of the earlier release cannot
   read VirtualizationNodes either: its types require `runtime.protocol`
@@ -525,9 +533,12 @@ What changes for running VMs and nodes:
   the objects. Until the new node agents have rolled out, heartbeats stop
   on every node and the Heartbeat column of `kubectl get
   virtualizationnodes` grows; the device plugins keep working, so running
-  VMs and their slots are not affected. Inferred from the types of the
-  earlier release; not tested. This is another reason to run the three
-  steps in this order and quickly.
+  VMs and their slots are not affected. Tested in the release validation:
+  the heartbeats of all three nodes stopped after step 1, the earlier node
+  agents logged `publishing VirtualizationNode failed`
+  (`` missing field `protocol` ``), and running VMs were not affected.
+  This is another reason to run the three steps in this order and
+  quickly.
 - VirtualizationNode status loses `runtime.protocol`, `runtime.hypervisor`,
   `architecture`, `kernelRelease`, `osImage`, `kairosVersion`, `cpu`,
   `memoryBytes`, `kvm`, `iommu`, `vfio`, `numaNodes`, `hugepages`, and
@@ -539,8 +550,8 @@ What changes for running VMs and nodes:
 - A baryon-controller of an earlier release cannot read a
   VirtualizationNode written by the new node agent, which no longer
   writes `runtime.protocol` and `runtime.hypervisor`; step 3 upgrades
-  both together. Inferred from the types of the earlier release; not
-  tested.
+  both together. Tested in the release validation (the earlier
+  controller's watch errors above).
 - The `Ready` True reason of VirtualizationNode is `RuntimeReady`
   (before: `KvmAvailable`). Anything that matches the reason must be
   updated; matching the status is enough to tell whether the node is
@@ -552,9 +563,11 @@ What changes for running VMs and nodes:
 - Root disk claims that exist are not changed. New block-mode claims
   request exactly `rootDisk.size` instead of 64 MiB more.
 
-Status: the three steps were run in this order when the k0s cluster was
-upgraded in place to the API review change from a checkout, and the
-running VM kept running (Tested, [testing.md](testing.md#k0s-cluster)).
-The states between the steps described above are inferred, not tested. A
-release-like upgrade from an earlier release is pending in the release
-validation.
+Status: Tested. The three steps were run in this order when the k0s
+cluster was upgraded in place to the API review change from a checkout,
+and again in the v0.1.0-rc1 release validation, from a release-like build
+of 8db33bb to one of c3a3735 with the release files and a pause after
+step 1. Running VMs kept running through all three steps,
+with the same Anchor Pods, and the Cloud Hypervisor process checked (the
+VM on node2) kept its PID and start time
+([testing.md](testing.md#v010-rc1-release-validation)).

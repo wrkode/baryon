@@ -41,7 +41,7 @@ the [v0.1 support matrix](docs/compatibility.md#v01-support-matrix).
 |---|---|
 | VM lifecycle: create from an HTTP raw image or an existing claim, start, stop, restart, delete | Tested: E2E on the k0s cluster |
 | Root disks on filesystem-mode and raw block-mode claims | Tested: storage and import integrity E2E with OpenEBS LVM LocalPV and Ceph RBD |
-| Pod network: the guest takes the pod IP; Services select a VM's Anchor Pod by its `virtualization.baryon.io/vm-name` label | Tested: multi-node E2E. Services that select the VM's own labels (copied to the Anchor Pod): Inferred |
+| Pod network: the guest takes the pod IP; Services select a VM's Anchor Pod by its `virtualization.baryon.io/vm-name` label | Tested: multi-node E2E. Services that select the VM's own labels (copied to the Anchor Pod): Implemented; not tested |
 | Placement through Kubernetes scheduling fields (`spec.placement`) | Tested: placement E2E |
 | Recovery after a baryon-virtd, baryon-controller, or node agent restart, a VMM crash, and a node reboot | Tested: E2E and manual procedures |
 | Guest network service health (`NetworkReady`) | Tested: network-health E2E |

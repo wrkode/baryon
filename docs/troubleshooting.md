@@ -300,8 +300,9 @@ Symptom, one of:
   baryon-virtd; the message is the error.
 - `Ready` and `RuntimeHealthy` Unknown, reason `NodeAgentStopped`: the node
   agent was stopped (for a reboot, an upgrade, or a DaemonSet rollout).
-- The Heartbeat column keeps growing past 90 s: the node agent crashed, or
-  the node is down, and the conditions are stale.
+- The Heartbeat column keeps growing past 90 s: the node agent crashed, its
+  pod has not started yet ([after repeated reboots](#node-agent-pod-delayed-after-repeated-reboots)),
+  or the node is down, and the conditions are stale.
 
 In all three cases the node takes no new VMs. Running VMs keep running and
 stay `Ready`; their `NetworkReady` becomes Unknown (`RuntimeUnreachable`)
@@ -321,6 +322,35 @@ Fix: start baryon-virtd if it is stopped
 restarts it after a failure), or find why the node agent pod is not
 running. The
 node is `Ready` again at the next refresh, and VMs on it reattach.
+
+### Node agent pod delayed after repeated reboots
+
+Symptom: after a node was rebooted several times within a short time, the
+node is `Ready` but its baryon-node-agent pod does not start for minutes.
+Its VirtualizationNode keeps an old heartbeat or shows `NodeAgentStopped`,
+no new VM is placed on the node, and the node's VMs wait. CSI node plugins
+deployed as DaemonSets can be delayed the same way, so a VM's volume
+cannot be mapped yet (for example `MapVolume` failed because the driver is
+not registered).
+
+Cause: Kubernetes, not Baryon. During the shutdown the DaemonSet
+controller creates a replacement pod that kubelet rejects (`NodeShutdown`,
+pod `Failed`), and the DaemonSet controller backs off per node before it
+creates the next pod. Observed on the k0s cluster: minutes after repeated
+reboots of the same node within a short time; well under a minute on a
+first reboot.
+
+Confirm:
+
+```bash
+kubectl get pods -n baryon-system -o wide --field-selector spec.nodeName=<node>
+kubectl get events -n baryon-system --field-selector involvedObject.kind=Pod
+kubectl get events -n baryon-system --field-selector involvedObject.kind=DaemonSet,reason=FailedDaemonPod
+```
+
+Fix: wait. The DaemonSet controller creates the pod when its backoff
+expires; the node agent then reports, and the VMs on the node start again
+without intervention.
 
 ### No compatible node
 

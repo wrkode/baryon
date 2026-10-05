@@ -603,8 +603,8 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | Version skew with the network health change, one host on the previous host image (runtime protocol 1.1) | network health change; previous host image | E2E skew (`EXPECT_MIXED=1`) | 33 of 34: `NetworkReady` True on the two 1.2 hosts and Unknown `RuntimeDoesNotReport` on the 1.1 host; every VM reattached after the baryon-virtd restarts, including a 1.2 anchor on the 1.1 host. The failed check was `EXPECT_MIXED`: both host images carried the same commit stamp because the newer one was built from an uncommitted tree; the build scripts now mark such builds `-dirty` |
 | API review change: E2E suites and the `NodeAgentStopped` transition | API review change | E2E | The k0s cluster was upgraded in place to this change (CRDs, then classes reapplied with `cpu.vcpus`, then the deployment; the running VM kept running). Then: lifecycle 35 of 35, node agent outage 32 of 32 (including the stopping agent marking its node Ready Unknown `NodeAgentStopped`), deletion 19 of 19, placement 65 of 65, storage ceph-rbd Block 47 of 47 and lvm-local Filesystem 36 of 36, import integrity lvm-local 52 of 52 and ceph-rbd 52 of 52, multi-node 69 of 69, skew (all hosts on one build) 33 of 33, hostile disk 4 of 4. The API server checks pass against the k0s API server container that CI uses (run locally; see [API server checks](#api-server-checks)) |
 | Node failure: power loss of the node of a running VM (ceph-rbd, VM pinned to the node) | on top of 66f2cba (`NodeUnreachable` reporting) | manual | `Running`, `Ready`, and `NetworkReady` Unknown (`NodeUnreachable`) once Kubernetes marked the pod not ready; no new Anchor Pod while the node was off, also after taint eviction marked the pod Terminating; after power-on the old pod was removed and the VM was Ready again on its node |
-| API review change: the Kairos runbook check of step 5 and a release-like upgrade from an earlier release | API review change | manual procedure | pending |
-| Release validation of v0.1.0-rc1: the E2E suites and procedures with the published release files and images | v0.1.0-rc1 | E2E and manual procedures | in progress; no results recorded yet |
+| API review change: the Kairos runbook check of step 5 and a release-like upgrade from an earlier release | release B of the release validation | manual procedure | done: see [v0.1.0-rc1 release validation](#v010-rc1-release-validation) |
+| Release validation of v0.1.0-rc1: upgrade from a release-like build of 8db33bb, host upgrades, rollback, the E2E suites, uninstall and reinstall from release files | c3a3735 (the code of v0.1.0-rc1) | E2E and manual procedures | passed: see [v0.1.0-rc1 release validation](#v010-rc1-release-validation). Smoke test of the published artifacts: pending |
 | Uninstall from a checkout: VMs deleted first, then `kubectl delete -k deploy/base` ([installation.md](installation.md#9-uninstall)) | on top of 66f2cba (the changes of 743166a) | manual procedure | the `baryon-system` namespace and the CRDs were gone and no runtime directories were left on the nodes; each Node kept the `virtualization.baryon.io/vm` and `virtualization.baryon.io/import` extended resources at 0 after the device plugin unregistered |
 | Kernel settings behind the seccomp layer's rationale ([security.md](security.md#baryon-seccomp-layer)), read on 2026-10-05 on a Hadron v0.5.3 node of the k0s cluster | host image (Hadron v0.5.3 default kernel) | observation | `vm.unprivileged_userfaultfd` 0; `/dev/userfaultfd` owned by root, mode 0600; `kernel.yama.ptrace_scope` 1; `kernel.io_uring_disabled` 0 |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
@@ -619,6 +619,107 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | Kairos Operator v0.2.2 `NodeOpUpgrade` on one node (`force`, concurrency 1, upgrade image preloaded in containerd with a fixed tag) | working tree | manual | the drain deleted both Anchor Pods at once; both guests shut down cleanly before the reboot; the VM on ceph-rbd restarted on another node; the VM on lvm-local stayed Pending (`ClaimPending`, `Unschedulable` on the cordoned node) until its node returned and was then Ready; the operator reported the reboot complete and uncordoned the node while it was still NotReady |
 | Kairos Operator reboot (`nsenter -i -m -t 1 -- reboot`) with a VM running, no drain | working tree | manual | kubelet's logind delay inhibitor held; the guest powered off cleanly; the VM came back |
 | Kairos Operator v0.2.2 rolling `NodeOpUpgrade` of all three nodes (`nodeSelector` `virtualization.baryon.io/host=true`, concurrency 1, `force`, image preloaded on every node), one VM on ceph-rbd (node1) and one on lvm-local on each of node2 and node3 | working tree | manual | Completed; every node booted the new image (baryon-virtd hash equal to the image's). Concurrency 1 did not serialize the node outages: the drains of the three nodes started one after another without waiting for the previous node to return, because v0.2.2 counts a reboot as complete before the node is back, which frees the concurrency slot, so the node outages overlapped. Guests shut down cleanly at each drain. The lvm-local VMs came back on their own nodes once those returned. The ceph-rbd VM was down longest: no node was schedulable while all were cordoned or rebooting, and its restart was then delayed until the Ceph CSI attacher, whose controller had restarted with the control-plane node, regained its leader lease after the in-cluster API path returned; until then the volume stayed attached to the old node. Once the attacher led, detach and attach completed and the VM was Ready. All VMs recovered without intervention. VMs whose claims carried an older import record (no digest) got an import Pod after their drain; on filesystem claims the importer found the marker and left the disk unchanged |
+
+### v0.1.0-rc1 release validation
+
+Run on 2026-10-05 on the k0s cluster (node1 is the controller node and
+also runs workloads; node2 and node3 are workers).
+
+Builds:
+
+- **Release A**: a clean clone of 8db33bb (the runtime hardening commit),
+  built by the same procedure as the release workflow: component images,
+  the host image with k0s, and the manifests rendered by
+  `hack/release-manifests.sh`.
+- **Release B**: a clean clone of c3a3735, built the same way. The release
+  commit, tagged v0.1.0-rc1, differs from c3a3735 only in
+  `.github/workflows/release.yaml` (it creates the SBOM output directory)
+  and in documentation. No crate, packaging, deploy, or hack file differs,
+  so release B runs the code of v0.1.0-rc1. Its host images report the
+  commit stamp of c3a3735.
+
+The published release artifacts are rebuilt by the release workflow from
+the tag; they are not the builds above. A smoke test of the published
+artifacts follows the tag (pending).
+
+Procedure: the component images were loaded into each node's containerd
+(no registry pull), and the host upgrade images were preloaded in
+containerd under a fixed tag. The release manifests (`baryon.yaml`,
+`baryon-classes.yaml`) were applied as files, as in
+[installation.md](installation.md#6-install-baryon).
+
+Phase 0, from the development installation to release A:
+
+| Step | Result |
+|---|---|
+| Uninstall the development installation from a checkout ([installation.md](installation.md#9-uninstall)): VMs deleted first, then `kubectl delete -k deploy/base` | the `baryon-system` namespace and the CRDs were gone; no `/run/baryon/vms` entries on any node; baryon-virtd still active as a host service; each Node kept the `virtualization.baryon.io/vm` and `virtualization.baryon.io/import` extended resources at 0 |
+| Hosts to the release A host image (`kairos-agent upgrade`), then release A installed from its release files (`baryon.yaml` server-side, `baryon-classes.yaml`) | every VirtualizationNode Ready; a VM on ceph-rbd Filesystem (node2) and a VM on lvm-local Block (node3) Ready |
+
+Phase 1, cluster release A to B with every host on A, following
+[Upgrade to 0.1.0-rc1](compatibility.md#upgrade-to-010-rc1), with a pause
+after step 1:
+
+| Step | Result |
+|---|---|
+| 1. New CRDs | the classes read back with neither `vcpus` nor `cores` (pruned). The heartbeats of all three VirtualizationNodes stopped. The release A node agents logged `publishing VirtualizationNode failed` with `` missing field `protocol` ``; the release A controller logged `VirtualizationNode watch error` with the same cause. Running VMs were not affected |
+| 2. Classes applied again with `cpu.vcpus` | accepted (the one update of a class stored in the earlier shape) |
+| 3. Release B `baryon.yaml` | controller and node agent DaemonSet rolled out; heartbeats resumed; both VMs stayed `Ready`, `Running`, and `NetworkReady` True, with the same Anchor Pod UIDs; the Cloud Hypervisor process of the node2 VM kept its PID and start time |
+| Release B controller with release A hosts | a new VM (ceph-rbd Block, node1) Ready; a stop and start of the lvm-local VM: `Stopped`, then `Ready` again |
+
+Phase 2, host images A to B, one `NodeOpUpgrade` per node (Kairos Operator
+v0.2.2, `force`, concurrency 1, image preloaded), each with the full
+[runbook](kairos-integration.md#runbook-upgrade-one-node-with-kairos-operator),
+including the step 5 check of the boot ID and the heartbeat:
+
+| Node | Result |
+|---|---|
+| node3, with `kubectl drain` (runbook step 1) | the drain completed and evicted the Anchor Pod; Baryon needed no drain flags, other workloads on the node needed `--delete-emptydir-data`. `vmCount` reached 0; the reboot was detected by the boot ID; right after the reboot the VirtualizationNode showed `Ready` Unknown (`NodeAgentStopped`), the stopping node agent's write; step 5 passed; after the uncordon the lvm-local VM was Ready again on node3 |
+| Mixed hosts: node1 and node2 on A, node3 on B | a new VM on node3 (ceph-rbd Block) Ready with `NetworkReady` True; A and B hosts published the same features |
+| node2 and node1, without `kubectl drain` (the `NodeOpUpgrade` drain only) | step 5 passed on both; VMs pinned to the node came back on it. node1 is the controller node: the API server was unreachable during its reboot, and the step 5 wait tolerated that |
+| End state | every host on the release B host image, runtime protocol 1.2 |
+
+The runs found a defect in the runbook: step 2 (wait for `vmCount` 0)
+cannot pass without step 1. Step 2 is now skipped without step 1.
+
+Rollback:
+
+| Case | Result |
+|---|---|
+| Kairos one-shot fallback boot: `kairos-agent bootentry --select fallback` (sets `next_entry=fallback` in `/oem/grubenv`), drain, reboot of node3 | node3 booted `passive.img` with the release A baryon-virtd (8db33bb, protocol 1.2, the same features); VirtualizationNode Ready; the node's VM came back; a new VM (lvm-local, HTTP import) on the fallback host Ready under cluster release B. The next reboot returned to `active.img` (release B) and the VM came back The first attempt of the new VM stayed Pending: its import Pod was unschedulable because the CPU requests of the node were full; the VM was removed and the cycle repeated with capacity |
+| Cluster release B back to A manifests, CRDs and classes left on B (Not supported) | the release A controller logged `reconcile failed` (`` missing field `cores` ``) and watch errors (`` missing field `protocol` ``); the release A node agents could not publish, so every VirtualizationNode showed `Ready` Unknown (`NodeAgentStopped`, from the release B agents' stop write) with a stale heartbeat; running VMs kept running with the same Anchor Pods; a VM created meanwhile got no status and no pods. Applying release B `baryon.yaml` again: every node Ready, the new VM Ready, the Anchor Pods of running VMs unchanged |
+| A protocol feature disappearing on rollback | not exercised: releases A and B have the same feature set. The earlier skew run with a 1.1 host covers it: `NetworkReady` Unknown (`RuntimeDoesNotReport`) on that host, VMs attached |
+
+During the rollback cases, a node that had rebooted several times within
+a short time got its node agent pod only minutes after the node was
+Ready, and the OpenEBS LVM CSI node plugin was delayed the same way
+(`MapVolume` failed: driver not registered), so the lvm-local VM followed
+later. Recovery was automatic. This is Kubernetes DaemonSet behavior
+([troubleshooting.md](troubleshooting.md#node-agent-pod-delayed-after-repeated-reboots)).
+
+E2E on release B (every host on the release B host image, the cluster on
+the release B manifests, build c3a3735):
+
+| Script | Result |
+|---|---|
+| lifecycle | 35 of 35 |
+| node agent outage | 32 of 32 |
+| storage | ceph-rbd Block 47 of 47; lvm-local Filesystem 36 of 36 (the move to another node is skipped for a volume bound to its node) |
+| import integrity | lvm-local 52 of 52; ceph-rbd 52 of 52 |
+| multi-node | 69 of 69 |
+| placement | 65 of 65 |
+| hostile disk | 4 of 4 |
+| deletion | 19 of 19 |
+| skew (all hosts on one build) | 33 of 33 |
+| network health (`REBOOT=1`) | ceph-rbd 46 of 46; lvm-local 46 of 46 |
+
+13 runs of 10 scripts, 536 checks, none failed.
+
+Uninstall and reinstall with the release files:
+
+| Step | Result |
+|---|---|
+| Uninstall with `baryon.yaml` ([installation.md](installation.md#9-uninstall)), VMs deleted first | the namespace and the CRDs were gone; no Baryon pods left; no `/run/baryon/vms` entries; baryon-virtd still active as a host service; the vm extended resource at 0 |
+| Clean install from the release files (`baryon.yaml` server-side, `baryon-classes.yaml`) | every VirtualizationNode Ready; a ceph-rbd Block VM and an lvm-local Filesystem VM Ready, with `NetworkReady` True |
 
 ### Hadron single node and kind host
 

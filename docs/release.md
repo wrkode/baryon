@@ -35,8 +35,8 @@ with these files, built by `.github/workflows/release.yaml` from the tag:
 | `baryon.yaml` | Everything `deploy/base` installs: CRDs, namespace, node agent, controller, admission policies, tenant roles. Component images are pinned by digest. |
 | `baryon-crds.yaml` | The CRDs alone, for the first step of an upgrade |
 | `baryon-classes.yaml` | The example VirtualMachineClasses |
-| `baryon-virtd-<version>-x86_64-linux-musl` | The static baryon-virtd binary, copied from the host image |
-| `baryon-<version>-source.tar.gz` | The source tree of the tag |
+| `baryon-virtd-v<version>-x86_64-linux-musl` | The static baryon-virtd binary, copied from the host image |
+| `baryon-v<version>-source.tar.gz` | The source tree of the tag |
 | `images.txt` | The image references with their digests |
 | `*.spdx.json` | SPDX SBOMs of the source tree and of each image |
 | `SHA256SUMS` | SHA-256 checksums of the files above |
@@ -45,10 +45,10 @@ Images on ghcr.io:
 
 | Image | Content |
 |---|---|
-| `ghcr.io/wrkode/baryon-controller:<version>` | baryon-controller |
-| `ghcr.io/wrkode/baryon-node-agent:<version>` | baryon-node-agent |
-| `ghcr.io/wrkode/baryon-anchor:<version>` | baryon-anchor (Anchor Pod and import Pod) |
-| `ghcr.io/wrkode/baryon-hadron:<version>-k0s` | The Baryon-enabled Hadron host image with k0s, the version pinned in `packaging/versions.env` |
+| `ghcr.io/wrkode/baryon-controller:v<version>` | baryon-controller |
+| `ghcr.io/wrkode/baryon-node-agent:v<version>` | baryon-node-agent |
+| `ghcr.io/wrkode/baryon-anchor:v<version>` | baryon-anchor (Anchor Pod and import Pod) |
+| `ghcr.io/wrkode/baryon-hadron:v<version>-k0s` | The Baryon-enabled Hadron host image with k0s, the version pinned in `packaging/versions.env` |
 
 The component images are `FROM scratch` with one static binary. The
 inputs of the builds are pinned in `packaging/versions.env`: the base and

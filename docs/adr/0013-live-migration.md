@@ -113,9 +113,14 @@ are in the Cloud Hypervisor repository unless they start with `crates/`.
 
 ## Decision
 
-- Live migration is Not supported. Baryon has no public migration API (no
-  `VirtualMachineMigration` or equivalent resource), no migration RPC in the
-  runtime protocol, and no migration code in baryon-virtd.
+- Live migration is Not supported. The wording used in the documentation
+  and release notes: "Live migration is currently unsupported. Baryon's
+  network handoff model requires destination-side file descriptor
+  injection during Cloud Hypervisor migration, which is not available in
+  the currently supported Cloud Hypervisor release." Baryon has no public
+  migration API (no `VirtualMachineMigration` or equivalent resource), no
+  migration RPC in the runtime protocol, and no migration code in
+  baryon-virtd.
 - Evacuation stays stop and restart: a drain or a Kairos upgrade stops the
   VMs on the node, and the controller starts them again where their storage
   allows (ADR 0004).
@@ -361,3 +366,5 @@ record stays out of the repository; no timings are published.
 - 2026-10-04: the consequence on Cloud Hypervisor's seccomp profile now
   records that Baryon's seccomp filter denies `userfaultfd` and inet
   sockets. The decision is unchanged.
+- 2026-10-05: the Decision now carries the exact sentence that the
+  documentation and release notes repeat. The decision is unchanged.

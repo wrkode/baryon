@@ -750,13 +750,15 @@ protects it. Reviewed in the v0.1.0-rc1 release gate review of 2026-10-05.
 | Item | State |
 |---|---|
 | GitHub Actions | Every action in `.github/workflows/` is pinned by commit SHA, with the version in a comment |
-| Workflow token permissions | `contents: read` by default. Only the release job has write permissions: `contents: write` (the GitHub release), `packages: write` (ghcr.io), `id-token: write` and `attestations: write` (provenance). Checkouts do not persist credentials |
+| Workflow token permissions | `contents: read` by default. Only the release job has write permissions: `contents: write` (the GitHub release), `packages: write` (ghcr.io), `id-token: write` and `attestations: write` (provenance). The job holds them also for a `workflow_dispatch` dry run, which publishes nothing, and `id-token` and `attestations` are unused while the repository is private. The pinned `anchore/sbom-action` steps receive the job token through the action's default `github-token` input. Checkouts do not persist credentials. Split jobs: Planned |
 | Dependency gate | CI runs `cargo deny check advisories licenses sources bans` on every change. Implemented |
 | DCO | CI checks the `Signed-off-by` trailer of every commit in a push or pull request (`hack/check-dco.sh`). Implemented |
 | Host component downloads | Cloud Hypervisor, its firmware, and virtiofsd are downloaded by URL and checked against the SHA-256 in `packaging/versions.env`; CI checks that the pinned artifacts are fetchable and match (`hack/fetch-artifacts.sh`). Implemented |
 | Base and builder images | Hadron, kairos-init, the Rust builder image, and Alpine are pinned by digest in `packaging/versions.env` (tag kept for people, digest decides); `components.json` in the host image records the Hadron and kairos-init references with their digests. Implemented |
+| Kubernetes distribution binary | k0s is installed into the host image by kairos-init (pinned by digest) at the version in `packaging/versions.env`. Its download verification is kairos-init's and is not verified by Baryon; `components.json` records the version only. Upstream dependency |
+| Build context | `.dockerignore` excludes build outputs and `.git` only; the Dockerfiles copy explicit paths. An allowlist `.dockerignore`: Planned |
 | Component images | `FROM scratch` with one static binary; no base image, no package manager. Implemented |
-| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; not yet exercised by a published release |
+| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; Tested by the release workflow dry run on 2026-10-05; not yet exercised by a published release |
 | Provenance | GitHub artifact attestations for every release file and image, created only when the repository is public; a release from a private repository has none. Implemented; not yet exercised |
 | Signing | None. No file, image, or tag is signed with a project key |
 | Release gate | The release procedure requires CI to pass on `main` before tagging, but the release workflow does not check CI results or that the tag is on `main`, and tags are not protected. Accepted for v0.1.0-rc1; enforcement Planned |
@@ -918,7 +920,7 @@ Findings of the 2026-10-05 v0.1.0-rc1 release gate review:
 
 | Finding | Severity | State |
 |---|---|---|
-| H1: GitHub artifact attestations need a public repository on the current plan; wrkode/baryon is private, so a release has no provenance attestations and its images and files need GitHub access | High | Open: making the repository public is the owner's decision. The workflow attests only when the repository is public, and the docs say what a private release carries ([Release and supply chain](#release-and-supply-chain)) |
+| H1: GitHub artifact attestations need a public repository on the current plan; wrkode/baryon is private, so a release has no provenance attestations and its images and files need GitHub access | High | Resolved for v0.1.0-rc1 by disclosure: no attestations are created or claimed for a release from the private repository; the workflow attests only when the repository is public, and the docs say what a private release carries ([Release and supply chain](#release-and-supply-chain)). Making the repository public is the owner's decision |
 | M1: base and builder images were pinned by tag | Medium | Fixed: pinned by digest in `packaging/versions.env` |
 | M2: baryon-node-agent is node root through the device plugin: its `Allocate` answer decides which host devices and paths a container gets | Medium | Documented ([Trust boundaries](#trust-boundaries)); a separate minimal device plugin process is Planned |
 | L1: the release workflow does not check CI results or `main` ancestry, and tags are not protected | Low | Accepted for v0.1.0-rc1; Planned |
@@ -929,6 +931,8 @@ Findings of the 2026-10-05 v0.1.0-rc1 release gate review:
 | N1: DHCP responder events carry no responder generation, and a killed responder that the reaper stops waiting for after 60 s can remain a zombie | Note | Open |
 | N2: the attach log line carried anchor-supplied names before they were validated | Note | Fixed: VM name and namespace are logged cut to 253 bytes, required features to 16 entries of 253 bytes |
 | N3: one importer refusal message named the full source URL | Note | Fixed: it shows the URL redacted (scheme, host, port, path) |
+| Final gate: the release job holds unused write permissions (dry run, private repository), and the SBOM action receives the job token by default | Low | Accepted for v0.1.0-rc1; covered by the split-jobs item (Planned) |
+| Final gate: the k0s binary's integrity rests on kairos-init | Note | Documented ([Release and supply chain](#release-and-supply-chain)); upstream dependency |
 
 Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
 report no vulnerabilities in the Rust dependencies. Cloud Hypervisor

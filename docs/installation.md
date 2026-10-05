@@ -84,8 +84,8 @@ hack/build-hadron-image.sh <registry>/baryon-hadron:v0.1.0-rc1-k0s
   stands for a release must come from a clean checkout of its tag.
 - Stages and options: [hadron.md, Build](hadron.md#build).
 
-If the repository is public, verify the published image's build
-provenance (see [Verify the release](#verify-the-release)):
+If the release was published while the repository was public, verify
+the published image's build provenance (see [Verify the release](#verify-the-release)):
 
 ```bash
 gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s --repo wrkode/baryon
@@ -364,8 +364,8 @@ gh release download v0.1.0-rc1 --repo wrkode/baryon \
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-If the repository is public, also verify the attestations of the files
-and the images:
+If the release was published while the repository was public, also
+verify the attestations of the files and the images:
 
 ```bash
 gh attestation verify SHA256SUMS --repo wrkode/baryon
@@ -389,8 +389,11 @@ kubectl apply -f baryon-classes.yaml
 
 Status: the release workflow (`.github/workflows/release.yaml`) and the
 manifest renderer (`hack/release-manifests.sh`) are Implemented. An
-installation from the published release files is part of the v0.1.0-rc1
-release validation, which is in progress (pending: release validation).
+installation from release files rendered by the same procedure, applied as
+files, is Tested on the k0s cluster in the v0.1.0-rc1 release validation
+([testing.md](testing.md#v010-rc1-release-validation)). The published
+release files are rebuilt by the release workflow from the tag; a smoke
+test of them follows the tag (pending).
 
 ### Private repository
 
@@ -401,8 +404,9 @@ The ghcr.io images are private too. The manifests carry no
 `imagePullSecrets`, and baryon-controller creates Anchor Pods and import
 Pods in the VM's namespace without them, so every node's container
 runtime needs its own credentials for `ghcr.io`, or the images must be
-loaded onto the nodes. Status: Not tested; the release validation in
-progress uses the k0s cluster.
+loaded onto the nodes. Status: pulling the images with node credentials
+is Not tested; the release validation loaded the images into each node's
+containerd.
 
 ### From a checkout
 
@@ -540,14 +544,16 @@ To stop, start, and restart the VM: set `spec.runPolicy` to `Stopped` or
 
 ## 9. Uninstall
 
-Status: Tested on the k0s cluster for an installation from a checkout:
-the VMs were deleted first, then the components with
-`kubectl delete -k deploy/base`; afterwards the `baryon-system` namespace
-and the CRDs were gone and no runtime directories were left on the nodes.
-Deleting a VirtualMachine and what that removes is Tested
-([testing.md](testing.md#what-deletion-removes)). Uninstalling with the
-release file `baryon.yaml` follows the same steps (pending: release
-validation).
+Status: Tested on the k0s cluster, both with `kubectl delete -k
+deploy/base` for an installation from a checkout and with the release file
+`baryon.yaml` in the v0.1.0-rc1 release validation, the VMs deleted first
+each time: afterwards the `baryon-system` namespace and the CRDs were
+gone, no Baryon pods were left, no runtime directories were left on the
+nodes, and baryon-virtd was still active as a host service. A clean
+install from the release files afterwards worked
+([testing.md](testing.md#v010-rc1-release-validation)). Deleting a
+VirtualMachine and what that removes is Tested
+([testing.md](testing.md#what-deletion-removes)).
 
 1. Delete every VirtualMachine while baryon-controller still runs. Each VM
    carries the finalizer `virtualization.baryon.io/anchor-cleanup`, which
@@ -634,23 +640,47 @@ host images lack its host-side safety fixes.
 
 Status:
 
-- The order CRDs, classes, deployment was followed when the k0s cluster was
-  upgraded in place to the 0.1.0-rc1 API changes, from a checkout; the
-  running VM kept running (Tested, [testing.md](testing.md#k0s-cluster)).
-  An upgrade from an earlier release with the published release files:
-  pending: release validation.
-- `NodeOpUpgrade` of one node with Kairos Operator v0.2.2: Tested on the
-  k0s cluster, with the upgrade image preloaded on the node. Pulling the
-  host image from `ghcr.io` during the upgrade: Not tested.
+- The order CRDs, classes, deployment: Tested on the k0s cluster, from a
+  checkout, and in the v0.1.0-rc1 release validation with release files,
+  from a release-like build of 8db33bb to one of c3a3735; running VMs kept
+  running ([testing.md](testing.md#v010-rc1-release-validation)).
+- Host images with Kairos Operator v0.2.2, one `NodeOpUpgrade` per node and
+  the runbook including its step 5 check: Tested on all three nodes of the
+  k0s cluster in the release validation, with the upgrade image preloaded
+  on each node and a new VM started while the hosts were mixed. Pulling
+  the host image from `ghcr.io` during the upgrade: Not tested.
 
 ### Rollback
 
 - Rolling the cluster release back from 0.1.0-rc1 to an earlier commit: Not
   supported. Earlier controllers cannot read the 0.1.0-rc1 class shape
   (`cpu.vcpus`) or the 0.1.0-rc1 VirtualizationNode status
-  ([Upgrade to 0.1.0-rc1](compatibility.md#upgrade-to-010-rc1)).
-- Rolling a host image back through Kairos A/B (the node boots its previous
-  image) within the same runtime protocol major version: expected to work,
-  because any 1.x host image works with any 1.x cluster release (ADR 0012);
-  the older image lacks the host-side safety fixes of newer releases.
-  pending: release validation.
+  ([Upgrade to 0.1.0-rc1](compatibility.md#upgrade-to-010-rc1)). Observed
+  in the release validation, with the earlier manifests applied over the
+  0.1.0-rc1 CRDs and classes: the earlier controller's reconciles and
+  watches failed, the earlier node agents could not publish, so every
+  VirtualizationNode stayed `Ready` Unknown (`NodeAgentStopped`) with a
+  stale heartbeat, and a VM created meanwhile got no status and no pods.
+  Running VMs kept running with the same Anchor Pods. Recovery: apply the
+  0.1.0-rc1 `baryon.yaml` again; every node was Ready again, the waiting
+  VM started, and the Anchor Pods of running VMs were unchanged.
+- Rolling a host image back through Kairos A/B within the same runtime
+  protocol major version: any 1.x host image works with any 1.x cluster
+  release (ADR 0012); the older image lacks the host-side safety fixes of
+  newer releases. The one-shot fallback boot is Tested in the release
+  validation: drain the node, select the fallback entry for the next
+  boot (it sets `next_entry` in `/oem/grubenv`), reboot, and uncordon the
+  node when it is Ready:
+
+  ```bash
+  kubectl drain <node> --ignore-daemonsets
+  ssh <user>@<node-address> sudo kairos-agent bootentry --select fallback
+  ssh <user>@<node-address> sudo systemctl reboot
+  kubectl uncordon <node>
+  ```
+
+  The node
+  booted its previous host image, its VMs came back, and a new VM started
+  there under the 0.1.0-rc1 cluster release; the next reboot returned to
+  the active image. An automatic fallback after a failed upgrade boot is
+  Not tested ([lifecycle contract](kairos-integration.md#lifecycle-contract)).
