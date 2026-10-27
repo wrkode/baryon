@@ -107,6 +107,7 @@ mod mac_string {
 /// Liveness probes from `probes` are answered from this loop, between
 /// packets, so an answer shows that the loop that serves the guest runs,
 /// whether or not the guest sends anything.
+#[allow(unsafe_code)]
 pub async fn serve(
     socket: OwnedFd,
     lease: LeaseConfig,
@@ -114,7 +115,11 @@ pub async fn serve(
     mut probes: mpsc::Receiver<u64>,
     cancel: CancellationToken,
 ) -> io::Result<()> {
-    let socket = AsyncFd::new(socket)?;
+    // SAFETY: `socket` is an `OwnedFd` moved into the `AsyncFd`, which owns
+    // it until it is dropped at the end of this function. Nothing else can
+    // close it or replace the descriptor it refers to, and `as_raw_fd` of an
+    // `OwnedFd` always returns the same descriptor.
+    let socket = unsafe { AsyncFd::register(socket) }?;
     let mut buf = vec![0u8; 2048];
     let mut last_reported: Option<std::time::Instant> = None;
     let mut probing = true;

@@ -1071,6 +1071,18 @@ guest-triggerable VMM panics; it also adds `AF_NETLINK` to the VMM thread's
 `socket` rule, which Baryon's filter keeps denied
 ([Baryon seccomp layer](#baryon-seccomp-layer)).
 
+Dependency update of 2026-10-27, after `cargo deny check advisories`
+started failing on new advisories: rustls 0.23.46 (RUSTSEC-2026-0346,
+0347, 0348, 0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382),
+webpki-roots 1.0.11 (RUSTSEC-2026-0381), webpki-root-certs 1.0.11
+(RUSTSEC-2026-0383), and tokio 1.54.1 (RUSTSEC-2026-0386, the unsound
+`AsyncFd` constructors `new`, `with_interest`, and their `try_` variants).
+baryon-virtd's two uses of
+those constructors (the DHCP responder's packet socket and the wait for a
+pidfd) now use `AsyncFd::register` and `AsyncFd::register_with_interest`
+on an `OwnedFd` that the `AsyncFd` owns. cargo audit and cargo deny report
+no advisories after the update.
+
 ## Future hardening
 
 | Item | Status |

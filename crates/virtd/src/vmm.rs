@@ -272,9 +272,16 @@ pub fn signal(pidfd: BorrowedFd<'_>, pid: i32, sig: Signal) -> Result<(), VmmErr
 }
 
 /// Wait until the process behind `pidfd` exits.
+#[allow(unsafe_code)]
 pub async fn wait_exit(pidfd: &OwnedFd) -> io::Result<()> {
     let dup = pidfd.try_clone()?;
-    let async_fd = tokio::io::unix::AsyncFd::with_interest(dup, tokio::io::Interest::READABLE)?;
+    // SAFETY: `dup` is a fresh `OwnedFd` (a duplicate of the pidfd) moved
+    // into the `AsyncFd`, which owns it until it is dropped at the end of
+    // this function. Nothing else holds or can close that descriptor, and
+    // `as_raw_fd` of an `OwnedFd` always returns the same descriptor.
+    let async_fd = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(dup, tokio::io::Interest::READABLE)
+    }?;
     let _guard = async_fd.readable().await?;
     Ok(())
 }
