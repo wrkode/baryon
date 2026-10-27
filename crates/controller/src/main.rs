@@ -38,6 +38,10 @@ struct Args {
     /// Image of the Anchor Pod container (baryon-anchor).
     #[arg(long, env = "BARYON_ANCHOR_IMAGE")]
     anchor_image: String,
+    /// Image of the import Pod container (baryon-importer). It is never
+    /// used for Anchor Pods.
+    #[arg(long, env = "BARYON_IMPORTER_IMAGE")]
+    importer_image: String,
     /// Concurrent reconciles.
     #[arg(long, default_value_t = 8)]
     concurrency: u16,
@@ -54,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .flatten_event(true)
         .init();
-    tracing::info!(build = %BUILD, anchor_image = %args.anchor_image, "starting");
+    tracing::info!(build = %BUILD, anchor_image = %args.anchor_image, importer_image = %args.importer_image, "starting");
 
     let client = kube::Client::try_default()
         .await
@@ -120,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(reconcile::Context {
         client: client.clone(),
         anchor_image: args.anchor_image,
+        importer_image: args.importer_image,
         recorder: Recorder::new(client.clone(), reporter),
         nodes: node_view.clone(),
     });

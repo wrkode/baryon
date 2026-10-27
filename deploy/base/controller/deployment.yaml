@@ -35,6 +35,8 @@ spec:
           env:
             - name: BARYON_ANCHOR_IMAGE
               value: baryon/anchor:dev
+            - name: BARYON_IMPORTER_IMAGE
+              value: baryon/importer:dev
             - name: POD_NAME
               valueFrom:
                 fieldRef:

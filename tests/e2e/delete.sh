@@ -64,7 +64,7 @@ esac
 if [ -n "${NODE_SHELL:-}" ]; then
   # The importer must see neither /dev/kvm nor the baryon-virtd anchor socket.
   inode="$(node_of_pod "$v-import")"
-  seen="$(host "$inode" "for c in /proc/[0-9]*/cmdline; do case \"\$(tr '\\0' ' ' < \$c 2>/dev/null)\" in /baryon-anchor\ import*) r=\${c%/cmdline}/root; echo importer; ls -d \$r/dev/kvm \$r/run/baryon/anchor 2>/dev/null;; esac; done" || true)"
+  seen="$(host "$inode" "for c in /proc/[0-9]*/cmdline; do case \"\$(tr '\\0' ' ' < \$c 2>/dev/null)\" in /baryon-importer\ import*|/baryon-anchor\ import*) r=\${c%/cmdline}/root; echo importer; ls -d \$r/dev/kvm \$r/run/baryon/anchor 2>/dev/null;; esac; done" || true)"
   paths="$(printf '%s\n' "$seen" | grep -v '^importer$' | grep . || true)"
   if ! printf '%s\n' "$seen" | grep -qx importer; then
     bad "import: importer process not found on $inode"

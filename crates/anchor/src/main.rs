@@ -7,10 +7,11 @@
 //!   this process (ADR 0005).
 //! - `probe`: exec readiness probe. The pod IP belongs to the guest, so
 //!   network probes would reach the guest instead of this process.
-//! - `import`: init container that writes a raw disk image from an HTTP(S)
-//!   URL into the root disk volume.
+//!
+//! There is deliberately no command that writes to the VM's disk: images
+//! are imported by `baryon-importer` in the import Pod, before the VM's
+//! first start, and that binary is not part of the Anchor image.
 
-mod import;
 mod run;
 
 use std::path::PathBuf;
@@ -40,30 +41,6 @@ enum Command {
     },
     /// Exit 0 when the VM is running.
     Probe,
-    /// Import a raw disk image into the root disk volume.
-    Import {
-        #[arg(long)]
-        url: String,
-        /// Expected SHA-256 of the image, hex encoded.
-        #[arg(long)]
-        sha256: Option<String>,
-        /// Size of the virtual disk in bytes. The image is extended to it.
-        #[arg(long)]
-        size_bytes: u64,
-        #[arg(long, default_value = "/var/lib/baryon/disks/root")]
-        dir: PathBuf,
-        /// Write to this raw block device instead of an image file in `dir`.
-        #[arg(long)]
-        device: Option<PathBuf>,
-        /// Write nothing until this file is non-empty: baryon-controller
-        /// approves the import once the claim is bound to a volume
-        /// provisioned for it.
-        #[arg(long)]
-        approval_file: Option<PathBuf>,
-        /// UID of the claim; the approval must name it.
-        #[arg(long)]
-        claim_uid: Option<String>,
-    },
 }
 
 fn main() -> ExitCode {
@@ -92,36 +69,38 @@ fn main() -> ExitCode {
     tracing::info!(build = %BUILD, "starting");
     match args.command {
         Command::Run { socket } => rt.block_on(run::run(socket)),
-        Command::Import {
-            url,
-            sha256,
-            size_bytes,
-            dir,
-            device,
-            approval_file,
-            claim_uid,
-        } => match rt.block_on(async {
-            if let Some(f) = &approval_file {
-                import::wait_for_approval(f, claim_uid.as_deref()).await?;
-            }
-            import::import(
-                &url,
-                sha256.as_deref(),
-                size_bytes,
-                match &device {
-                    Some(d) => import::Target::Device(d),
-                    None => import::Target::File(&dir),
-                },
-            )
-            .await
-        }) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "import failed");
-                run::write_termination_message(&format!("ImportFailed: {e:#}"));
-                ExitCode::FAILURE
-            }
-        },
         Command::Probe => ExitCode::SUCCESS,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn the_cli_is_consistent() {
+        Args::command().debug_assert();
+    }
+
+    /// The Anchor runtime has no disk import authority (finding M2 of
+    /// 2026-10-27): no subcommand imports or writes a disk image.
+    #[test]
+    fn there_is_no_import_subcommand() {
+        let names: Vec<String> = Args::command()
+            .get_subcommands()
+            .map(|c| c.get_name().to_owned())
+            .collect();
+        assert_eq!(names, ["run", "probe"]);
+        assert!(
+            Args::try_parse_from([
+                "baryon-anchor",
+                "import",
+                "--url=https://example.com/a.raw",
+                "--size-bytes=1048576",
+                "--device=/dev/baryon/root",
+            ])
+            .is_err()
+        );
     }
 }

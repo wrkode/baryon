@@ -19,7 +19,7 @@ case "$image" in
 esac
 packages=("$@")
 if [ "${#packages[@]}" -eq 0 ]; then
-  packages=(baryon-virtd baryon-anchor baryon-controller baryon-node-agent)
+  packages=(baryon-virtd baryon-anchor baryon-importer baryon-controller baryon-node-agent)
 fi
 pkg_args=()
 for p in "${packages[@]}"; do

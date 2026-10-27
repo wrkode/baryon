@@ -5,7 +5,7 @@
 #
 # Usage: hack/release-manifests.sh <out-dir>
 # Environment (all required): CONTROLLER_IMAGE, NODE_AGENT_IMAGE,
-# ANCHOR_IMAGE, each a full image reference such as
+# ANCHOR_IMAGE, IMPORTER_IMAGE, each a full image reference such as
 # ghcr.io/wrkode/baryon-controller@sha256:<digest>.
 #
 # Output in <out-dir>:
@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 out="${1:?usage: hack/release-manifests.sh <out-dir>}"
-for v in CONTROLLER_IMAGE NODE_AGENT_IMAGE ANCHOR_IMAGE; do
+for v in CONTROLLER_IMAGE NODE_AGENT_IMAGE ANCHOR_IMAGE IMPORTER_IMAGE; do
   [ -n "${!v:-}" ] || { echo "$v is required" >&2; exit 2; }
 done
 
@@ -51,6 +51,12 @@ trap 'rm -rf "$work"' EXIT
   echo "      - op: replace"
   echo "        path: /spec/template/spec/containers/0/env/0/value"
   echo "        value: $ANCHOR_IMAGE"
+  echo "      - op: test"
+  echo "        path: /spec/template/spec/containers/0/env/1/name"
+  echo "        value: BARYON_IMPORTER_IMAGE"
+  echo "      - op: replace"
+  echo "        path: /spec/template/spec/containers/0/env/1/value"
+  echo "        value: $IMPORTER_IMAGE"
 } > "$work/kustomization.yaml"
 
 mkdir -p "$out"
@@ -63,7 +69,7 @@ if grep -n 'baryon/[a-z-]*:dev' "$out/baryon.yaml"; then
   echo "development image references left in baryon.yaml" >&2
   exit 1
 fi
-for ref in "$CONTROLLER_IMAGE" "$NODE_AGENT_IMAGE" "$ANCHOR_IMAGE"; do
+for ref in "$CONTROLLER_IMAGE" "$NODE_AGENT_IMAGE" "$ANCHOR_IMAGE" "$IMPORTER_IMAGE"; do
   grep -qF "$ref" "$out/baryon.yaml" || { echo "$ref missing from baryon.yaml" >&2; exit 1; }
 done
 echo "rendered $out/baryon.yaml, $out/baryon-crds.yaml, $out/baryon-classes.yaml"

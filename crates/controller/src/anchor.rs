@@ -108,6 +108,10 @@ pub(crate) struct AnchorInput {
     /// import Pod only.
     pub import_approval: Option<String>,
     pub anchor_image: String,
+    /// Image of the import Pod. The Anchor image does not contain the
+    /// importer, so access to a running Anchor Pod cannot re-import the
+    /// disk.
+    pub importer_image: String,
     pub restarted_at: Option<String>,
     /// Nodes the Anchor Pod must not be scheduled to (host identity
     /// conflicts).
@@ -396,13 +400,13 @@ pub(crate) fn build_import(input: &AnchorInput) -> Result<Pod, BuildError> {
     });
     let importer = Container {
         name: IMPORT_CONTAINER.to_owned(),
-        image: Some(input.anchor_image.clone()),
+        image: Some(input.importer_image.clone()),
         args: Some(args),
         // Never ready, so Services that select the VM's labels never send
         // traffic to the import Pod.
         readiness_probe: Some(Probe {
             exec: Some(ExecAction {
-                command: Some(vec!["/baryon-anchor".to_owned(), "probe".to_owned()]),
+                command: Some(vec!["/baryon-importer".to_owned(), "probe".to_owned()]),
             }),
             period_seconds: Some(60),
             ..Default::default()
@@ -548,6 +552,7 @@ mod tests {
             claim_uid: "claim-1".into(),
             import_approval: None,
             anchor_image: "baryon/anchor:dev".into(),
+            importer_image: "baryon/importer:dev".into(),
             restarted_at: None,
             avoid_nodes: Vec::new(),
             placement: None,
@@ -712,6 +717,49 @@ mod tests {
         assert_eq!(args[0], "import");
         assert!(args.contains(&"--url=https://example.org/d.raw".to_owned()));
         assert!(!args.iter().any(|a| a.starts_with("--device")));
+        // The importer has its own image, which the Anchor Pod never uses,
+        // and the approval it needs is always on its command line.
+        assert_eq!(c.image.as_deref(), Some("baryon/importer:dev"));
+        assert!(args.contains(&format!("--approval-file={APPROVAL_DIR}/approved")));
+        assert!(args.contains(&format!("--claim-uid={}", i.claim_uid)));
+        assert_eq!(
+            c.readiness_probe
+                .as_ref()
+                .unwrap()
+                .exec
+                .as_ref()
+                .unwrap()
+                .command,
+            Some(vec!["/baryon-importer".to_owned(), "probe".to_owned()])
+        );
+    }
+
+    /// The Anchor Pod has no disk import authority (finding M2 of
+    /// 2026-10-27): it runs the Anchor image only, with `run` as its only
+    /// command, and no container or probe refers to the importer.
+    #[test]
+    fn anchor_pod_has_no_import_authority() {
+        for mode in [DiskMode::Filesystem, DiskMode::Block] {
+            let mut i = input(true);
+            i.disk_mode = mode;
+            let spec = build(&i).unwrap().spec.unwrap();
+            assert!(spec.init_containers.is_none());
+            assert!(spec.ephemeral_containers.is_none());
+            assert_eq!(spec.containers.len(), 1);
+            let c = &spec.containers[0];
+            assert_eq!(c.image.as_deref(), Some("baryon/anchor:dev"));
+            assert_eq!(c.args.as_deref(), Some(&["run".to_owned()][..]));
+            assert!(c.command.is_none());
+            let probe = c.readiness_probe.as_ref().unwrap().exec.as_ref().unwrap();
+            assert_eq!(
+                probe.command,
+                Some(vec!["/baryon-anchor".to_owned(), "probe".to_owned()])
+            );
+            let text = serde_json::to_string(&spec).unwrap();
+            assert!(!text.contains("importer"), "{text}");
+            assert!(!text.contains("--approval-file"), "{text}");
+            assert!(!text.contains("import-approval"), "{text}");
+        }
     }
 
     #[test]

@@ -75,7 +75,7 @@ jobs:
       - name: Component images
         id: images
         run: |
-          for c in anchor node-agent controller; do
+          for c in anchor importer node-agent controller; do
             ref="$REGISTRY/baryon-$c:$VERSION"
             docker build -f "packaging/images/$c.Dockerfile" -t "$ref" .
             if [ "$PUBLISH" != true ]; then
@@ -111,6 +111,7 @@ jobs:
           CONTROLLER_IMAGE: ${{ steps.images.outputs.controller }}
           NODE_AGENT_IMAGE: ${{ steps.images.outputs.node_agent }}
           ANCHOR_IMAGE: ${{ steps.images.outputs.anchor }}
+          IMPORTER_IMAGE: ${{ steps.images.outputs.importer }}
           HOST_IMAGE: ${{ steps.host.outputs.ref }}
         run: |
           mkdir -p _release
@@ -122,6 +123,7 @@ jobs:
             echo "controller: $CONTROLLER_IMAGE"
             echo "node-agent: $NODE_AGENT_IMAGE"
             echo "anchor: $ANCHOR_IMAGE"
+            echo "importer: $IMPORTER_IMAGE"
             echo "host (k0s $(sed -n 's/^K0S_VERSION=//p' packaging/versions.env)): $HOST_IMAGE"
           } > _release/images.txt
 
@@ -131,6 +133,14 @@ jobs:
           image: ${{ env.REGISTRY }}/baryon-anchor:${{ env.VERSION }}
           format: spdx-json
           output-file: _release/baryon-anchor-${{ env.VERSION }}.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: SBOM importer image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.REGISTRY }}/baryon-importer:${{ env.VERSION }}
+          format: spdx-json
+          output-file: _release/baryon-importer-${{ env.VERSION }}.spdx.json
           upload-artifact: false
           upload-release-assets: false
       - name: SBOM node agent image
@@ -172,6 +182,13 @@ jobs:
         with:
           subject-name: ${{ env.REGISTRY }}/baryon-anchor
           subject-digest: ${{ steps.images.outputs.anchor_digest }}
+          push-to-registry: true
+      - name: Provenance of the importer image
+        if: env.ATTEST == 'true'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/baryon-importer
+          subject-digest: ${{ steps.images.outputs.importer_digest }}
           push-to-registry: true
       - name: Provenance of the node agent image
         if: env.ATTEST == 'true'

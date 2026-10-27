@@ -275,12 +275,18 @@ baryon-virtd the anchor keeps its last readiness for 30 s
 One pod per VM while an HTTP import is pending, named `<vm>-import`, in the
 VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
 
-- runs `baryon-anchor import` as the VM's host identity, with the same
+- runs `baryon-importer import` from its own image, `baryon-importer`,
+  which only import Pods use: the Anchor image does not contain the
+  importer, so access to a running Anchor Pod gives no way to re-import
+  or overwrite the VM's disk (finding M2 of 2026-10-27). It runs as the
+  VM's host identity, with the same
   restricted pod and container security context, claim volume, and
   scheduling fields (the VM's placement and Baryon's identity-conflict
   term) as the Anchor Pod; `restartPolicy: OnFailure`. The importer's
   arguments carry `--url=`, `--size-bytes=`, `--claim-uid=`, and
-  `--approval-file=`, plus `--sha256=` and, in block mode, `--device=`
+  `--approval-file=`, plus `--sha256=` and, in block mode, `--device=`;
+  the importer refuses to start without `--approval-file=` and
+  `--claim-uid=`
 - mounts a downward API volume at `/etc/baryon/import` whose file
   `approved` holds the pod's annotation
   `virtualization.baryon.io/import-approved`. The importer writes nothing
@@ -299,8 +305,8 @@ VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
   Pod in the VM's spread constraints and pod anti-affinity (with storage
   that binds on first use, the import Pod decides the VM's node); no
   `vm-name` label
-- a readiness probe (`baryon-anchor probe`) that never passes, because the
-  importer never writes the status file it reads, so a Service that
+- a readiness probe (`baryon-importer probe`) that never passes, so a
+  Service that
   selects the VM's labels never sends traffic to the import Pod
 - annotation `virtualization.baryon.io/import-source`: `sha256:` and the hex
   SHA-256 of the source URL. An import Pod whose digest differs from the

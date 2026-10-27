@@ -1,0 +1,34 @@
+[package]
+name = "baryon-importer"
+description = "Process in the import Pod: writes a raw disk image into a VM's new root disk volume"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+baryon-runtime-api = { workspace = true }
+baryon-version = { workspace = true }
+
+anyhow = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
+serde_json = { workspace = true }
+rustix = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

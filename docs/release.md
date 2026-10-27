@@ -47,7 +47,8 @@ Images on ghcr.io:
 |---|---|
 | `ghcr.io/wrkode/baryon-controller:v<version>` | baryon-controller |
 | `ghcr.io/wrkode/baryon-node-agent:v<version>` | baryon-node-agent |
-| `ghcr.io/wrkode/baryon-anchor:v<version>` | baryon-anchor (Anchor Pod and import Pod) |
+| `ghcr.io/wrkode/baryon-anchor:v<version>` | baryon-anchor (Anchor Pod) |
+| `ghcr.io/wrkode/baryon-importer:v<version>` | baryon-importer (import Pod); not part of the anchor image |
 | `ghcr.io/wrkode/baryon-hadron:v<version>-k0s` | The Baryon-enabled Hadron host image with k0s, the version pinned in `packaging/versions.env` |
 
 The component images are `FROM scratch` with one static binary. The

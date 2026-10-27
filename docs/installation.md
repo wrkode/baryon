@@ -415,7 +415,7 @@ that digest reference: an image saved by Docker's classic image store has
 a different manifest, and an image known only by a tag name is not found,
 so kubelet tries to pull and fails with `401 Unauthorized`. One way that
 keeps the digest, with the `oras` CLI on a machine with access and the
-k0s `ctr`; repeat for the node agent and anchor images and for every
+k0s `ctr`; repeat for the other component images and for every
 node, with the references from `images.txt`:
 
 ```bash
@@ -433,12 +433,12 @@ under the tag that the `NodeOpUpgrade` names.
 
 ### From a checkout
 
-Build the static binaries and the three component images, and push them
+Build the static binaries and the component images, and push them
 to a registry the nodes can pull from:
 
 ```bash
 hack/build-static.sh
-for c in anchor node-agent controller; do
+for c in anchor importer node-agent controller; do
   docker build -f "packaging/images/$c.Dockerfile" -t "<registry>/baryon-$c:<tag>" .
   docker push "<registry>/baryon-$c:<tag>"
 done
@@ -450,6 +450,7 @@ Render the manifests with your images and apply them:
 CONTROLLER_IMAGE=<registry>/baryon-controller:<tag> \
 NODE_AGENT_IMAGE=<registry>/baryon-node-agent:<tag> \
 ANCHOR_IMAGE=<registry>/baryon-anchor:<tag> \
+IMPORTER_IMAGE=<registry>/baryon-importer:<tag> \
   hack/release-manifests.sh _out
 kubectl apply --server-side -f _out/baryon.yaml
 kubectl apply -f _out/baryon-classes.yaml
@@ -458,7 +459,7 @@ kubectl apply -f _out/baryon-classes.yaml
 `hack/release-manifests.sh` needs `kubectl` (for `kubectl kustomize`) and
 refuses output that still contains a development image reference. Instead,
 you can set the images in `deploy/base/controller/deployment.yaml` (the
-controller image and the `BARYON_ANCHOR_IMAGE` value) and
+controller image and the `BARYON_ANCHOR_IMAGE` and `BARYON_IMPORTER_IMAGE` values) and
 `deploy/base/node-agent/daemonset.yaml` and run
 `kubectl apply --server-side -k deploy/base`
 ([development.md](development.md#deploying-to-a-cluster-of-hadron-nodes)).

@@ -218,21 +218,10 @@ dependencies = [
 name = "baryon-anchor"
 version = "0.1.0-rc1"
 dependencies = [
- "anyhow",
  "baryon-runtime-api",
  "baryon-version",
- "bytes",
  "clap",
- "http",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
  "rustix",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
  "tokio",
  "tonic",
  "tracing",
@@ -299,6 +288,29 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+]
+
+[[package]]
+name = "baryon-importer"
+version = "0.1.0-rc1"
+dependencies = [
+ "anyhow",
+ "baryon-runtime-api",
+ "baryon-version",
+ "bytes",
+ "clap",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "rustix",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

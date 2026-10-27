@@ -42,8 +42,10 @@ in the VM's namespace and owned by the VirtualMachine.
   cluster in which a kind node container acted as the host, with
   `enforce=restricted`).
 - An imported root disk is written by a separate import Pod, `<vm>-import`,
-  before the first Anchor Pod exists. It runs `baryon-anchor import` as the
-  VM's host identity with the same restricted security context, claim
+  before the first Anchor Pod exists. It runs `baryon-importer import`, from
+  an image that only import Pods use (the Anchor image has no import
+  code), as the VM's host identity with the same restricted security
+  context, claim
   volume, and scheduling fields as the Anchor Pod, `restartPolicy: OnFailure`,
   and requests the VM's CPU and memory plus one
   `virtualization.baryon.io/import` slot. That resource has the same slot
@@ -203,3 +205,8 @@ start.
   is unchanged: no new Anchor Pod while the old pod object exists.
   Deleting the Node object, or the pod, removes the fencing; it is safe
   only after confirming that the machine is off.
+- 2026-10-27: the importer is a separate binary and image,
+  `baryon-importer`, used only by import Pods; `baryon-anchor` has no
+  import command, so access to a running Anchor Pod (for example through
+  `pods/exec`) gives no way to re-import or overwrite the VM's disk
+  (security.md, finding M2 of 2026-10-27). The decision is unchanged.

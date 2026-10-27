@@ -1,4 +1,4 @@
-//! `baryon-anchor import`: write a raw disk image from an HTTP(S) URL into
+//! `baryon-importer import`: write a raw disk image from an HTTP(S) URL into
 //! the root disk volume.
 //!
 //! The image is streamed and its SHA-256 is verified when given.
@@ -55,14 +55,14 @@ pub(crate) enum Target<'a> {
 /// pod restarts it.
 const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-/// Wait until `file` holds the approval: the claim UID `expected`, or any
-/// value when none is expected. Nothing is written to the disk before.
-pub(crate) async fn wait_for_approval(file: &Path, expected: Option<&str>) -> anyhow::Result<()> {
+/// Wait until `file` holds the approval, the claim UID `expected`. Nothing
+/// is written to the disk before.
+pub(crate) async fn wait_for_approval(file: &Path, expected: &str) -> anyhow::Result<()> {
     let start = std::time::Instant::now();
     let mut logged = false;
     loop {
         match std::fs::read_to_string(file) {
-            Ok(v) if !v.trim().is_empty() && expected.is_none_or(|e| v.trim() == e) => {
+            Ok(v) if !expected.is_empty() && v.trim() == expected => {
                 tracing::info!("import approved");
                 return Ok(());
             }
@@ -963,7 +963,7 @@ mod tests {
         std::fs::write(&f, "").unwrap();
         let waiter = tokio::spawn({
             let f = f.clone();
-            async move { wait_for_approval(&f, Some("claim-uid")).await }
+            async move { wait_for_approval(&f, "claim-uid").await }
         });
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         assert!(!waiter.is_finished(), "an empty approval must not proceed");

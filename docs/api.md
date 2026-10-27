@@ -129,7 +129,7 @@ other image.
 
 The import runs in a separate import Pod, `<vm>-import`, before the VM's
 first Anchor Pod exists (see [architecture.md](architecture.md#import-pod-implemented-tested-by-the-deletion-and-storage-e2e-on-the-k0s-cluster)).
-The importer (`baryon-anchor import`, `crates/anchor/src/import.rs`) applies
+The importer (`baryon-importer import`, `crates/importer/src/import.rs`, in its own image) applies
 the same digest rule on its own, refuses a redirect from HTTPS to plain HTTP,
 and resolves relative redirect locations against the current URL path. It
 refuses an image larger than `rootDisk.size` before writing past it.

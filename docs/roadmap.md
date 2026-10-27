@@ -57,7 +57,7 @@ v0.1.0-rc1 is published
 | Item | Status | Notes |
 |---|---|---|
 | AnchorService peer checks: no calls from the VMM or the DHCP responder; `Attach` and `Stop` only from the Anchor container's init process | Designed | Finding M1 of 2026-10-27 in [security.md](security.md#review-findings); part of [ADR 0014](adr/0014-guest-access.md), can ship first |
-| `baryon-anchor import` only with the controller's approval and the claim UID | Planned | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings) |
+| Disk import removed from the Anchor runtime: a separate `baryon-importer` binary and image for import Pods | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings) |
 | Device plugin in a separate minimal process | Planned | Finding M2 of the 2026-10-05 release gate review in [security.md](security.md#review-findings) |
 | Separate build and publish jobs in the release workflow | Planned | Only the publish job would hold write tokens |
 | Release workflow check of CI results and `main` ancestry; protected release tags | Planned | Finding L1 of the 2026-10-05 release gate review, accepted for v0.1.0-rc1 ([security.md](security.md#review-findings)) |
