@@ -2,6 +2,7 @@
 target
 !target/static/x86_64-unknown-linux-musl/release/baryon-anchor
 !target/static/x86_64-unknown-linux-musl/release/baryon-controller
+!target/static/x86_64-unknown-linux-musl/release/baryon-importer
 !target/static/x86_64-unknown-linux-musl/release/baryon-node-agent
 _output
 .git
