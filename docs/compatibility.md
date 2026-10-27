@@ -39,7 +39,7 @@ and Not tested rows make no claim. States:
 | Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`, pinned by digest in `packaging/versions.env`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
 | Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`, pinned by digest in `packaging/versions.env`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
 | Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
-| Cloud Hypervisor | v53.0, static binary, SHA-256 pinned in `packaging/versions.env` | Tested. Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
+| Cloud Hypervisor | v54.0, static binary, SHA-256 pinned in `packaging/versions.env`, with nested virtualization off and the virtio-net offloads on written explicitly (ADR 0007) | Tested: the E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)). v0.1.0-rc1 ships v53.0 (Tested in its release validation). Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
 | UEFI firmware | CLOUDHV.fd from cloud-hypervisor/edk2 `ch-97eeb7b09`, SHA-256 pinned in `packaging/versions.env` | Tested |
 | virtiofsd | v1.14.0 | Shipped in the image, not used by Baryon |
 | Architecture | x86_64 | Tested. aarch64: Not supported, binaries and firmware are built for x86_64 only (aarch64 support is Planned) |
@@ -76,6 +76,7 @@ and Not tested rows make no claim. States:
 - Snapshots and VM cloning.
 - Confidential computing (SEV-SNP, TDX, attestation).
 - Hugepage-backed guest memory and NUMA placement.
+- Nested virtualization inside guests.
 - More than one disk or one network interface per VM.
 - Disk image formats other than raw (qcow2, compressed images).
 - aarch64.
@@ -111,7 +112,7 @@ claims still follow tests.
 
 | Distribution | State for v0.1 |
 |---|---|
-| k0s | Tested: v1.36.4+k0s.1 on the k0s cluster, three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, one controller that also runs workloads and two workers, kube-router, OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0. Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container; it validates only API server behavior (CRD schema, CEL rules, admission policies) and is not a Baryon host |
+| k0s | Tested: v1.36.4+k0s.1 on the k0s cluster, three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, one controller that also runs workloads and two workers, kube-router, OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0 (v0.1.0-rc1) and v54.0 (`main`). Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container; it validates only API server behavior (CRD schema, CEL rules, admission policies) and is not a Baryon host |
 | k3s | Not supported for v0.1 until tested on more than one node. An earlier release ran on a single Baryon-enabled Hadron node (VM with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, k3s v1.36.4+k3s1, flannel (vxlan backend, `cni0` bridge), local-path, systemd cgroup driver, Cloud Hypervisor v53.0. That is historical evidence. `hack/build-hadron-image.sh` builds a k3s image only when `KUBERNETES_DISTRO=k3s` is set; the default is k0s |
 | kubeadm (provider-kubernetes) | Not tested |
 | kind | Not a Baryon environment. A development cluster in which a kind node container acted as the host was used for the runtime experiments and early E2E runs; it is no longer used |
@@ -126,7 +127,7 @@ kernel 7.2.6-hadron; "kind host" evidence on a host kernel 6.8.
 | x86_64. aarch64 is Planned. | Binaries and firmware built for x86_64 only. | ADR 0002 | Verified (kind host, Hadron node) |
 | `/dev/kvm` usable, KVM API 12 | VMs need KVM. | ADR 0002 | Verified (kind host and Hadron node, both nested). On the Hadron node, `/dev/kvm` appeared shortly after baryon-virtd started, when udev loaded `kvm_intel`; discovery runs on each node agent request, so this had no effect. |
 | Linux 6.5 or later | `SO_PEERPIDFD` for race-free peer identification. | ADR 0005 | Verified on 6.8 (kind host) and 7.2.6-hadron (Hadron node) |
-| Landlock ABI 3 (Linux 6.2 or later) | Cloud Hypervisor `--landlock`, plus `--landlock-rules` granting read-write access to the VM's own `vmm` runtime directory, which a guest reset needs to re-create the serial socket. | ADR 0005 | Verified on 6.8 and 7.2.6-hadron, including a guest reset under Landlock on both |
+| Landlock ABI 3 (Linux 6.2 or later) | Cloud Hypervisor `--landlock`, plus `--landlock-rules` granting read-write access to the VM's own `vmm` runtime directory, which Cloud Hypervisor v53.0 needed to re-create the serial socket on a guest reset (with v54.0, see [VMM confinement](security.md#vmm-confinement)). | ADR 0005 | Verified on 6.8 and 7.2.6-hadron, including a guest reset under Landlock on both |
 | cgroup v2, unified hierarchy | Pod cgroup derivation, container placement. | ADR 0005 | Verified (kind host, Hadron node) |
 | kubelet systemd cgroup driver; cgroupfs is Not supported | Only stopping the Anchor container's systemd scope stops the host-spawned VMM before volume teardown while baryon-virtd is down. Under cgroupfs, runc kills leftover cgroup processes only for containers without a private PID namespace, and kubelet kills leftover pod processes only after volume teardown (inferred from upstream code, not observed). baryon-virtd refuses a VM whose Anchor container cgroup is not a systemd scope inside a systemd pod slice (`CgroupDriverUnsupported`). | ADR 0005 | Verified with the systemd driver on the kind host, on k3s (Hadron node), and on k0s (k0s cluster). k0s v1.36.4 does not use it by default; see [k0s node configuration](#k0s-node-configuration). Before the fix, baryon-virtd refused every VM on those nodes with `CgroupDriverUnsupported` |
 | Kernel modules: kvm, tun, sch_ingress, cls_u32, act_mirred, act_gact | TAP and tc passthrough. | ADR 0007 | Verified (kind host, Hadron node); the image lists them in `/usr/lib/modules-load.d/baryon.conf` except the KVM vendor module, which udev loads |
@@ -243,6 +244,7 @@ backend is Open. Other CNIs are not tested.
 | UEFI-bootable raw disk image | Firmware boot with CLOUDHV.fd. | Verified (Debian 13 genericcloud) |
 | DHCP client on the first NIC, or cloud-init (NoCloud via SMBIOS serial enables its fallback DHCP) | Guest addressing. | Verified (Debian 13 genericcloud) |
 | Serial console on ttyS0 (optional) | Console login prompt as boot evidence and console log. | Verified (Debian 13 genericcloud) |
+| The guest does not run a hypervisor of its own | Guests start with nested virtualization off (`--cpus ...,nested=off`), the Cloud Hypervisor v54.0 default, written explicitly; v53.0, which v0.1.0-rc1 ships, defaulted to on. | Verified: no `vmx` or `svm` flag in a guest's `/proc/cpuinfo` on the k0s cluster (manual check, [testing.md](testing.md#cloud-hypervisor-v540)) |
 
 ## Version skew
 

@@ -821,7 +821,7 @@ is Tested by `tests/e2e/node-agent-outage.sh` on the k0s cluster.
 ```
 $ kubectl get virtualizationnodes
 NAME    READY   REASON         VMS   RUNTIME     HYPERVISOR   HEARTBEAT   AGE
-node1   True    RuntimeReady   1     0.1.0-rc1   v53.0        12s         12m
+node1   True    RuntimeReady   1     0.1.0-rc1   v54.0        12s         12m
 ```
 
 ### Host inventory

@@ -490,6 +490,9 @@ node2   True    RuntimeReady   0     0.1.0-rc1   v53.0        9s          12m
 node3   True    RuntimeReady   0     0.1.0-rc1   v53.0        21s         12m
 ```
 
+The v0.1.0-rc1 host image ships Cloud Hypervisor v53.0. A host image built
+from `main` reports v54.0.
+
 Each Baryon node advertises VM and import slots:
 
 ```bash

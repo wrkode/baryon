@@ -2,13 +2,15 @@
 //! identity: Cloud Hypervisor and the DHCP responder.
 //!
 //! Cloud Hypervisor installs its own per-thread seccomp filters, which allow
-//! what any of its features needs, and none on its main thread. Its
-//! configuration offers no way to narrow them. Seccomp filters stack and the
-//! strictest result wins, so baryon-virtd installs this filter before exec:
-//! it is the floor for every thread of both processes, and the only filter
-//! on Cloud Hypervisor's main thread and in the DHCP responder. It denies
-//! only what Baryon's supported feature set never needs (checked against
-//! Cloud Hypervisor v53.0; see docs/security.md, "Baryon seccomp layer"):
+//! what any of its features needs; since v54 its main thread also gets one
+//! once it has started the other threads. Its configuration offers no way to
+//! narrow them. Seccomp filters stack and the strictest result wins, so
+//! baryon-virtd installs this filter before exec: it is the floor for every
+//! thread of both processes, the only filter of Cloud Hypervisor's main
+//! thread until that thread installs its own, and the only filter in the
+//! DHCP responder. It denies only what Baryon's supported feature set never
+//! needs (checked against Cloud Hypervisor v54.0; see docs/security.md,
+//! "Baryon seccomp layer"):
 //!
 //! - `userfaultfd(2)`: used by Cloud Hypervisor only for demand-paged
 //!   snapshot restore and post-copy live migration, neither supported by
@@ -17,7 +19,8 @@
 //! - `ptrace(2)`, `process_vm_readv(2)`, `process_vm_writev(2)`,
 //!   `pidfd_getfd(2)`: no Cloud Hypervisor thread allows them; denied so the
 //!   VMM and the responder of a VM, which share a uid, cannot reach into
-//!   each other through the threads Cloud Hypervisor leaves unfiltered.
+//!   each other through the responder, which has no Cloud Hypervisor
+//!   filter, or through a VMM thread before Cloud Hypervisor filters it.
 //! - `socket(2)` for any family but `AF_UNIX`: Baryon passes TAP devices as
 //!   file descriptors, and Cloud Hypervisor's TAP ioctls on that path use
 //!   `AF_UNIX` sockets; inet sockets serve only TAP creation with an

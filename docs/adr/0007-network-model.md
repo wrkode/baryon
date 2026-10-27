@@ -28,6 +28,19 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   the anchor pidfd, opens `/dev/net/tun`, and creates a non-persistent TAP
   `bvm0` with `IFF_TAP | IFF_NO_PI | IFF_VNET_HDR`. Its fd is the only
   reference; the TAP disappears when Cloud Hypervisor exits.
+- The guest NIC is started with checksum and segmentation offloads on
+  (`offload_csum=on,offload_tso=on,offload_ufo=on`), written explicitly in
+  the `--net` option. They were Cloud Hypervisor's default up to v53.0;
+  v54.0 turns them off by default (cloud-hypervisor#9041). With them off,
+  TCP throughput between pods and a guest on the k0s cluster fell to a
+  fraction of the v53.0 value in both directions, and upstream measurements
+  in the same pull request show the host spending several times more VMM
+  CPU per Gbit/s, also when the host has to segment the frames itself. With
+  them on, v54.0 matched v53.0
+  ([testing.md](../testing.md#cloud-hypervisor-v540)). The guest therefore
+  hands frames of up to 64 KiB with partial checksums to the TAP, as in
+  v0.1.0-rc1, and the host kernel validates their virtio-net headers
+  ([security.md](../security.md#guest-attack-surface)).
 - Each VM has a stable MAC address derived from its VirtualMachine UID
   (`02:` and the last 40 bits of the UID). baryon-virtd sets the pod
   interface to that MAC before the guest starts (veth supports a live address
@@ -216,3 +229,6 @@ CNI ADD. Guest images bind their network configuration to the NIC MAC.
   responder that hung without exiting was not detected and `NetworkReady`
   stayed True. The restart policy and the rest of the decision are
   unchanged.
+- 2026-10-27: Cloud Hypervisor v54.0 turned the virtio-net offloads off by
+  default; the Decision now sets them on explicitly, which keeps the guest
+  NIC of v0.1. The rest of the decision is unchanged.

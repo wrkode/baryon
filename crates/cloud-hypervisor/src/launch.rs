@@ -3,7 +3,11 @@
 //! Baryon starts Cloud Hypervisor with the complete VM configuration on the
 //! command line because only inherited file descriptors can be passed at
 //! creation time: `vm.create` over the API drops file descriptors (Cloud
-//! Hypervisor v53, `vmm/src/api/http/http_endpoint.rs`).
+//! Hypervisor v54, `vmm/src/api/http/http_endpoint.rs`).
+//!
+//! Options whose upstream default has changed between releases are always
+//! written out, so that the guest sees the same device configuration
+//! whatever the default of the pinned release is.
 //!
 //! Values are validated before they are formatted. Cloud Hypervisor option
 //! strings are comma separated `key=value` lists, so paths and identifiers
@@ -137,8 +141,10 @@ pub enum ConsoleMode {
     Off,
     Null,
     File(PathBuf),
-    /// Cloud Hypervisor listens on this Unix socket. Output produced while no
-    /// client is connected is buffered (1 MiB, Cloud Hypervisor v53 and later).
+    /// Cloud Hypervisor listens on this Unix socket and serves one client at
+    /// a time: a new connection replaces the current one. Output produced
+    /// while no client is connected is buffered (1 MiB, Cloud Hypervisor v53
+    /// and later). v54 also creates `<socket>.lock` next to the socket.
     Socket(PathBuf),
 }
 
@@ -180,7 +186,8 @@ pub struct LaunchConfig {
     /// Directories Cloud Hypervisor may create and remove files in once
     /// Landlock is enforced (`--landlock-rules path=<dir>,access=rw`). Its
     /// own rules cover the files named in the configuration, but not
-    /// re-creating the serial socket when the guest reboots. Ignored without
+    /// re-creating the serial socket when the guest reboots (v53) or
+    /// removing the socket's lock file at exit (v54). Ignored without
     /// `landlock`.
     pub landlock_writable_dirs: Vec<PathBuf>,
 }
@@ -216,7 +223,9 @@ impl LaunchConfig {
                 reason: "must be at least 1".into(),
             });
         }
-        push("--cpus", format!("boot={}", self.vcpus));
+        // Nested virtualization is off: Baryon does not support guests that
+        // run their own hypervisor. v54 defaults to off, v53 to on.
+        push("--cpus", format!("boot={},nested=off", self.vcpus));
 
         if self.memory_mib == 0 {
             return Err(LaunchError::Invalid {
@@ -338,8 +347,13 @@ fn net_value(net: &Net) -> Result<String, LaunchError> {
         .collect::<Result<Vec<_>, _>>()?
         .join(",");
     // Cloud Hypervisor requires two virtqueues (rx and tx) per TAP queue.
+    // Checksum and segmentation offloads are on, as they were by default up
+    // to v53. v54 turns them off by default, which cut guest TCP throughput
+    // on the pod network to a fraction; upstream measurements show the host
+    // spending more CPU per byte with them off, not less
+    // (docs/adr/0007-network-model.md).
     Ok(format!(
-        "fd=[{fds}],num_queues={},mac={},id={}",
+        "fd=[{fds}],num_queues={},mac={},offload_csum=on,offload_tso=on,offload_ufo=on,id={}",
         net.tap_fds.len() * 2,
         net.mac,
         ident("net.id", &net.id)?
@@ -503,7 +517,7 @@ mod tests {
             "--log-file",
             "/run/baryon/vms/u/vmm/ch.log",
             "--cpus",
-            "boot=2",
+            "boot=2,nested=off",
             "--memory",
             "size=2048M",
             "--firmware",
@@ -511,7 +525,7 @@ mod tests {
             "--disk",
             "path=/proc/self/fd/4,image_type=raw,readonly=off,direct=off,id=root,serial=baryon-root",
             "--net",
-            "fd=[5],num_queues=2,mac=02:42:0a:f4:01:05,id=net0",
+            "fd=[5],num_queues=2,mac=02:42:0a:f4:01:05,offload_csum=on,offload_tso=on,offload_ufo=on,id=net0",
             "--serial",
             "socket=/run/baryon/vms/u/vmm/serial.sock",
             "--console",
@@ -620,7 +634,7 @@ mod tests {
         let mut cfg = base();
         cfg.nets[0].tap_fds = vec![5, 6];
         let args = joined(&cfg);
-        assert!(args.contains(&"fd=[5,6],num_queues=4,mac=02:42:0a:f4:01:05,id=net0".to_owned()));
+        assert!(args.contains(&"fd=[5,6],num_queues=4,mac=02:42:0a:f4:01:05,offload_csum=on,offload_tso=on,offload_ufo=on,id=net0".to_owned()));
     }
 
     #[test]

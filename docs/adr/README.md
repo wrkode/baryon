@@ -29,6 +29,7 @@ Status values: Proposed, Accepted, Superseded, Rejected.
 | [0011](0011-vm-host-identity.md) | Each VM runs as a distinct unprivileged host identity | Accepted |
 | [0012](0012-protocol-versioning.md) | Runtime protocol versions, features, and negotiation | Accepted |
 | [0013](0013-live-migration.md) | Live migration is not supported | Accepted |
+| [0014](0014-guest-access.md) | Guest user data from a Secret and a serial console through the Anchor Pod | Proposed |
 
 Template:
 

@@ -88,7 +88,8 @@ if [ -n "${NODE_SHELL:-}" ]; then
     host "$1" "for c in /proc/[0-9]*/cmdline; do l=\$(tr '\\0' ' ' < \$c 2>/dev/null); case \"\$l\" in *$3*$2*) p=\${c%/cmdline}; p=\${p#/proc/}; for t in \$p \$(ls /proc/\$p/task | grep -vx \$p); do echo \$t \$(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/\$p/task/\$t/status) \$(sed -n 's/^Seccomp_filters:[[:space:]]*//p' /proc/\$p/task/\$t/status); done; break;; esac; done"
   }
   # Baryon's filter is the floor on every thread; Cloud Hypervisor adds its
-  # own on every thread but the main one; the responder has only Baryon's.
+  # own on every thread, on the main one once it has started the others
+  # (v54); the responder has only Baryon's.
   t="$(thread_filters "$first_node" "$first_pod" "[b]aryon-dhcp")"
   log "responder threads (tid mode filters): $(tr '\n' ';' <<<"$t")"
   if [ -n "$t" ] && awk '$2 != 2 || $3 != 1 { bad = 1 } END { exit bad }' <<<"$t"; then
@@ -98,8 +99,8 @@ if [ -n "${NODE_SHELL:-}" ]; then
   fi
   t="$(thread_filters "$first_node" "$first_pod" "[c]loud-hypervisor")"
   log "VMM threads (tid mode filters): $(tr '\n' ';' <<<"$t")"
-  if [ -n "$t" ] && awk 'NR == 1 && ($2 != 2 || $3 != 1) { bad = 1 } NR > 1 && ($2 != 2 || $3 < 2) { bad = 1 } END { exit bad || NR < 2 }' <<<"$t"; then
-    ok "VMM main thread under Baryon's filter, every other thread under Baryon's and Cloud Hypervisor's"
+  if [ -n "$t" ] && awk '$2 != 2 || $3 < 2 { bad = 1 } END { exit bad || NR < 2 }' <<<"$t"; then
+    ok "every VMM thread, the main one included, under Baryon's and Cloud Hypervisor's filters"
   else
     bad "VMM seccomp state unexpected"
   fi

@@ -176,3 +176,7 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
   filters (see [security.md](../security.md#baryon-seccomp-layer)). It
   denies only what Baryon's supported features never need, and is the only
   filter on Cloud Hypervisor's main thread. The decision is unchanged.
+- 2026-10-27: since Cloud Hypervisor v54.0 the VMM's main thread also
+  installs Cloud Hypervisor's own filter, before the VM is created, so
+  Baryon's filter is the only one on that thread only until then; in the
+  DHCP responder it remains the only filter. The decision is unchanged.

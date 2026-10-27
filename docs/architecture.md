@@ -403,7 +403,7 @@ Hadron image, running as root, not a Kubernetes client (ADR 0005). It:
 
 ### Cloud Hypervisor
 
-Executes the VM. Baryon pins one version per release (v53.0 today) and uses a
+Executes the VM. Baryon pins one version per release (v54.0 today) and uses a
 narrow internal crate, `baryon-cloud-hypervisor`, to build the command line,
 call the REST API on the Unix socket, and read the event monitor. There is no
 VMM abstraction.

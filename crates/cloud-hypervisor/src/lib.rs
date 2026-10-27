@@ -5,8 +5,9 @@
 //! API over its Unix socket, and how to read the event monitor stream. It is
 //! not a VMM abstraction and has no notion of other hypervisors.
 //!
-//! Behavior is pinned to Cloud Hypervisor v53. Upstream facts this crate
-//! relies on are cited in the module documentation.
+//! Behavior is pinned to Cloud Hypervisor v54. Upstream facts this crate
+//! relies on are cited in the module documentation and were checked against
+//! v54.0.
 
 pub mod api;
 pub mod events;

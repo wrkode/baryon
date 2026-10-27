@@ -28,6 +28,9 @@ release workflow, the supply chain, and the node agent's privileges (see
 [Release and supply chain](#release-and-supply-chain)).
 Findings and their resolution are listed in
 [Review findings](#review-findings).
+On 2026-10-27 ADR 0014 (guest user data from a Secret and a serial console
+through the Anchor Pod; Proposed) and the move to Cloud Hypervisor v54.0
+were reviewed ([Review findings](#review-findings)).
 
 ## Trust boundaries
 
@@ -158,9 +161,19 @@ can reach it is limited by the mount (only containers allocated the
 on that resource. A process on the host, outside any pod cgroup, is refused.
 
 The anchor check proves pod membership and the VM's identity, not that the
-caller is the anchor binary. A compromised VMM runs as the same identity in the
-same container cgroup and passes it; it can then only reattach to or stop its
-own VM, because a different spec for the same pod is refused.
+caller is the anchor binary. Every process in the pod cgroup with the VM's
+identity passes it: processes started with `kubectl exec` in the Anchor
+container, and also the VMM and the DHCP responder, which baryon-virtd
+places in that cgroup and which can reach the anchor socket by path. Any of
+them can call `Stop` and can `Attach` with the identical spec, and the
+newest caller becomes the VM's anchor; when that caller exits, baryon-virtd
+cannot restart the DHCP responder until another attach, and it skips the
+network teardown. A different spec for the same pod is refused. Status:
+Implemented; open finding M1 of 2026-10-27 (read from the code, not
+tested). Designed (ADR 0014): AnchorService calls from peers in
+baryon-virtd's own PID namespace (the VMM and the responder) are refused,
+`Attach` and `Stop` are accepted only from the Anchor container's init
+process, and a live anchor is never replaced.
 
 ## Kubernetes authorization
 
@@ -278,6 +291,20 @@ therefore node-root-equivalent: a pod there can mount any host path, and
 the node agent is part of each node's trusted computing base. Grant these
 rights only to cluster administrators. Status: Documented.
 
+### Guest user data and console access (ADR 0014, Designed)
+
+| Right | What it gives | Status |
+|---|---|---|
+| `create` or `update` on VirtualMachines with `spec.userData.secretRef` | The guest receives the named Secret's `userdata` key, and anyone who can log in to the guest can read it. Without an admission check this would be read access to every Secret of the namespace for any subject bound to `baryon-vm-edit`, which has no rights on Secrets; the admission policy `baryon-vm-user-data` (Designed) requires that the requester may `get` the referenced Secret | Designed |
+| `create` on `pods/exec` for an Anchor Pod | The VM's console (ADR 0014, Designed), including taking over another session and the last 16 KiB of output. Already in v0.1: stopping the VM, attaching as its anchor (finding M1), opening `/dev/kvm` within the pod's limits, and in block mode overwriting the running VM's root disk with `baryon-anchor import` (finding M2). Grant it as the right to operate the VM, not to view it | Implemented (exec path); console Designed |
+| `pods/ephemeralcontainers` on an Anchor Pod | Everything above, from an image of the requester's choice | Implemented (Kubernetes) |
+
+RBAC can narrow these rights to named pods (`resourceNames`), not by
+label. baryon-controller does not read Secrets; kubelet mounts the Secret
+into the Anchor Pod, mode 0440, group the VM's gid. A compromised
+baryon-controller can already mount any Secret of any namespace into a pod
+it creates (cluster-wide pod `create`).
+
 ## VMM confinement
 
 baryon-virtd starts Cloud Hypervisor with the following, in this order,
@@ -305,9 +332,18 @@ which stack on top of Baryon's, and Landlock rules (`--landlock`).
 baryon-virtd adds one Landlock rule: read and write access, including
 creating and removing files, beneath the VM's own
 runtime directory `/run/baryon/vms/<pod-uid>/vmm` (owned by the VM's identity,
-holding only the VMM's log, event file, and serial socket). Without it, a
-guest reboot failed: Cloud Hypervisor could not remove and re-create its
-serial socket. With it, the guest reset in the lifecycle E2E passes (Tested).
+holding the VMM's log, event file, serial socket, and, since Cloud
+Hypervisor v54.0, the socket's lock file `serial.sock.lock`). With v53.0,
+a guest reboot failed without it: Cloud Hypervisor could not remove and
+re-create its serial socket; with it, the guest reset in the lifecycle E2E
+passed (Tested). With v54.0 the socket and its lock file are created before
+Cloud Hypervisor applies Landlock, and the socket is reused across a guest
+reboot (`vmm/src/lib.rs`, `vm_create`; `vmm/src/console_devices.rs`), so
+the rule is needed at most to remove both files when the VMM exits; the
+tmpfs is unmounted at cleanup in any case. Whether the rule can be removed
+with v54.0 is Open; the lifecycle E2E with its guest reset passes with it.
+The lock file gets Cloud Hypervisor's default mode (0666 minus the umask);
+only the VM's identity and root reach it, through the 0700 directory.
 
 That directory is a private tmpfs per VM (32 MiB, 256 inodes, mode 0700,
 owned by the VM's identity, `nosuid,nodev,noexec`), mounted before the VMM starts
@@ -346,6 +382,15 @@ every other VMM thread:  Seccomp 2, Seccomp_filters 2 or 3
 every responder thread:  Seccomp 2, Seccomp_filters 1   (Baryon's filter only)
 ```
 
+With Cloud Hypervisor v54.0, measured on a node of the k0s cluster on
+2026-10-27 for a running VM, the main thread also carries Cloud
+Hypervisor's main-thread filter:
+
+```
+VMM main thread:         Seccomp 2, Seccomp_filters 2   (Baryon's and Cloud Hypervisor's)
+every other VMM thread:  Seccomp 2, Seccomp_filters 2 or 3
+```
+
 What this gives:
 
 - A distinct host identity per VM: one VMM cannot signal, trace, or read
@@ -356,8 +401,10 @@ What this gives:
   cannot raise privileges.
 - Empty network namespace: a compromised VMM cannot open connections to host,
   node-local, or cluster addresses. Cloud Hypervisor's seccomp profile
-  allows `socket` for AF_UNIX, AF_INET, and AF_INET6 and `connect` without
-  conditions (v53.0 `vmm/src/seccomp_filters.rs`, read on 2026-10-03).
+  allows `socket` for AF_UNIX, AF_INET, AF_INET6, and (since v54, for
+  musl's `getaddrinfo` in TCP migration, upstream commit 98b1d50a0b)
+  AF_NETLINK, and `connect` without
+  conditions (v54.0 `vmm/src/seccomp_filters.rs`, read on 2026-10-27).
   Baryon's filter denies `socket` for every family other than AF_UNIX on
   every thread; `connect` stays unconditioned, and the empty namespace
   leaves no inet peer to reach. Its only network path is the TAP fd, which
@@ -366,8 +413,9 @@ What this gives:
 - Baryon's seccomp filter on every thread of the VMM and the responder:
   `userfaultfd`, `ptrace`, `process_vm_readv`, `process_vm_writev`,
   `pidfd_getfd`, x32 calls, and non-AF_UNIX sockets fail with `EPERM`, and a
-  system call of another architecture kills the process. On the VMM's main
-  thread and in the responder it is the only filter.
+  system call of another architecture kills the process. In the responder
+  it is the only filter; on the VMM's main thread it is the only filter
+  until Cloud Hypervisor installs its main-thread filter (v54).
 - Container cgroup: the pod's memory and CPU limits and any per-container
   cpuset apply to the VMM.
 
@@ -378,8 +426,9 @@ What it does not give:
   filesystem rules only. Baryon adds no Landlock policy of its own beyond
   the one writable-directory rule above.
 - Baryon's seccomp filter is a short denylist, not an allowlist. Every
-  other system call is left to Cloud Hypervisor's filters; on the VMM's
-  main thread and in the DHCP responder nothing else restricts it.
+  other system call is left to Cloud Hypervisor's filters; in the DHCP
+  responder, and on the VMM's main thread while it starts the other
+  threads and before the VM is created, nothing else restricts it.
 - The DHCP responder has no allowlist filter and no Landlock rules; both
   are Designed (see [Baryon seccomp layer](#baryon-seccomp-layer)).
 - Path-based Unix sockets are reachable by path from any network namespace.
@@ -387,8 +436,9 @@ What it does not give:
   whose peer check applies.
 - Cloud Hypervisor's seccomp and Landlock profiles are fixed by the pinned
   Cloud Hypervisor version, not reviewed by Baryon line by line. Only the
-  calls in the deviation table below were checked against v53.0, and they
-  must be checked again on every Cloud Hypervisor upgrade.
+  calls in the deviation table below were checked, against v53.0 and
+  again against v54.0, and they must be checked again on every Cloud
+  Hypervisor upgrade.
 
 ### Baryon seccomp layer
 
@@ -399,11 +449,18 @@ with unit tests that run in CI (below). E2E: `tests/e2e/lifecycle.sh`
 checks the per-thread seccomp state of the VMM and the responder; Tested
 on the k0s cluster (results below).
 
-Cloud Hypervisor installs its own seccomp filter per thread and none on its
-main thread, and its configuration offers no way to narrow the filters.
-Seccomp filters stack and the strictest result wins, so a filter installed
-before `execve` is the floor of every thread of both processes. On the
-VMM's main thread and in the responder it is the only filter. The filter:
+Cloud Hypervisor installs its own seccomp filter per thread. Up to v53 its
+main thread had none; since v54 the main thread installs an allowlist of
+its own (`main_thread_rules` in `vmm/src/seccomp_filters.rs`) after it has
+started the worker threads and before it asks the VMM thread to create and
+boot the VM (`cloud-hypervisor/src/main.rs`), so no guest code runs while
+the main thread lacks it. Its configuration offers no way to narrow the
+filters. Seccomp filters stack and the strictest result wins, so a filter
+installed before `execve` is the floor of every thread of both processes.
+In the responder it is the only filter. On threads with Cloud Hypervisor's
+filter (action `Trap`), a call that both filters reject ends in `SIGSYS`,
+because a trap takes precedence over an error return; the "Baryon filter"
+column below gives the result of Baryon's filter alone. The filter:
 
 - kills the process on a system call of another architecture (for example
   an i386 call through `int 0x80` in an x86_64 process);
@@ -415,14 +472,14 @@ VMM's main thread and in the responder it is the only filter. The filter:
 - allows everything else, which Cloud Hypervisor's filters then decide.
 
 Each denied call, why Cloud Hypervisor allows it, and why Baryon does not
-need it (checked against Cloud Hypervisor v53.0):
+need it (checked against Cloud Hypervisor v53.0 and v54.0):
 
 | System call | Why Cloud Hypervisor allows it | Feature that needs it | Baryon support status | Baryon filter |
 |---|---|---|---|---|
 | `userfaultfd` | the VMM thread filter allows it, with the `UFFDIO` ioctls (`vmm/src/uffd.rs`) | `vm.restore` with `memory_restore_mode=ondemand` (`memory_manager.rs`, `restore_by_uffd`) and the receive side of post-copy migration (`start_postcopy_serving`) | snapshots and live migration: Not supported; Baryon's Cloud Hypervisor client cannot call those endpoints | `EPERM` |
-| `socket` for families other than `AF_UNIX` | the VMM thread filter allows `AF_INET` and `AF_INET6`; the migration thread filter allows any family | TAP creation with an address (`ip=`, `Tap::set_ip_addr`); the TCP and TLS migration transports | not used: baryon-virtd passes TAP fds without `ip=`, and the TAP ioctls on that path use `AF_UNIX` sockets; live migration: Not supported. The responder creates no sockets; its packet socket is inherited | `EPERM` unless the family is `AF_UNIX` |
-| `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd` | no Cloud Hypervisor thread filter allows them; the main thread has no Cloud Hypervisor filter | none | not needed | `EPERM` |
-| System calls of another ABI | the main thread has no Cloud Hypervisor filter | none | not needed | another architecture (i386): the process is killed (`SIGSYS`); x32: `EPERM` |
+| `socket` for families other than `AF_UNIX` | the VMM thread filter allows `AF_INET`, `AF_INET6`, and since v54 `AF_NETLINK` (upstream commit 98b1d50a0b: musl's `getaddrinfo`, called by `TcpStream::connect` in TCP migration); the migration thread filter allows any family | TAP creation with an address (`ip=`, `Tap::set_ip_addr`); the TCP and TLS migration transports | not used: baryon-virtd passes TAP fds without `ip=`, and the TAP ioctls on that path use `AF_UNIX` sockets; live migration: Not supported. The responder creates no sockets; its packet socket is inherited | `EPERM` unless the family is `AF_UNIX` |
+| `ptrace`, `process_vm_readv`, `process_vm_writev`, `pidfd_getfd` | no Cloud Hypervisor thread filter allows them, the v54 main-thread filter included; the main thread runs without a Cloud Hypervisor filter until it installs its own | none | not needed | `EPERM` |
+| System calls of another ABI | the main thread runs without a Cloud Hypervisor filter until it installs its own (none at all before v54) | none | not needed | another architecture (i386): the process is killed (`SIGSYS`); x32: `EPERM` |
 
 Why each denial matters:
 
@@ -476,11 +533,14 @@ Unit tests (`crates/virtd/src/seccomp.rs`; each runs in a forked child with
   return.
 
 E2E checks (`tests/e2e/lifecycle.sh`, with `NODE_SHELL` set): every
-responder thread has seccomp mode 2 with exactly one filter; the VMM's main
-thread has mode 2 with exactly one filter, and every other VMM thread mode
-2 with at least two. Tested on the k0s cluster: every responder thread had
-mode 2 with one filter; the VMM's main thread had one filter and every
-other VMM thread two or three ([testing.md](testing.md#k0s-cluster)).
+responder thread has seccomp mode 2 with exactly one filter, and every VMM
+thread, the main one included, mode 2 with at least two (Cloud Hypervisor
+v54.0; with v53.0 the check required exactly one filter on the main
+thread). Tested on the k0s cluster: every responder thread had mode 2 with
+one filter; with v53.0 the VMM's main thread had one filter and every other
+VMM thread two or three ([testing.md](testing.md#k0s-cluster)); with
+v54.0 the main thread had two and every other VMM thread two or three
+([testing.md](testing.md#cloud-hypervisor-v540)).
 
 Remaining hardening:
 
@@ -494,6 +554,36 @@ Remaining hardening:
 
 - Device emulation: virtio-blk, virtio-net, virtio-rng, serial, ACPI. A guest
   that exploits Cloud Hypervisor gains the VMM's confined identity above.
+- Host kernel network path: the guest NIC runs with checksum and
+  segmentation offloads on (ADR 0007). With checksum offload off, Cloud
+  Hypervisor v54.0 drops guest frames that ask for a partial checksum or
+  segmentation; with it on, it passes every guest-chosen virtio-net header
+  value (GSO type and size, header length, checksum start and offset) to
+  the TAP and checks only the header length (`net_util/src/queue_pair.rs`,
+  `tx_is_header_valid`); v53.0 had no such check. With the offloads on,
+  the host kernel's validation of the header in the TAP write path is the
+  control. This is the exposure of every release so far: Cloud Hypervisor
+  had the offloads on by default up to v53.0, and Baryon sets them on
+  explicitly with v54.0, which defaults to off. Accepted, because with them
+  off guest TCP throughput on the k0s cluster fell to a fraction
+  ([testing.md](testing.md#cloud-hypervisor-v540)), and upstream
+  measurements in cloud-hypervisor#9041 show more VMM CPU per byte (ADR
+  0007); where the kernel's segmentation work is accounted (pod cgroup or
+  softirq) was not measured. UDP fragmentation offload (`offload_ufo`)
+  is a legacy path that current Linux guests do not use; whether to keep
+  it is Open. Re-evaluate on advisories in the TAP or virtio-net header
+  code.
+- Nested virtualization: Baryon starts guests with `nested=off`, so a guest
+  cannot use the CPU's virtualization extensions and cannot reach the
+  host's nested KVM code. v0.1.0-rc1 passed no `nested` option and Cloud
+  Hypervisor v53.0 defaults it to on; on hosts whose KVM module allows
+  nesting (`nested=Y` on the k0s cluster nodes), its guests could use the
+  extensions (inferred from the default and the host parameter; not
+  checked from inside a v0.1.0-rc1 guest). Fixed on `main`: a guest on the
+  k0s cluster with Cloud Hypervisor v54.0 had no `vmx` or `svm` flag in
+  `/proc/cpuinfo` (Tested by a manual check on 2026-10-27,
+  [testing.md](testing.md#cloud-hypervisor-v540)). Whether v0.1.0 carries
+  the fix is an owner decision (Planned, [roadmap.md](roadmap.md#v010)).
 - DHCP: guest-sent DHCP frames are parsed by the DHCP responder process,
   not by baryon-virtd. The responder runs with the VMM's confinement (the
   VM's identity, no capabilities, `no_new_privs`, empty network namespace, Anchor
@@ -656,7 +746,22 @@ Remaining hardening:
   than 14 days, except under the directories of running VMs, which
   baryon-virtd keeps under a shared BSD lock that systemd-tmpfiles honors
   (Tested on the Hadron node with a short override age). Deleting a
-  VirtualMachine does not remove its logs sooner.
+  VirtualMachine does not remove its logs sooner. With interactive console
+  sessions (ADR 0014, Designed), the console log also holds what the guest
+  echoes and prints during a session (commands typed at a shell and their
+  output, and anything cloud-init prints from user data), for the same 14
+  days. A new console session first receives the last 16 KiB of console
+  output, so it can see what an earlier session displayed: read-only
+  sessions are not a confidentiality boundary.
+- Guest user data (ADR 0014, Designed): kubelet mounts the referenced
+  Secret into the Anchor Pod (a tmpfs volume, mode 0440, group the VM's
+  gid), and baryon-anchor writes the seed image to the pod's `/dev/shm`;
+  both are removed with the pod. baryon-controller and baryon-virtd never
+  read or store the content. Termination messages and VM status carry the
+  reason and the size only, because Pod status is readable without rights
+  on Secrets. The seed disk stays attached while the VM runs, so any guest
+  process that can read it can read the user data; user data is never
+  protected from the host.
 
 ## Cleanup and stale state
 
@@ -934,10 +1039,37 @@ Findings of the 2026-10-05 v0.1.0-rc1 release gate review:
 | Final gate: the release job holds unused write permissions (dry run, private repository), and the SBOM action receives the job token by default | Low | Accepted for v0.1.0-rc1; covered by the split-jobs item (Planned) |
 | Final gate: the k0s binary's integrity rests on kairos-init | Note | Documented ([Release and supply chain](#release-and-supply-chain)); upstream dependency |
 
+Findings of the 2026-10-27 review of ADR 0014 (Proposed) and the move to
+Cloud Hypervisor v54.0:
+
+| Finding | Severity | Status |
+|---|---|---|
+| H1: a Secret reference in a VirtualMachine would give subjects bound to `baryon-vm-edit`, which has no rights on Secrets, read access to any Secret of the namespace | High | Resolved in the ADR: admission policy `baryon-vm-user-data` (Designed) |
+| H2: user data in `VmSpec` would be stored in the runtime record or break the identical-spec reattach after a baryon-virtd restart or a Secret edit | High | Resolved in the ADR: baryon-anchor builds the seed and passes it as a disk; baryon-virtd never handles user data |
+| M1: any process in the pod cgroup with the VM's identity, including exec'd processes, the VMM, and the DHCP responder, can call `Stop` and `Attach`, and the newest attach becomes the VM's anchor | Medium | Open (exists in v0.1); peer checks Designed in ADR 0014 |
+| M2: `pods/exec` on a block-mode Anchor Pod allows overwriting the running VM's root disk with `baryon-anchor import`, whose approval is optional on its command line | Medium | Open (exists in v0.1); documented as an operate right; required approval Planned |
+| M3: guest terminal output would reach the operator's terminal unfiltered | Medium | Resolved in the ADR: output filtering in `baryon-anchor console` (Designed) |
+| M4: console and user data bounds were anchor-side only; no explicit gRPC message limits; Cloud Hypervisor's serial input queue is unbounded | Medium | Resolved in the ADR: bounds enforced by baryon-virtd (Designed) |
+| L1: the Landlock writable-directory rationale and the VMM directory contents were stale for v54.0 (`serial.sock.lock`) | Low | Documented; removal of the rule with v54.0 Open |
+| L2: the reason for `AF_NETLINK` in Cloud Hypervisor's VMM thread filter was not cited | Low | Documented (upstream commit 98b1d50a0b); Baryon keeps it denied |
+| L3: virtio-net offloads on re-expose the kernel's header validation to guest-chosen values; UFO likely unneeded | Low | Accepted (checksum, TSO); UFO Open; re-evaluate on TAP or virtio-net header advisories |
+| L4: v0.1.0-rc1 (Cloud Hypervisor v53.0 default) exposed nested virtualization to guests on hosts whose KVM module allows it | Low | Fixed on `main` (`nested=off`): no `vmx` or `svm` flag inside a guest on the k0s cluster; v0.1.0 open ([roadmap.md](roadmap.md)) |
+| L5: console log content during sessions, the replay, termination messages, and the guest-side lifetime of user data were not recorded | Low | Documented (ADR 0014 Consequences, Data handling) |
+| L6: console sessions cannot be attributed to a Kubernetes user by baryon-virtd | Low | Designed: session IDs and an audit rule example |
+| L7: plain `kubectl exec` by pod name can reach a pod another user created under that name while the VM is stopped | Low | Designed: baryonctl checks that the pod's controller owner reference is the VirtualMachine's UID |
+
 Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
 report no vulnerabilities in the Rust dependencies. Cloud Hypervisor
 v53.0 is not affected by its published security advisories. k0s
 v1.36.4+k0s.1 includes the fix for GHSA-qjgc-wmg7-3jc3.
+
+Check of 2026-10-27 for the move to Cloud Hypervisor v54.0: it is not
+affected by its published security advisories (the most recent,
+GHSA-f47p-p25q-83rh, is fixed in v52.0 and v51.2). Its release adds a
+main-thread seccomp filter, hardens disk image parsing, and fixes
+guest-triggerable VMM panics; it also adds `AF_NETLINK` to the VMM thread's
+`socket` rule, which Baryon's filter keeps denied
+([Baryon seccomp layer](#baryon-seccomp-layer)).
 
 ## Future hardening
 
@@ -962,6 +1094,9 @@ v1.36.4+k0s.1 includes the fix for GHSA-qjgc-wmg7-3jc3.
 | The device plugin in a separate minimal process, apart from the node agent's API client | Planned |
 | Remove virtiofsd from the host image until Baryon uses it | Planned |
 | AppArmor or SELinux profiles for baryon-virtd and the VMM | Planned |
+| AnchorService peer checks: refuse peers in baryon-virtd's PID namespace; `Attach` and `Stop` only from the Anchor container's init process; a live anchor is never replaced (finding M1 of 2026-10-27) | Designed (ADR 0014) |
+| `baryon-anchor import` runs only with the controller's approval at its fixed path and the claim UID; the importer separated from the Anchor binary (finding M2 of 2026-10-27) | Planned |
+| `kvm_intel.nested=0` and `kvm_amd.nested=0` in the Baryon-enabled image | Planned |
 
 ## Not supported
 

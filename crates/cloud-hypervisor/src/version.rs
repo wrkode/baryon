@@ -19,7 +19,7 @@ impl Version {
     /// only: a different version is never refused, so the pinned version
     /// can be changed without a code change.
     pub const TESTED: Version = Version {
-        major: 53,
+        major: 54,
         point: 0,
     };
 
@@ -90,6 +90,6 @@ mod tests {
     #[test]
     fn orders_and_displays() {
         assert!(Version::parse("52.0").unwrap() < Version::TESTED);
-        assert_eq!(Version::TESTED.to_string(), "v53.0");
+        assert_eq!(Version::TESTED.to_string(), "v54.0");
     }
 }

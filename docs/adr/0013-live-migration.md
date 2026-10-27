@@ -368,3 +368,13 @@ record stays out of the repository; no timings are published.
   sockets. The decision is unchanged.
 - 2026-10-05: the Decision now carries the exact sentence that the
   documentation and release notes repeat. The decision is unchanged.
+- 2026-10-27: re-checked against Cloud Hypervisor v54.0, the version Baryon
+  moves to. The decision and its exact sentence are unchanged. v54.0 adds
+  `vm.cancel-migration`, accepts migrations from the two previous releases,
+  and accepts pre-opened VFIO and `iommufd` descriptors on
+  `receive-migration` (`vfio_fds`, `iommufd_fd`), but still no network
+  descriptors: `VmReceiveMigrationData` in `vmm/src/api/mod.rs` has no
+  network field, and `deserialize_netconfig_fds` in `vmm/src/vm_config.rs`
+  still restores them as `-1`.
+  [cloud-hypervisor#7054](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7054)
+  is open. The sections above describe v53 and are kept as written.

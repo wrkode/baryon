@@ -998,8 +998,10 @@ impl Supervisor {
             },
             seccomp: self.cfg.seccomp,
             landlock: self.cfg.landlock,
-            // The VMM's own directory (logs, events, serial socket), so a
-            // guest reboot can re-create the serial socket.
+            // The VMM's own directory (logs, events, serial socket and, since
+            // v54, its `serial.sock.lock`). v53 re-creates the socket on a
+            // guest reboot; v54 creates both before Landlock applies and
+            // needs the rule at most to remove them when it exits.
             landlock_writable_dirs: vec![vmm_dir.clone()],
         };
         let args = launch

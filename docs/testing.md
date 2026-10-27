@@ -149,7 +149,7 @@ each Anchor Pod run on that pod's node.
 
 | Phase | Checks |
 |---|---|
-| create | VM becomes Ready; with `NODE_SHELL`: every DHCP responder thread has seccomp mode 2 with exactly one filter (Baryon's), the VMM's main thread mode 2 with exactly one filter and every other VMM thread mode 2 with at least two (Baryon's and Cloud Hypervisor's), at least two VMM threads; guest reachable over the pod network; guest reachable through a ClusterIP Service by DNS name |
+| create | VM becomes Ready; with `NODE_SHELL`: every DHCP responder thread has seccomp mode 2 with exactly one filter (Baryon's), every VMM thread, the main one included, mode 2 with at least two filters (Baryon's and Cloud Hypervisor's; Cloud Hypervisor v54.0 filters the main thread too), at least two VMM threads; guest reachable over the pod network; guest reachable through a ClusterIP Service by DNS name |
 | stop | Anchor Pod removed; Ready reason is `Stopped`; host runtime state removed; root disk claim kept |
 | start | VM Ready again; start created a new Anchor Pod |
 | restart | restart replaced the Anchor Pod; VM Ready; old VMM state removed; guest reachable with the new pod IP; Service follows the VM to its new Anchor Pod |
@@ -525,7 +525,8 @@ Results come from three environments:
   (systemd cgroups, device ownership; [compatibility.md](compatibility.md#k0s-node-configuration)),
   graceful node shutdown 150 s and 30 s through a k0s worker profile, the
   k0s default CNI (kube-router; no network provider set in the k0s
-  configuration), Cloud Hypervisor v53.0. Storage: OpenEBS LVM LocalPV
+  configuration), Cloud Hypervisor v53.0 (v54.0 for the run in
+  [Cloud Hypervisor v54.0](#cloud-hypervisor-v540)). Storage: OpenEBS LVM LocalPV
   (`openebs/lvm-driver:1.10.1`, `WaitForFirstConsumer`, "lvm-local") and
   Rook v1.20.8 (`rook/ceph:v1.20.8`) with Ceph 19.2.3
   (`quay.io/ceph/ceph:v19.2.3`) RBD ("ceph-rbd") through the
@@ -547,7 +548,8 @@ Results come from three environments:
 
 Results from the kind host are not results for a Baryon host; they are
 listed because some behavior was observed only there. The runs recorded
-here were made from 2026-10-03 to 2026-10-05.
+here were made from 2026-10-03 to 2026-10-05, except the Cloud Hypervisor
+v54.0 run of 2026-10-27.
 
 ### k0s cluster
 
@@ -738,6 +740,38 @@ the tag (caff228), on the k0s cluster that ran release B:
 Not covered: SBOMs of the component images list the image only, not the
 Rust crates inside the static binaries; the Rust dependencies are in the
 source tree SBOM.
+
+### Cloud Hypervisor v54.0
+
+Run on 2026-10-27 on the k0s cluster, for the move from Cloud Hypervisor
+v53.0 to v54.0. "Cloud Hypervisor v54.0 change" is the change on top of
+75f8bc2 that pins v54.0 and writes `nested=off` and the virtio-net offloads
+on explicitly. Hosts: a host image built from that change, installed on
+node3 and then on node2 and node1 with Kairos A/B upgrades; the VMs on each
+upgraded node started again. Cluster components: release B of the
+v0.1.0-rc1 validation, whose code the change does not touch. Runtime
+protocol unchanged (1.2). The E2E rows count script checks; the last four
+rows are manual checks on the nodes and in a guest, not E2E assertions.
+
+| Check | Result |
+|---|---|
+| E2E lifecycle (with the new expectation: every VMM thread, the main one included, under at least two seccomp filters) | 35 of 35 |
+| E2E node agent outage | 32 of 32 |
+| E2E storage: ceph-rbd Block; lvm-local Filesystem | 47 of 47; 36 of 36 |
+| E2E import integrity: lvm-local; ceph-rbd | 52 of 52; 52 of 52 |
+| E2E multi-node | 69 of 69 |
+| E2E placement | 65 of 65 |
+| E2E hostile disk | 4 of 4 |
+| E2E deletion | 19 of 19 |
+| E2E network health with node reboot (`REBOOT=1`): ceph-rbd; lvm-local | 46 of 46; 46 of 46 |
+| VMM seccomp state, read on a node for a running VM | main thread mode 2 with 2 filters (Baryon's and Cloud Hypervisor's), every other thread mode 2 with 2 or 3 |
+| VMM directory | `serial.sock` and `serial.sock.lock` present |
+| Guest network throughput: iperf3 between a guest (2 vCPUs, Debian 13 with an SSH key added for the test) and pods on its node and on another node, both directions, three runs each | Cloud Hypervisor v53.0 (offloads on by default) and v54.0 with the offloads written on: equal within run-to-run variation, and the same virtio-net feature bits in the guest. v54.0 with its default (offloads off): a fraction of that in both directions, the guest-to-pod direction lowest |
+| Nested virtualization inside a guest | no `vmx` or `svm` flag in the guest's `/proc/cpuinfo` |
+
+Not run: the version skew suite (the change touches neither the protocol
+nor the cluster components). Not measured: where the host accounts the
+segmentation work (pod cgroup or softirq), and UDP throughput.
 
 ### Hadron single node and kind host
 

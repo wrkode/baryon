@@ -10,7 +10,8 @@ Hypervisor executes the VM. Kairos manages the machine lifecycle around them.
 Status: this tree is version 0.1.0-rc1, the first release candidate
 ([release notes](docs/release-notes/v0.1.0-rc1.md)). The API is `v1alpha1`
 and can change ([api-stability.md](docs/api-stability.md)). Baryon makes no
-claim of production readiness.
+claim of production readiness. Intended work and its status:
+[roadmap.md](docs/roadmap.md).
 
 ## Why Hadron
 
@@ -33,8 +34,9 @@ Cloud Hypervisor version per release and has no other VMM (ADR 0002).
 
 Support claims follow tests on the k0s cluster: three x86_64
 Baryon-enabled Hadron nodes (node1 to node3, VMs with nested KVM) running
-k0s v1.36.4+k0s.1, with Cloud Hypervisor v53.0, kube-router, OpenEBS LVM
-LocalPV, Ceph RBD through Rook, and Debian 13 guests. Exact versions are in
+k0s v1.36.4+k0s.1, with Cloud Hypervisor v54.0 (v53.0 in v0.1.0-rc1),
+kube-router, OpenEBS LVM LocalPV, Ceph RBD through Rook, and Debian 13
+guests. Exact versions are in
 the [v0.1 support matrix](docs/compatibility.md#v01-support-matrix).
 
 | Area | Status |
@@ -67,8 +69,9 @@ labels: [architecture.md](docs/architecture.md).
 - Snapshots and cloning.
 - More than one disk or network per VM.
 - Multi-cluster operation: Baryon manages the VMs of one cluster.
-- Also Not supported in v0.1: confidential computing, hugepage-backed
-  guest memory, NUMA placement, disk image formats other than raw,
+- Also Not supported in v0.1: confidential computing, nested
+  virtualization inside guests, hugepage-backed guest memory, NUMA
+  placement, disk image formats other than raw,
   aarch64, the kubelet cgroupfs driver, and k3s (kubeadm is Not tested).
   The full list:
   [Not supported in v0.1](docs/compatibility.md#not-supported-in-v01).

@@ -550,9 +550,10 @@ Anchor container cgroup.
 
 These values were measured before Baryon's seccomp layer. Since
 2026-10-04 baryon-virtd installs its own seccomp filter on both processes
-before `execve`, so the VMM's main thread and every responder thread run
-under one filter, and every other VMM thread under Baryon's and Cloud
-Hypervisor's (measured on the k0s cluster; see
+before `execve`, so every responder thread runs under one filter (Baryon's)
+and every VMM thread under Baryon's and Cloud Hypervisor's. The exception
+was the VMM's main thread with Cloud Hypervisor v53.0, which had Baryon's
+filter only; since v54.0 it also has Cloud Hypervisor's (measured on the k0s cluster; see
 [security.md](security.md#baryon-seccomp-layer)).
 
 ### Recovery and reboot (Tested, manual procedures)

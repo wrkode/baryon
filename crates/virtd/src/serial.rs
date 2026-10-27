@@ -1,7 +1,8 @@
 //! Serial console capture.
 //!
-//! Cloud Hypervisor serves the guest UART on a Unix socket and buffers up to
-//! 1 MiB of output while no client is connected (v53). baryon-virtd keeps one
+//! Cloud Hypervisor serves the guest UART on a Unix socket, one client at a
+//! time (a new connection replaces the current one), and buffers up to 1 MiB
+//! of output while no client is connected (v53, v54). baryon-virtd keeps one
 //! client connected for the VM's lifetime, appends the output to a log file
 //! with a size cap, and reports a login prompt as boot evidence. When
 //! baryon-virtd restarts it reconnects and receives what was buffered.
