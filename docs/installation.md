@@ -2,9 +2,8 @@
 
 This guide takes a cluster from bare machines to a running VM with the
 release artifacts of Baryon, and covers uninstalling and upgrading. It is
-written for v0.1.0-rc1, the first release that publishes these artifacts.
-The release URLs and image tags below resolve only after the release
-workflow has published v0.1.0-rc1; before that, the
+written for v0.1.0-rc2. The release URLs and image tags below resolve
+only after the release workflow has published v0.1.0-rc2; before that, the
 [from a checkout](#from-a-checkout) path is the only one available.
 
 Status labels follow [architecture.md](architecture.md). "Tested" names the
@@ -40,7 +39,7 @@ Where to find the reasons behind each step:
   a public repository, to verify attestations.
 - Network: nodes pull images from `ghcr.io`, and VM disk imports download
   the image URL from an import Pod over the pod network.
-- Access: v0.1.0-rc1 is published from the repository wrkode/baryon while
+- Access: v0.1.0-rc2 is published from the repository wrkode/baryon while
   it is private. Its release files and ghcr.io images then need a GitHub
   account with access to the repository, on your workstation and for
   every image pull on the nodes
@@ -58,7 +57,7 @@ OCI image ([hadron.md](hadron.md)).
 Option A, the published image (k0s v1.36.4+k0s.1):
 
 ```bash
-docker pull ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s
+docker pull ghcr.io/wrkode/baryon-hadron:v0.1.0-rc2-k0s
 ```
 
 While the repository is private, log in first with a GitHub account that
@@ -70,8 +69,8 @@ Option B, build it from a checkout:
 ```bash
 git clone https://github.com/wrkode/baryon.git
 cd baryon
-git checkout v0.1.0-rc1
-hack/build-hadron-image.sh <registry>/baryon-hadron:v0.1.0-rc1-k0s
+git checkout v0.1.0-rc2
+hack/build-hadron-image.sh <registry>/baryon-hadron:v0.1.0-rc2-k0s
 ```
 
 - The script needs Docker with BuildKit. It installs k0s by default
@@ -88,7 +87,7 @@ If the release was published while the repository was public, verify
 the published image's build provenance (see [Verify the release](#verify-the-release)):
 
 ```bash
-gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s --repo wrkode/baryon
+gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc2-k0s --repo wrkode/baryon
 ```
 
 A release from a private repository has no attestations; compare the
@@ -107,7 +106,7 @@ image in the local Docker daemon, with the cloud-config and the output in
 docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v "<work-dir>:/work" \
   quay.io/kairos/auroraboot:v0.27.1 \
   --set disable_http_server=true --set disable_netboot=true \
-  --set disk.efi=true --set container_image=docker:ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s \
+  --set disk.efi=true --set container_image=docker:ghcr.io/wrkode/baryon-hadron:v0.1.0-rc2-k0s \
   --set state_dir=/work/aurora --cloud-config /work/cloud-config.yaml
 ```
 
@@ -324,8 +323,8 @@ of the supported installation and need Kubernetes 1.32 or later
 ### From the release
 
 ```bash
-kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon.yaml
-kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon-classes.yaml
+kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon.yaml
+kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon-classes.yaml
 ```
 
 These URLs work only while the repository is public; otherwise see
@@ -344,9 +343,9 @@ The GitHub release (a prerelease for `-rc` tags) carries:
 | `baryon.yaml` | everything `deploy/base` installs, component images pinned by digest |
 | `baryon-crds.yaml` | the CRDs alone, for the first step of an upgrade |
 | `baryon-classes.yaml` | the example VirtualMachineClasses |
-| `baryon-virtd-v0.1.0-rc1-x86_64-linux-musl` | the static baryon-virtd binary, copied from the host image |
-| `baryon-v0.1.0-rc1-source.tar.gz` | the source tree of the tag |
-| `images.txt` | the controller, node agent, anchor, and host image references with digests |
+| `baryon-virtd-v0.1.0-rc2-x86_64-linux-musl` | the static baryon-virtd binary, copied from the host image |
+| `baryon-v0.1.0-rc2-source.tar.gz` | the source tree of the tag |
+| `images.txt` | the controller, node agent, anchor, importer, and host image references with digests |
 | `*.spdx.json` | SPDX SBOMs of the source tree and of each image |
 | `SHA256SUMS` | SHA-256 checksums of the files above |
 
@@ -358,7 +357,7 @@ Download the files (`gh release download` works for a public and, with
 access, for a private repository) and check the checksums:
 
 ```bash
-gh release download v0.1.0-rc1 --repo wrkode/baryon \
+gh release download v0.1.0-rc2 --repo wrkode/baryon \
   --pattern baryon.yaml --pattern baryon-crds.yaml --pattern baryon-classes.yaml \
   --pattern images.txt --pattern SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
@@ -370,10 +369,10 @@ verify the attestations of the files and the images:
 ```bash
 gh attestation verify SHA256SUMS --repo wrkode/baryon
 gh attestation verify baryon.yaml --repo wrkode/baryon
-for c in controller node-agent anchor; do
-  gh attestation verify "oci://ghcr.io/wrkode/baryon-$c:v0.1.0-rc1" --repo wrkode/baryon
+for c in controller node-agent anchor importer; do
+  gh attestation verify "oci://ghcr.io/wrkode/baryon-$c:v0.1.0-rc2" --repo wrkode/baryon
 done
-gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc1-k0s --repo wrkode/baryon
+gh attestation verify oci://ghcr.io/wrkode/baryon-hadron:v0.1.0-rc2-k0s --repo wrkode/baryon
 ```
 
 Otherwise there are no attestations: verify `SHA256SUMS` only. The
@@ -420,12 +419,12 @@ node, with the references from `images.txt`:
 
 ```bash
 ref=ghcr.io/wrkode/baryon-controller@sha256:<digest>
-oras copy "$ref" --to-oci-layout controller:v0.1.0-rc1
+oras copy "$ref" --to-oci-layout controller:v0.1.0-rc2
 (cd controller && tar cf ../controller.tar .)
 ssh <user>@<node-address> sudo k0s ctr -n k8s.io images import \
   --base-name ghcr.io/wrkode/baryon-controller - < controller.tar
 ssh <user>@<node-address> sudo k0s ctr -n k8s.io images tag \
-  ghcr.io/wrkode/baryon-controller:v0.1.0-rc1 "$ref"
+  ghcr.io/wrkode/baryon-controller:v0.1.0-rc2 "$ref"
 ```
 
 The host image for a Kairos Operator upgrade can be loaded the same way
@@ -486,13 +485,13 @@ Each Baryon node has a VirtualizationNode that is `Ready` with reason
 ```
 $ kubectl get virtualizationnodes
 NAME    READY   REASON         VMS   RUNTIME     HYPERVISOR   HEARTBEAT   AGE
-node1   True    RuntimeReady   0     0.1.0-rc1   v53.0        12s         12m
-node2   True    RuntimeReady   0     0.1.0-rc1   v53.0        9s          12m
-node3   True    RuntimeReady   0     0.1.0-rc1   v53.0        21s         12m
+node1   True    RuntimeReady   0     0.1.0-rc2   v54.0        12s         12m
+node2   True    RuntimeReady   0     0.1.0-rc2   v54.0        9s          12m
+node3   True    RuntimeReady   0     0.1.0-rc2   v54.0        21s         12m
 ```
 
-The v0.1.0-rc1 host image ships Cloud Hypervisor v53.0. A host image built
-from `main` reports v54.0.
+The v0.1.0-rc2 host image ships Cloud Hypervisor v54.0 (v0.1.0-rc1:
+v53.0).
 
 Each Baryon node advertises VM and import slots:
 
@@ -637,8 +636,10 @@ Baryon has two parts that are upgraded separately
   Cloud Hypervisor; upgraded through Kairos, one node at a time
 
 Read the release notes and the
-[API change log](api-stability.md#change-log-per-release) first. For the
-upgrade from an earlier commit to 0.1.0-rc1, follow
+[API change log](api-stability.md#change-log-per-release) first. The
+upgrade from 0.1.0-rc1 to 0.1.0-rc2 is the procedure below; the CRDs and
+classes do not change. For the upgrade from an earlier commit to
+0.1.0-rc1, follow
 [Upgrade to 0.1.0-rc1](compatibility.md#upgrade-to-010-rc1).
 
 Cluster release, in this order and close together:
@@ -692,6 +693,11 @@ Status:
   Running VMs kept running with the same Anchor Pods. Recovery: apply the
   0.1.0-rc1 `baryon.yaml` again; every node was Ready again, the waiting
   VM started, and the Anchor Pods of running VMs were unchanged.
+- Rolling the cluster release back from 0.1.0-rc2 to 0.1.0-rc1: Not
+  tested. The CRDs and classes are the same; the 0.1.0-rc1 controller runs
+  imports with the anchor image, and the policies of 0.1.0-rc2 that the
+  0.1.0-rc1 `baryon.yaml` does not contain stay installed until they are
+  deleted.
 - Rolling a host image back through Kairos A/B within the same runtime
   protocol major version: any 1.x host image works with any 1.x cluster
   release (ADR 0012); the older image lacks the host-side safety fixes of

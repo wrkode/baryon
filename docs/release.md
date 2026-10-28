@@ -8,7 +8,7 @@ how a release is made.
 Baryon follows [Semantic Versioning](https://semver.org/). Every crate of
 the workspace has the version in the workspace `Cargo.toml`; there is no
 independent crate versioning. Tags are `v<version>`, for example
-`v0.1.0-rc1`.
+`v0.1.0-rc2`.
 
 While the major version is 0:
 
@@ -85,7 +85,7 @@ for every release file and image. Verify them with the GitHub CLI:
 
 ```bash
 gh attestation verify baryon.yaml --repo wrkode/baryon
-gh attestation verify oci://ghcr.io/wrkode/baryon-controller:v0.1.0-rc1 --repo wrkode/baryon
+gh attestation verify oci://ghcr.io/wrkode/baryon-controller:v0.1.0-rc2 --repo wrkode/baryon
 ```
 
 A release from a private repository has no attestations; verify

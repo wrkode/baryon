@@ -7,8 +7,8 @@ integration with a Kairos-managed immutable virtualization host.
 Kubernetes manages the VM. Hadron provides the virtualization host. Cloud
 Hypervisor executes the VM. Kairos manages the machine lifecycle around them.
 
-Status: this tree is version 0.1.0-rc1, the first release candidate
-([release notes](docs/release-notes/v0.1.0-rc1.md)). The API is `v1alpha1`
+Status: this tree is version 0.1.0-rc2, the second release candidate
+([release notes](docs/release-notes/v0.1.0-rc2.md)). The API is `v1alpha1`
 and can change ([api-stability.md](docs/api-stability.md)). Baryon makes no
 claim of production readiness. Intended work and its status:
 [roadmap.md](docs/roadmap.md).
@@ -50,7 +50,7 @@ the [v0.1 support matrix](docs/compatibility.md#v01-support-matrix).
 | Host upgrades through Kairos A/B and Kairos Operator `NodeOpUpgrade`, one node at a time; VMs stop and start again | Tested: manual procedures |
 | Mixed host and cluster versions within a runtime protocol major version | Tested for the pairs in [version skew](docs/compatibility.md#version-skew) |
 | VMM confinement: a distinct unprivileged host identity per VM, no capabilities, empty network namespace, seccomp, Landlock ([security.md](docs/security.md)) | Tested: the lifecycle E2E on the k0s cluster runs the confined VMM and checks the seccomp state of every VMM thread; process values measured on a single Hadron node |
-| Admission policies and namespace user roles | Tested: CI API server checks and import integrity E2E. The ADR 0015 admission rules: their API server checks pass on a local k0s API server and have not yet run in CI; the image change and ephemeral container refusals are Tested by the anchor authority E2E on the k0s cluster |
+| Admission policies and namespace user roles | Tested: CI API server checks and import integrity E2E. The ADR 0015 admission rules: their API server checks pass in CI; the image change and ephemeral container refusals are Tested by the anchor authority E2E on the k0s cluster |
 
 Evidence for each row: [testing.md](docs/testing.md#results). Status
 labels: [architecture.md](docs/architecture.md).
@@ -117,11 +117,11 @@ cluster of Baryon-enabled Hadron nodes and a CSI driver in place, the
 release install is:
 
 ```bash
-kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon.yaml
-kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc1/baryon-classes.yaml
+kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon.yaml
+kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon-classes.yaml
 ```
 
-These URLs resolve once the release workflow has published v0.1.0-rc1,
+These URLs resolve once the release workflow has published v0.1.0-rc2,
 and only while the repository is public. A release from the private
 repository needs GitHub access for its files and images
 ([installation.md, Private repository](docs/installation.md#private-repository)).

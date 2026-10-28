@@ -3,7 +3,8 @@
 This page lists what Baryon intends to work on, in the order it is
 expected to happen. It records intent, not commitments: an item can move,
 change, or be dropped when its design or upstream facts say so. Each item
-carries a status label from [architecture.md](architecture.md); an item is
+carries a status label from [architecture.md](architecture.md), or Blocked
+upstream for an item that waits on a change outside Baryon; an item is
 removed from this page once it is released and documented in the release
 notes.
 
@@ -11,36 +12,38 @@ Support claims are made only in [compatibility.md](compatibility.md) and
 the release notes, after tests. A Planned or Designed item here is not
 supported.
 
-Last updated: 2026-10-27.
+Last updated: 2026-10-28.
 
 ## v0.1.0
 
 v0.1.0-rc1 is published
-([release notes](release-notes/v0.1.0-rc1.md)). Before v0.1.0:
+([release notes](release-notes/v0.1.0-rc1.md)). v0.1.0-rc2 carries the
+items under "On main" below and no new user-facing feature
+([release notes](release-notes/v0.1.0-rc2.md)); v0.1.0 is planned as the
+same stabilized set. Before v0.1.0:
 
 | Item | Status | Notes |
 |---|---|---|
-| Cloud Hypervisor v54.0 in v0.1.0 | Planned (owner decision) | `main` pins v54.0 (below); v0.1.0-rc1 ships v53.0. A v0.1.0 from `main` needs a new release candidate with its own validation ([release.md](release.md)) |
-| Guests without nested virtualization in v0.1.0 | Planned (owner decision) | v0.1.0-rc1 starts guests with Cloud Hypervisor v53.0's default, nested virtualization on; `main` sets it off ([security.md](security.md#guest-attack-surface)) |
 | Repository and package visibility | Planned (owner decision) | A public repository enables provenance attestations and anonymous image pulls ([release.md](release.md)) |
 | Installation from a private registry with node pull credentials | Planned | Not tested; [installation.md](installation.md#private-repository) documents the image import alternative |
-| Repeated E2E runs with `tests/e2e/repeat.sh` | Planned | Each suite has passed; repeated runs have not been made for this release |
 | Rust dependency data in the component image SBOMs | Planned | Today the component image SBOMs list the image only; the crates are in the source tree SBOM ([release.md](release.md)) |
 
-## On main, not released
+## On main, for v0.1.0-rc2
 
 | Item | Status | Notes |
 |---|---|---|
-| Cloud Hypervisor v54.0 | Tested | Pinned in `packaging/versions.env`. Nested virtualization off and virtio-net offloads on, both written explicitly (ADR 0007, [compatibility.md](compatibility.md)); E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)) |
+| Cloud Hypervisor v54.0 | Implemented | Pinned in `packaging/versions.env`. Nested virtualization off and virtio-net offloads on, both written explicitly (ADR 0007, [compatibility.md](compatibility.md)); E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)); `tests/e2e/guest-policy.sh` checks the options |
+| M1: lifecycle control only by the Anchor supervisor | Implemented | [ADR 0015](adr/0015-anchor-authority.md); unit tests, CI API server checks, and E2E on the k0s cluster |
+| M2: disk import only in `baryon-importer` | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings); unit tests and E2E on the k0s cluster |
 
-## Next: guest access
+## Next, after v0.1 stabilization: guest access
 
 | Item | Status | Notes |
 |---|---|---|
-| Guest user data from a Secret (cloud-init NoCloud seed disk) | Designed (ADR Proposed) | [ADR 0014](adr/0014-guest-access.md) |
-| Interactive serial console through the Anchor Pod | Designed (ADR Proposed) | [ADR 0014](adr/0014-guest-access.md) |
-| `baryonctl` command line client, with `console` as its first command | Designed (ADR Proposed) | [ADR 0014](adr/0014-guest-access.md); also installable as the kubectl plugin `kubectl-baryon` |
-| Guest network throughput measurement in the E2E suites | Planned | Needs guest credentials, which the user data item provides |
+| Guest configuration from a Secret (`spec.guestConfig`, NoCloud seed disk) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted); needs the feature placement resource of ADR 0012 and the refusing form of `baryon-vm-guest-config` one cluster release earlier |
+| Interactive serial console through the Anchor Pod (`pods/exec`, one interactive writer) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted) |
+| `baryonctl console` | Planned | Designed in [ADR 0014](adr/0014-guest-access.md) (Accepted), as a later part after the console through `kubectl exec`; also installable as the kubectl plugin `kubectl-baryon` |
+| Guest network throughput measurement in the E2E suites | Planned | Needs guest credentials, which the guest configuration item provides; until then `tests/e2e/guest-policy.sh` has an optional throughput floor (`MIN_MBPS`) for a guest image that has credentials |
 
 ## Storage
 
@@ -56,11 +59,9 @@ v0.1.0-rc1 is published
 
 | Item | Status | Notes |
 |---|---|---|
-| AnchorService peer checks: no calls from the VMM or the DHCP responder; `Attach` and `Stop` only from the Anchor supervisor | Implemented | Finding M1 of 2026-10-27 in [security.md](security.md#review-findings); [ADR 0015](adr/0015-anchor-authority.md); unit tests, CI API server checks (local run), and E2E on the k0s cluster |
 | VMM and DHCP responder in a PID namespace of their own, so they cannot signal the anchor | Planned | Residual of [ADR 0015](adr/0015-anchor-authority.md); whether Cloud Hypervisor runs correctly as PID 1 is not verified |
 | A seccomp filter in baryon-anchor after startup that denies `execve`, `execveat`, and new processes | Planned | [security.md](security.md) |
-| A per-pod limit on AnchorService connections | Planned | [security.md](security.md) |
-| Disk import removed from the Anchor runtime: a separate `baryon-importer` binary and image for import Pods | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings); unit tests and E2E on the k0s cluster |
+| A per-pod limit on AnchorService connections and streams | Designed | Required before the console ships ([ADR 0014](adr/0014-guest-access.md), finding M11) |
 | Device plugin in a separate minimal process | Planned | Finding M2 of the 2026-10-05 release gate review in [security.md](security.md#review-findings) |
 | Separate build and publish jobs in the release workflow | Planned | Only the publish job would hold write tokens |
 | Release workflow check of CI results and `main` ancestry; protected release tags | Planned | Finding L1 of the 2026-10-05 release gate review, accepted for v0.1.0-rc1 ([security.md](security.md#review-findings)) |
@@ -94,10 +95,12 @@ v0.1.0-rc1 is published
 
 ## Waiting on upstream
 
-| Item | Upstream dependency | Notes |
-|---|---|---|
-| Live migration | Cloud Hypervisor: network devices passed as file descriptors to a migration destination (v54.0 accepts pre-opened VFIO and `iommufd` descriptors on `receive-migration`, but no network descriptors). Most of ADR 0013's entry criteria are Baryon design work (fencing, authorization, the receive endpoint, disks and host paths on the destination, Kairos Operator cooperation) | [ADR 0013](adr/0013-live-migration.md#decision) |
-| Upgrade completion detection without the runbook's boot ID check | Kairos Operator reporting the reboot of a node | [kairos-integration.md](kairos-integration.md) |
+Items here are Blocked upstream: they wait on a change outside Baryon.
+
+| Item | Status | Upstream dependency | Notes |
+|---|---|---|---|
+| Live migration | Blocked upstream | Cloud Hypervisor: network devices passed as file descriptors to a migration destination (v54.0 accepts pre-opened VFIO and `iommufd` descriptors on `receive-migration`, but no network descriptors). Most of ADR 0013's entry criteria are Baryon design work (fencing, authorization, the receive endpoint, disks and host paths on the destination, Kairos Operator cooperation) | [ADR 0013](adr/0013-live-migration.md#decision) |
+| Upgrade completion detection without the runbook's boot ID check | Blocked upstream | Kairos Operator reporting the reboot of a node | [kairos-integration.md](kairos-integration.md) |
 
 ## Out of scope
 

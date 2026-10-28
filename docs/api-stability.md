@@ -193,6 +193,16 @@ rules above apply.
 
 ## Change log per release
 
+### 0.1.0-rc2
+
+No API change: no field, default, validation rule, condition type, or
+reason of `v1alpha1` changed since 0.1.0-rc1. The admission policies of
+the installation changed (ADR 0015): Baryon pods are refused when they
+share the process namespace, use the host PID namespace or a user
+namespace, run more than one container, keep or add capabilities, or allow
+privilege escalation, and their container images and ephemeral containers
+cannot be changed or added. baryon-controller creates no such pods.
+
 ### 0.1.0-rc1
 
 API changes; the API stays `v1alpha1`. Details are in
