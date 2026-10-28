@@ -39,7 +39,7 @@ and Not tested rows make no claim. States:
 | Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`, pinned by digest in `packaging/versions.env`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
 | Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`, pinned by digest in `packaging/versions.env`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
 | Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
-| Cloud Hypervisor | v54.0, static binary, SHA-256 pinned in `packaging/versions.env`, with nested virtualization off and the virtio-net offloads on written explicitly (ADR 0007) | Tested: the E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)). v0.1.0-rc1 ships v53.0 (Tested in its release validation). Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
+| Cloud Hypervisor | v54.0, static binary, SHA-256 pinned in `packaging/versions.env`, with nested virtualization off and the virtio-net offloads on written explicitly (ADR 0005, ADR 0007) | Tested: the E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)). v0.1.0-rc1 ships v53.0 (Tested in its release validation). Other versions: Not tested; the Baryon-enabled image ships only the pinned build |
 | UEFI firmware | CLOUDHV.fd from cloud-hypervisor/edk2 `ch-97eeb7b09`, SHA-256 pinned in `packaging/versions.env` | Tested |
 | virtiofsd | v1.14.0 | Shipped in the image, not used by Baryon |
 | Architecture | x86_64 | Tested. aarch64: Not supported, binaries and firmware are built for x86_64 only (aarch64 support is Planned) |
@@ -65,10 +65,10 @@ and Not tested rows make no claim. States:
 
 ## Not supported in v0.1
 
-- Live migration is currently unsupported. Baryon's network handoff model
-  requires destination-side file descriptor injection during Cloud
-  Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A
+- Live migration is currently unsupported because Baryon's network
+  handoff model requires destination-side file descriptor injection
+  during Cloud Hypervisor migration, which is not available in the
+  currently supported Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A
   drain or node upgrade stops the VMs on the node; they start again where
   their storage allows ([lifecycle contract](kairos-integration.md#lifecycle-contract)).
 - Windows guests.
@@ -112,7 +112,7 @@ claims still follow tests.
 
 | Distribution | State for v0.1 |
 |---|---|
-| k0s | Tested: v1.36.4+k0s.1 on the k0s cluster, three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, one controller that also runs workloads and two workers, kube-router, OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0 (v0.1.0-rc1) and v54.0 (`main`). Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container; it validates only API server behavior (CRD schema, CEL rules, admission policies) and is not a Baryon host |
+| k0s | Tested: v1.36.4+k0s.1 on the k0s cluster, three Baryon-enabled Hadron nodes (VMs with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, one controller that also runs workloads and two workers, kube-router, OpenEBS LVM LocalPV and Ceph RBD, systemd cgroup driver, Cloud Hypervisor v53.0 (v0.1.0-rc1) and v54.0 (v0.1.0-rc2). Needs the containerd drop-in and worker profile in [k0s node configuration](#k0s-node-configuration). Nested virtualization on three nodes is evidence, not a certification. CI also runs a single-node k0s v1.36.4+k0s.1 API server in a container; it validates only API server behavior (CRD schema, CEL rules, admission policies) and is not a Baryon host |
 | k3s | Not supported for v0.1 until tested on more than one node. An earlier release ran on a single Baryon-enabled Hadron node (VM with nested KVM): Hadron v0.5.3, kairos-init v4.3.0, k3s v1.36.4+k3s1, flannel (vxlan backend, `cni0` bridge), local-path, systemd cgroup driver, Cloud Hypervisor v53.0. That is historical evidence. `hack/build-hadron-image.sh` builds a k3s image only when `KUBERNETES_DISTRO=k3s` is set; the default is k0s |
 | kubeadm (provider-kubernetes) | Not tested |
 | kind | Not a Baryon environment. A development cluster in which a kind node container acted as the host was used for the runtime experiments and early E2E runs; it is no longer used |
@@ -258,9 +258,10 @@ Baryon has two parts that are upgraded separately:
   Cloud Hypervisor, and the firmware. It is upgraded with the OS, through
   Kairos, one node at a time ([lifecycle contract](kairos-integration.md#lifecycle-contract)).
 - the **cluster release**: the CRDs, admission policies, RBAC,
-  baryon-controller, baryon-node-agent, and the anchor image. It is
-  upgraded with `kubectl apply` (for this release, see
-  [Upgrade to 0.1.0-rc1](#upgrade-to-010-rc1); API changes and their
+  baryon-controller, baryon-node-agent, and the anchor and importer
+  images. It is upgraded with `kubectl apply` (from 0.1.0-rc1 to
+  0.1.0-rc2, see [installation.md](installation.md#10-upgrading); to
+  0.1.0-rc1, see [Upgrade to 0.1.0-rc1](#upgrade-to-010-rc1); API changes and their
   upgrade steps per release are in
   [api-stability.md](api-stability.md#change-log-per-release)).
 

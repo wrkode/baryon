@@ -228,10 +228,10 @@ setting and its side effects are in
   Not supported in the API (the runtime protocol accepts up to eight).
 - One running VM per claim. A `ReadWriteMany` block claim used as a root
   disk by VMs on different nodes is Not supported.
-- Live migration is currently unsupported. Baryon's network handoff model
-  requires destination-side file descriptor injection during Cloud
-  Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md).
+- Live migration is currently unsupported because Baryon's network
+  handoff model requires destination-side file descriptor injection
+  during Cloud Hypervisor migration, which is not available in the
+  currently supported Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md).
   Snapshots are Not supported.
 - Block mode requires a container runtime that creates granted device nodes
   on the container's `/dev` tmpfs and gives them the pod's `runAsUser` and

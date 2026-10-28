@@ -150,7 +150,7 @@ freeze. Do not build on them.
 - Event reasons. They follow the condition reasons where they overlap,
   but are informational.
 
-Anything that The contract does not list is not contract.
+Anything that the contract does not list is not contract.
 
 ## Reading conditions
 
@@ -195,8 +195,19 @@ rules above apply.
 
 ### 0.1.0-rc2
 
-No API change: no field, default, validation rule, condition type, or
-reason of `v1alpha1` changed since 0.1.0-rc1. The admission policies of
+No breaking API change: no field, default, validation rule, or condition
+type of `v1alpha1` changed since 0.1.0-rc1. Additions:
+
+- The failure reason `NotAnchorSupervisor` (from baryon-virtd, on
+  `Running` and `Ready`): the anchor was not recognized as the Anchor
+  supervisor (ADR 0015, [api.md](api.md#failure-reasons)).
+- baryon-controller acts on an `IdentityConflict` termination message only
+  together with the anchor's dedicated exit code 3 (ADR 0012). An anchor
+  of 0.1.0-rc1 exits with 1 on an identity conflict, so after the upgrade
+  such a VM is not moved away from its node and stays not ready there
+  until its Anchor Pod is replaced, for example by deleting it.
+
+The admission policies of
 the installation changed (ADR 0015): Baryon pods are refused when they
 share the process namespace, use the host PID namespace or a user
 namespace, run more than one container, keep or add capabilities, or allow

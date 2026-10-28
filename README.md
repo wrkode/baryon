@@ -57,10 +57,10 @@ labels: [architecture.md](docs/architecture.md).
 
 ## What is not supported
 
-- Live migration is currently unsupported. Baryon's network handoff model
-  requires destination-side file descriptor injection during Cloud
-  Hypervisor migration, which is not available in the currently supported
-  Cloud Hypervisor release. See [ADR 0013](docs/adr/0013-live-migration.md).
+- Live migration is currently unsupported because Baryon's network
+  handoff model requires destination-side file descriptor injection
+  during Cloud Hypervisor migration, which is not available in the
+  currently supported Cloud Hypervisor release. See [ADR 0013](docs/adr/0013-live-migration.md).
   A drain or node upgrade stops the VMs on the node; they start again
   where their storage allows.
 - Windows guests.

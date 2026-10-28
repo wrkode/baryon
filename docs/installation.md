@@ -391,9 +391,10 @@ manifest renderer (`hack/release-manifests.sh`) are Implemented. An
 installation from release files rendered by the same procedure, applied as
 files, is Tested on the k0s cluster in the v0.1.0-rc1 release validation
 ([testing.md](testing.md#v010-rc1-release-validation)). The published
-release files and images, rebuilt by the release workflow from the tag,
-passed a smoke test on the k0s cluster after the tag
-([testing.md](testing.md#published-artifacts-smoke-test)).
+release files and images of v0.1.0-rc1, rebuilt by the release workflow
+from the tag, passed a smoke test on the k0s cluster after the tag
+([testing.md](testing.md#published-artifacts-smoke-test)); the smoke test
+of v0.1.0-rc2 follows its tag.
 
 ### Private repository
 

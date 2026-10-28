@@ -32,7 +32,7 @@ same stabilized set. Before v0.1.0:
 
 | Item | Status | Notes |
 |---|---|---|
-| Cloud Hypervisor v54.0 | Implemented | Pinned in `packaging/versions.env`. Nested virtualization off and virtio-net offloads on, both written explicitly (ADR 0007, [compatibility.md](compatibility.md)); E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)); `tests/e2e/guest-policy.sh` checks the options |
+| Cloud Hypervisor v54.0 | Implemented | Pinned in `packaging/versions.env`. Nested virtualization off and virtio-net offloads on, both written explicitly (ADR 0005, ADR 0007, [compatibility.md](compatibility.md)); E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)); `tests/e2e/guest-policy.sh` checks the options |
 | M1: lifecycle control only by the Anchor supervisor | Implemented | [ADR 0015](adr/0015-anchor-authority.md); unit tests, CI API server checks, and E2E on the k0s cluster |
 | M2: disk import only in `baryon-importer` | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings); unit tests and E2E on the k0s cluster |
 
@@ -40,7 +40,7 @@ same stabilized set. Before v0.1.0:
 
 | Item | Status | Notes |
 |---|---|---|
-| Guest configuration from a Secret (`spec.guestConfig`, NoCloud seed disk) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted); needs the feature placement resource of ADR 0012 and the refusing form of `baryon-vm-guest-config` one cluster release earlier |
+| Guest configuration from a Secret (`spec.guestConfig`, NoCloud seed disk) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted); needs the feature placement resource of ADR 0012 and the refusing form of `baryon-vm-guest-config` one cluster release earlier. v0.1.0 does not carry that policy (it is the same set as v0.1.0-rc2), so a cluster release after v0.1.0 ships it before the release that adds the field |
 | Interactive serial console through the Anchor Pod (`pods/exec`, one interactive writer) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted) |
 | `baryonctl console` | Planned | Designed in [ADR 0014](adr/0014-guest-access.md) (Accepted), as a later part after the console through `kubectl exec`; also installable as the kubectl plugin `kubectl-baryon` |
 | Guest network throughput measurement in the E2E suites | Planned | Needs guest credentials, which the guest configuration item provides; until then `tests/e2e/guest-policy.sh` has an optional throughput floor (`MIN_MBPS`) for a guest image that has credentials |

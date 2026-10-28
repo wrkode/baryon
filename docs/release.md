@@ -114,17 +114,28 @@ carries `-dirty`; release builds come from the clean tag and never do.
    manually (`workflow_dispatch`): it builds every release file and image
    from the selected branch without pushing images, creating
    attestations, or creating a release.
-3. Release validation on a real cluster passes (see
+3. Release qualification on a real cluster passes (see
    [testing.md](testing.md)); hardware E2E does not run in GitHub-hosted
-   CI, which has no KVM.
+   CI, which has no KVM. It runs on the exact candidate commit: images,
+   the host image, and the release files are built from a clean checkout
+   of that commit, and the tag is placed on that commit. Any change after
+   qualification, documentation included, makes a new candidate that is
+   qualified again. Because the results cannot be part of the commit they
+   qualify, they are recorded in [testing.md](testing.md) on `main` after
+   the tag, naming the commit, and the release notes link there.
 4. Architecture, security, and documentation reviews pass.
 5. Tag and push: `git tag -a v<version> -m "Baryon v<version>"` and
    `git push origin v<version>`. The workflow builds, publishes, and
    creates the GitHub release; a version with a prerelease part becomes a
    prerelease. It creates attestations only when the repository is public.
-6. If the repository is public, make the five ghcr.io packages
+6. Smoke-test the published artifacts, not the pre-tag builds, and record
+   the result on `main`. A correction found after the tag goes to `main`
+   and, where readers need it, into the GitHub release description; the
+   tag never moves.
+7. If the repository is public, make the five ghcr.io packages
    (`baryon-controller`, `baryon-node-agent`, `baryon-anchor`,
-   `baryon-importer`, `baryon-hadron`) public in their package settings on GitHub. Packages
+   `baryon-importer`, `baryon-hadron`) public in their package settings on
+   GitHub. Packages
    published from a personal account start private, and the images must
    be public for an installation without credentials. While the
    repository is private, this step does not apply: its packages stay

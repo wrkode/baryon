@@ -284,8 +284,8 @@ is best effort: on a reboot the pod network may already be gone.
 `deploy/base/policy/` holds six ValidatingAdmissionPolicies. They need
 Kubernetes 1.30 or later, and 1.32 or later for the node name in service
 account identities. `baryon-vm-resource` and `baryon-node-agent-own-node`
-are Implemented and Tested on the kind host (Kubernetes 1.34) and the
-Hadron node (k3s 1.36); the CI API server checks (k0s 1.36) confirm the
+are Implemented and were Tested earlier on the retired kind host
+(Kubernetes 1.34) and the historical single Hadron node (k3s 1.36); the CI API server checks (k0s 1.36) confirm the
 `baryon-vm-resource` denial for a pod that requests the vm resource, a pod
 that requests the import resource, and an init container that requests the
 vm resource. `baryon-controller-writes` and `baryon-import-approval` are
@@ -1204,7 +1204,7 @@ Findings of the 2026-10-28 v0.1.0-rc2 release gate review:
 | Finding | Severity | Status |
 |---|---|---|
 | rc2 gate H1: CI's dependency gate failed on the frozen candidate (RUSTSEC-2026-0414, pulldown-cmark, a build dependency) | High (process) | Fixed before the tag: pulldown-cmark 0.13.5; the candidate was frozen again and qualified on the new commit |
-| rc2 gate L1: `baryon-vm-resource` does not refuse `hostIPC`, `hostNetwork`, or hostPath volumes; only a mutating webhook could add them, and a `hostNetwork` Anchor is refused by the supervisor check | Low | Accepted for v0.1.0-rc2; `hostIPC` refusal Designed with ADR 0014 (v0.2) |
+| rc2 gate L1: `baryon-vm-resource` does not refuse `hostIPC`, `hostNetwork`, or hostPath volumes; only a mutating webhook could add them, and a `hostNetwork` Anchor is refused by the supervisor check | Low | Accepted for v0.1.0-rc2; `hostIPC` refusal Designed with ADR 0014 (after v0.1 stabilization, [roadmap.md](roadmap.md)) |
 | rc2 gate L2: the image SBOMs are generated from the image tag in the local daemon, not from the pushed digest | Low | Open; use the digest outputs (Planned) |
 
 Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
@@ -1273,8 +1273,8 @@ cargo deny reports no advisories after the update.
 
 VFIO and PCI passthrough, SR-IOV, snapshots, and confidential computing
 (SEV-SNP, TDX, measured boot, attestation) are not supported. Live
-migration is currently unsupported. Baryon's network handoff model
-requires destination-side file descriptor injection during Cloud
+migration is currently unsupported because Baryon's network handoff
+model requires destination-side file descriptor injection during Cloud
 Hypervisor migration, which is not available in the currently supported
 Cloud Hypervisor release. See [Live migration](#live-migration-not-supported)
 and [ADR 0013](adr/0013-live-migration.md). The current handoff is host-mediated by design: baryon-virtd resolves disks,

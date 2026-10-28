@@ -114,8 +114,8 @@ are in the Cloud Hypervisor repository unless they start with `crates/`.
 ## Decision
 
 - Live migration is Not supported. The wording used in the documentation
-  and release notes: "Live migration is currently unsupported. Baryon's
-  network handoff model requires destination-side file descriptor
+  and release notes: "Live migration is currently unsupported because
+  Baryon's network handoff model requires destination-side file descriptor
   injection during Cloud Hypervisor migration, which is not available in
   the currently supported Cloud Hypervisor release." Baryon has no public
   migration API (no `VirtualMachineMigration` or equivalent resource), no
@@ -378,3 +378,5 @@ record stays out of the repository; no timings are published.
   still restores them as `-1`.
   [cloud-hypervisor#7054](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7054)
   is open. The sections above describe v53 and are kept as written.
+- 2026-10-28: the documented wording joins its two sentences with
+  "because"; the meaning and the decision are unchanged.

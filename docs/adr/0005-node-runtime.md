@@ -5,7 +5,7 @@ kind node container acted as the host (see
 [runtime-boundary.md](../runtime-boundary.md), Experiment C) and on a single
 Baryon-enabled Hadron node (k3s, systemd cgroup driver). The cgroupfs driver
 is Not supported.
-Date: 2026-10-02, revised 2026-10-03 and 2026-10-04
+Date: 2026-10-02, revised 2026-10-03, 2026-10-04, 2026-10-27, and 2026-10-28
 
 ## Context
 
@@ -70,6 +70,11 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
    - with a TAP fd from the pod network namespace and disk `O_PATH` fds
      resolved in the pod mount namespace (ADR 0006, ADR 0007)
    - with seccomp and Landlock enabled
+   - with nested virtualization off (`--cpus ...,nested=off`), written
+     explicitly although it is the Cloud Hypervisor v54.0 default: the
+     guest CPU feature policy is Baryon's decision, not a VMM default
+     (ADR 0002). Nested virtualization in guests is not a supported
+     capability.
 3. /dev/kvm reaches the container's device list, and the anchor socket
    reaches the container, through the `virtualization.baryon.io/vm` device
    plugin (ADR 0009).
@@ -183,3 +188,11 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
 - 2026-10-27: ADR 0015 relies on the VMM and the DHCP responder running in
   baryon-virtd's PID namespace: AnchorService calls from that namespace are
   refused. The decision is unchanged.
+- 2026-10-28: nested virtualization off is recorded as a decision (item
+  2). v0.1.0-rc1 started guests with the Cloud Hypervisor v53.0 default;
+  from v0.1.0-rc2 Baryon writes `nested=off`. With v54.0 the serial
+  socket and its lock file are created before Cloud Hypervisor applies
+  Landlock and the socket is reused across a guest reboot, so the
+  Landlock rule for the VM's `vmm` directory is needed at most to remove
+  both files when the VMM exits; whether the rule can be dropped is Open
+  ([security.md](../security.md)).
