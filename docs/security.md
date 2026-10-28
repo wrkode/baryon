@@ -975,11 +975,11 @@ protects it. Reviewed in the v0.1.0-rc1 release gate review of 2026-10-05.
 | Kubernetes distribution binary | k0s is installed into the host image by kairos-init (pinned by digest) at the version in `packaging/versions.env`. Its download verification is kairos-init's and is not verified by Baryon; `components.json` records the version only. Upstream dependency |
 | Build context | `.dockerignore` excludes build outputs and `.git` only; the Dockerfiles copy explicit paths. An allowlist `.dockerignore`: Planned |
 | Component images | `FROM scratch` with one static binary; no base image, no package manager. Implemented |
-| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; Tested by the release workflow dry run on 2026-10-05; not yet exercised by a published release |
+| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; Tested by the release workflow dry run on 2026-10-05 and by the published v0.1.0-rc1 release (smoke test, [testing.md](testing.md#published-artifacts-smoke-test)) |
 | Provenance | GitHub artifact attestations for every release file and image, created only when the repository is public; a release from a private repository has none. Implemented; not yet exercised |
 | Signing | None. No file, image, or tag is signed with a project key |
-| Release gate | The release procedure requires CI to pass on `main` before tagging, but the release workflow does not check CI results or that the tag is on `main`, and tags are not protected. Accepted for v0.1.0-rc1; enforcement Planned |
-| Build isolation | One job builds and publishes, so the build steps run with the write tokens available. Accepted for v0.1.0-rc1; split jobs Planned |
+| Release gate | The release procedure requires CI to pass on `main` before tagging, but the release workflow does not check CI results or that the tag is on `main`, and tags and `main` are not protected (no rulesets, checked 2026-10-28). Accepted for v0.1.0-rc1 and v0.1.0-rc2; enforcement Planned |
+| Build isolation | One job builds and publishes, so the build steps run with the write tokens available. Accepted for v0.1.0-rc1 and v0.1.0-rc2; split jobs Planned |
 
 ## Review findings
 
@@ -1199,6 +1199,14 @@ a design; nothing implemented):
 | L18: the seed open, the `Console` caller rule, and the projected Secret keys were imprecise | Low | Resolved in the ADR (Designed) |
 | N9: ADR 0015 named a console bridge that the chosen design does not have; a controller downgrade could start a referencing VM without its user data | Note | Resolved: ADR 0015 wording corrected; a downgrade below the release that adds the field is documented as not supported |
 
+Findings of the 2026-10-28 v0.1.0-rc2 release gate review:
+
+| Finding | Severity | Status |
+|---|---|---|
+| rc2 gate H1: CI's dependency gate failed on the frozen candidate (RUSTSEC-2026-0414, pulldown-cmark, a build dependency) | High (process) | Fixed before the tag: pulldown-cmark 0.13.5; the candidate was frozen again and qualified on the new commit |
+| rc2 gate L1: `baryon-vm-resource` does not refuse `hostIPC`, `hostNetwork`, or hostPath volumes; only a mutating webhook could add them, and a `hostNetwork` Anchor is refused by the supervisor check | Low | Accepted for v0.1.0-rc2; `hostIPC` refusal Designed with ADR 0014 (v0.2) |
+| rc2 gate L2: the image SBOMs are generated from the image tag in the local daemon, not from the pushed digest | Low | Open; use the digest outputs (Planned) |
+
 Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
 report no vulnerabilities in the Rust dependencies. Cloud Hypervisor
 v53.0 is not affected by its published security advisories. k0s
@@ -1223,6 +1231,14 @@ those constructors (the DHCP responder's packet socket and the wait for a
 pidfd) now use `AsyncFd::register` and `AsyncFd::register_with_interest`
 on an `OwnedFd` that the `AsyncFd` owns. cargo audit and cargo deny report
 no advisories after the update.
+
+Dependency update of 2026-10-28, before the v0.1.0-rc2 tag, after
+`cargo deny check advisories` failed in CI on RUSTSEC-2026-0414
+(pulldown-cmark 0.13.4, exponential event growth with
+`ENABLE_WIKILINKS`): pulldown-cmark 0.13.5. pulldown-cmark is a build
+dependency only (prost-build, through tonic-prost-build) and parses the
+comments of Baryon's own `.proto` files; no Baryon binary contains it.
+cargo deny reports no advisories after the update.
 
 ## Future hardening
 
