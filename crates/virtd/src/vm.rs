@@ -2160,6 +2160,14 @@ mod tests {
                 .spawn()
                 .unwrap();
             let pid = i32::try_from(vmm.id()).unwrap();
+            // Under load the child can still show the test binary for a
+            // moment; adopt() would then refuse it for the wrong reason.
+            let exe = dir.join("cloud-hypervisor");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::fs::read_link(format!("/proc/{pid}/exe")).ok().as_ref() != Some(&exe) {
+                assert!(std::time::Instant::now() < deadline, "child did not exec");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let rec = VmRecord {
                 version: record::RECORD_VERSION,
                 pod_uid: "p".into(),
