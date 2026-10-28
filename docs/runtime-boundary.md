@@ -79,7 +79,10 @@ volume down.
 ### Implementation
 
 `crates/virtd/src/handoff/storage.rs`, disk import by
-`baryon-anchor import` (`crates/anchor/src/import.rs`).
+`baryon-importer import` (`crates/importer/src/import.rs`). When this
+experiment ran, the importer was `baryon-anchor import` in
+`crates/anchor/src/import.rs`; it moved to its own binary and image on
+2026-10-27 (finding M2).
 
 ### Observations
 
@@ -454,6 +457,13 @@ Model B with `container` placement, on the evidence above:
   semantics for the guest.
 - /dev/kvm and the anchor socket reach the container through the
   `virtualization.baryon.io/vm` device plugin.
+- Compromise recorded in ADR 0015: because the VMM and the DHCP responder
+  share the Anchor container's cgroup and the VM's host identity, the
+  identity check cannot tell them, or processes started with `kubectl
+  exec`, from the anchor. Lifecycle calls therefore also require the Anchor
+  supervisor (the init process of the Anchor container's PID namespace).
+  The VMM and the responder can still kill the anchor, which stops only
+  their own VM.
 
 `pod-child` placement was removed from baryon-virtd (the
 `--vmm-cgroup pod-child` flag no longer exists). It created cgroups under

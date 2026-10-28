@@ -4,6 +4,14 @@
 //! credentials. The pidfd obtained through `SO_PEERPIDFD` refers to the exact
 //! process that connected, so later operations on its namespaces cannot be
 //! redirected to another process by PID reuse.
+//!
+//! Identity is not authority (ADR 0015). Every process of a pod that runs as
+//! the VM's host identity passes the identity check, including processes
+//! started with `kubectl exec`, and the VMM and the DHCP responder, which
+//! baryon-virtd places in the Anchor container's cgroup. Lifecycle calls
+//! additionally require the caller to be an Anchor supervisor
+//! ([`check_supervisor`]): the init process of a container PID namespace, in
+//! the initial user namespace, outside baryon-virtd's own namespaces.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -48,6 +56,69 @@ pub enum PeerError {
     Root { pid: i32 },
 }
 
+/// Identity of a namespace: the device and inode of its nsfs file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsId {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// The namespaces that the supervisor check compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Namespaces {
+    pub user: NsId,
+    pub pid: NsId,
+    pub mnt: NsId,
+    pub net: NsId,
+}
+
+impl Namespaces {
+    /// Namespaces of the process behind `/proc/<pid>` (`self` for this one).
+    pub fn of(pid: &str) -> io::Result<Self> {
+        let id = |ns: &str| -> io::Result<NsId> {
+            let st = rustix::fs::stat(format!("/proc/{pid}/ns/{ns}").as_str())?;
+            Ok(NsId {
+                dev: st.st_dev,
+                ino: st.st_ino,
+            })
+        };
+        Ok(Self {
+            user: id("user")?,
+            pid: id("pid")?,
+            mnt: id("mnt")?,
+            net: id("net")?,
+        })
+    }
+}
+
+/// baryon-virtd's own namespaces, read once.
+pub fn own_namespaces() -> Result<Namespaces, String> {
+    static OWN: std::sync::OnceLock<Result<Namespaces, String>> = std::sync::OnceLock::new();
+    OWN.get_or_init(|| Namespaces::of("self").map_err(|e| e.to_string()))
+        .clone()
+}
+
+/// Why a peer is not an Anchor supervisor. The text follows the reason
+/// `NotAnchorSupervisor` in refusals.
+pub fn check_supervisor(nspid: &[i32], peer: &Namespaces, own: &Namespaces) -> Result<(), String> {
+    if peer.user != own.user {
+        return Err("the caller is not in the initial user namespace".into());
+    }
+    if peer.pid == own.pid || nspid.len() < 2 {
+        return Err("the caller runs in baryon-virtd's PID namespace, not in a container".into());
+    }
+    if nspid.last() != Some(&1) {
+        return Err(
+            "the caller is not the init process of its container (for example a process started with kubectl exec)"
+                .into(),
+        );
+    }
+    if peer.mnt == own.mnt || peer.net == own.net {
+        return Err("the caller shares baryon-virtd's mount or network namespace".into());
+    }
+    Ok(())
+}
+
 /// A process inside a pod that connected to the anchor socket.
 #[derive(Debug)]
 pub struct AnchorPeer {
@@ -58,6 +129,32 @@ pub struct AnchorPeer {
     pub groups: Vec<u32>,
     pub pidfd: OwnedFd,
     pub cgroup: PodCgroup,
+    /// The process's PID in each nested PID namespace, outermost first, from
+    /// the pidfd's fdinfo (`NSpid`), so PID reuse cannot change it.
+    pub nspid: Vec<i32>,
+    pub namespaces: Namespaces,
+}
+
+impl AnchorPeer {
+    /// Whether the peer may call lifecycle RPCs (ADR 0015); the error says
+    /// why not.
+    pub fn supervisor(&self) -> Result<(), String> {
+        let own = own_namespaces()?;
+        check_supervisor(&self.nspid, &self.namespaces, &own)
+    }
+
+    /// Whether the peer runs outside baryon-virtd's PID namespace, the
+    /// condition for any AnchorService call.
+    pub fn outside_host_pid_namespace(&self) -> Result<(), String> {
+        let own = own_namespaces()?;
+        if self.namespaces.pid == own.pid || self.nspid.len() < 2 {
+            return Err(
+                "the caller runs in baryon-virtd's PID namespace (for example a VMM or a DHCP responder)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Connection metadata attached to every request by tonic.
@@ -105,6 +202,12 @@ pub fn identify_anchor(stream: &UnixStream) -> Result<AnchorPeer, PeerError> {
 
     let cgroup_raw = read_proc(pid, "cgroup")?;
     let status_raw = read_proc(pid, "status")?;
+    let namespaces = Namespaces::of(&pid.to_string()).map_err(|source| PeerError::Proc {
+        pid,
+        file: "ns",
+        source,
+    })?;
+    let nspid = pidfd_nspid(pidfd.as_fd()).ok_or(PeerError::Exited { pid })?;
     // The files above could belong to a new process if the peer exited and
     // its PID was reused while they were read. The pidfd still refers to the
     // original process; if it is alive, the PID was not reused.
@@ -123,6 +226,8 @@ pub fn identify_anchor(stream: &UnixStream) -> Result<AnchorPeer, PeerError> {
         groups,
         pidfd,
         cgroup,
+        nspid,
+        namespaces,
     })
 }
 
@@ -169,6 +274,25 @@ pub fn pidfd_pid(pidfd: BorrowedFd<'_>) -> Option<i32> {
         .find_map(|l| l.strip_prefix("Pid:"))
         .and_then(|v| v.trim().parse::<i32>().ok())
         .filter(|p| *p > 0)
+}
+
+/// `NSpid` of a pidfd from `/proc/self/fdinfo`: the PID in each nested PID
+/// namespace, outermost first. `None` if the process has exited.
+pub fn pidfd_nspid(pidfd: BorrowedFd<'_>) -> Option<Vec<i32>> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).ok()?;
+    parse_nspid(&info)
+}
+
+fn parse_nspid(fdinfo: &str) -> Option<Vec<i32>> {
+    let v: Vec<i32> = fdinfo
+        .lines()
+        .find_map(|l| l.strip_prefix("NSpid:"))?
+        .split_whitespace()
+        .map(|p| p.parse::<i32>().ok())
+        .collect::<Option<_>>()?;
+    // An exited process shows -1; a process outside the procfs instance's
+    // PID namespace shows 0.
+    (!v.is_empty() && v.iter().all(|p| *p > 0)).then_some(v)
 }
 
 /// Supplementary groups from `/proc/<pid>/status`.
@@ -278,6 +402,98 @@ mod tests {
         let pidfd = peer_pidfd(&a).unwrap();
         assert_eq!(pidfd_pid(pidfd.as_fd()), Some(std::process::id() as i32));
         assert!(pidfd_alive(pidfd.as_fd()));
+    }
+
+    #[test]
+    fn parses_nspid_and_fails_closed() {
+        assert_eq!(
+            parse_nspid("Pid:\t4242\nNSpid:\t4242\t1\n"),
+            Some(vec![4242, 1])
+        );
+        assert_eq!(parse_nspid("Pid:\t7\nNSpid:\t7\n"), Some(vec![7]));
+        // Exited process, process outside the PID namespace, garbage, absent.
+        assert_eq!(parse_nspid("Pid:\t-1\nNSpid:\t-1\n"), None);
+        assert_eq!(parse_nspid("Pid:\t0\nNSpid:\t0\n"), None);
+        assert_eq!(parse_nspid("NSpid:\t12\tx\n"), None);
+        assert_eq!(parse_nspid("NSpid:\n"), None);
+        assert_eq!(parse_nspid("Pid:\t12\n"), None);
+    }
+
+    fn ns(n: u64) -> NsId {
+        NsId { dev: 4, ino: n }
+    }
+
+    fn host() -> Namespaces {
+        Namespaces {
+            user: ns(1),
+            pid: ns(2),
+            mnt: ns(3),
+            net: ns(4),
+        }
+    }
+
+    fn container() -> Namespaces {
+        Namespaces {
+            user: ns(1),
+            pid: ns(12),
+            mnt: ns(13),
+            net: ns(14),
+        }
+    }
+
+    /// Finding M1 of 2026-10-27: the VM's identity is not lifecycle
+    /// authority. Only the init process of a container PID namespace in the
+    /// initial user namespace passes.
+    #[test]
+    fn only_a_container_init_is_a_supervisor() {
+        let own = host();
+        // The Anchor container's init process (baryon-anchor run).
+        assert!(check_supervisor(&[4242, 1], &container(), &own).is_ok());
+        // Deeper nesting by the node runtime is accepted as long as the
+        // caller is its namespace's init and in the initial user namespace.
+        assert!(check_supervisor(&[4242, 9, 1], &container(), &own).is_ok());
+
+        // The VMM or the DHCP responder: baryon-virtd's PID, mount, and
+        // network namespaces (the VMM's network namespace is its own empty
+        // one, but its PID namespace is the host's).
+        let mut vmm = host();
+        vmm.net = ns(40);
+        let e = check_supervisor(&[5000], &vmm, &own).unwrap_err();
+        assert!(e.contains("PID namespace"), "{e}");
+
+        // A process started with kubectl exec in the Anchor container.
+        let e = check_supervisor(&[5001, 27], &container(), &own).unwrap_err();
+        assert!(e.contains("init process"), "{e}");
+
+        // A same-uid process that created a user namespace and, in it, a PID
+        // namespace whose init it is (from the host or from a container).
+        let mut nested = container();
+        nested.user = ns(77);
+        let e = check_supervisor(&[5002, 1], &nested, &own).unwrap_err();
+        assert!(e.contains("user namespace"), "{e}");
+        let e = check_supervisor(&[5003, 27, 1], &nested, &own).unwrap_err();
+        assert!(e.contains("user namespace"), "{e}");
+
+        // A PID namespace of its own but the host's mount or network
+        // namespace.
+        let mut odd = container();
+        odd.mnt = own.mnt;
+        assert!(check_supervisor(&[5004, 1], &odd, &own).is_err());
+        let mut odd = container();
+        odd.net = own.net;
+        assert!(check_supervisor(&[5005, 1], &odd, &own).is_err());
+
+        // Malformed: no NSpid entries, or the host PID namespace with depth.
+        assert!(check_supervisor(&[], &container(), &own).is_err());
+        let mut hostpid = container();
+        hostpid.pid = own.pid;
+        assert!(check_supervisor(&[5006, 1], &hostpid, &own).is_err());
+    }
+
+    #[test]
+    fn own_namespaces_are_readable() {
+        let a = own_namespaces().unwrap();
+        assert_eq!(a, Namespaces::of("self").unwrap());
     }
 
     #[tokio::test]

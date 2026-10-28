@@ -184,13 +184,10 @@ Read from the code on 2026-10-27:
   does not count towards the VM's sessions and never becomes the VM's
   anchor. `Console` is accepted from processes in the Anchor container
   (exec), never from peers in baryon-virtd's own PID namespace, which are
-  the VMM and the DHCP responder of the VM. This ADR also closes the
-  existing gap that any process of the pod with the VM's identity can call
-  `Attach` and `Stop` today (finding M1 of 2026-10-27 in
-  [security.md](../security.md#review-findings)):
-  AnchorService calls from baryon-virtd's PID namespace are refused, and
-  `Attach` and `Stop` are accepted only from the Anchor container's init
-  process; a live anchor is never replaced by a newer caller.
+  the VMM and the DHCP responder of the VM. Lifecycle authority (`Attach`
+  and `Stop`) belongs only to the Anchor supervisor (ADR 0015, finding M1
+  of 2026-10-27 in [security.md](../security.md#review-findings)); a
+  console session never has it.
 - Entry point: a new `baryon-anchor console` subcommand. It runs in the
   Anchor container through the Kubernetes `pods/exec` subresource, puts its
   terminal in raw mode, and bridges it to the `Console` stream. The
@@ -224,13 +221,14 @@ Read from the code on 2026-10-27:
   audit the exec request, its command included; Baryon adds no listener,
   no TCP port, and no credentials. `pods/exec` on an Anchor Pod is the
   right to operate the VM, not to view it: besides the console it allows
-  stopping the VM, opening `/dev/kvm` within the pod's limits, and, until
-  the importer requires the controller's approval at its fixed path, in
-  block mode overwriting the running VM's root disk with `baryon-anchor
-  import` (finding M2 of 2026-10-27 in
-  [security.md](../security.md#review-findings), an existing gap that this
-  ADR does not create). `pods/ephemeralcontainers` on an Anchor Pod
-  gives the same with an image of the user's choice.
+  opening `/dev/kvm` within the pod's limits, using up the pod's
+  resources, and writing the anchor's readiness file (ADR 0015). It no
+  longer allows stopping the VM or attaching as its anchor (finding M1 of
+  2026-10-27, ADR 0015), nor overwriting the root disk, because the Anchor
+  image has no import code (finding M2 of 2026-10-27; see
+  [security.md](../security.md#review-findings)). Ephemeral containers
+  are refused on Anchor Pods (`baryon-no-ephemeral-containers`, ADR 0015),
+  and so are image changes (`baryon-pod-immutable`).
 - Audit: baryon-virtd logs each session's start and end with a session
   ID, the mode, the peer pid and container cgroup, the session it took
   over, and the byte counts in each direction; never the content. Console
@@ -360,3 +358,7 @@ rebuilds the seed from the Secret).
   console is not a protocol feature; caller restrictions, bounds,
   terminal output filtering, audit, the command line contract, and the
   affected ADRs were added.
+- 2026-10-27, still Proposed: lifecycle authority moved to ADR 0015
+  (Accepted on 2026-10-28), and the rights of `pods/exec` and
+  `pods/ephemeralcontainers` on an Anchor Pod were updated for the M1 and
+  M2 fixes. The decision is unchanged.

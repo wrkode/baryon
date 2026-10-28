@@ -55,7 +55,7 @@ so neither can hold trusted import state.
   the CSI driver, because the VMM runs in the Anchor container's systemd
   scope and is stopped with it before kubelet starts volume teardown.
 - Raw disk images only in v1alpha1. Baryon can import a raw image from an
-  HTTP(S) URL into a filesystem-mode claim it creates (`baryon-anchor
+  HTTP(S) URL into a filesystem-mode claim it creates (`baryon-importer
   import`, streamed, sparse, SHA-256 verified), or onto a block-mode claim it
   creates (`rootDisk.volumeMode: Block`). The import runs in a separate
   import Pod before the first Anchor Pod exists (ADR 0004).
@@ -299,3 +299,7 @@ so neither can hold trusted import state.
   longer applies.
 - 2026-10-04: the migration consequence now links ADR 0013 and lists what
   migration storage would need. The decision is unchanged.
+- 2026-10-27: the importer moved from `baryon-anchor import` to the
+  separate `baryon-importer` binary and image (ADR 0004); it runs only as
+  the import container's init process and holds its target exclusively.
+  The decision is unchanged.

@@ -1,0 +1,54 @@
+# Nobody may add ephemeral containers to a pod that requests the
+# virtualization.baryon.io/vm or virtualization.baryon.io/import extended
+# resources, that is, to Anchor Pods and import Pods (ADR 0015).
+#
+# An ephemeral container runs an image of the requester's choice with the
+# pod's user, which is the VM's host identity, and shares the pod's network
+# namespace and cgroup. Without a target container it is the init process
+# of a PID namespace of its own, which is the shape of an Anchor supervisor
+# to baryon-virtd; with one it shares the Anchor container's PID namespace.
+# It is never allocated the vm resource, so it has no anchor socket, and with
+# a target its PID namespace's init is the non-dumpable anchor. The policy is
+# therefore defense in depth (ADR 0015): it keeps an image of the requester's
+# choice from running as the VM's identity with the pod's volumes, network
+# namespace, and cgroup. Baryon's pods run only the containers that
+# baryon-controller created. Debug a VM from its node instead.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-no-ephemeral-containers
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/ephemeralcontainers"]
+  matchConditions:
+    - name: requests-baryon-resource
+      expression: >-
+        [object.spec.containers,
+         has(object.spec.initContainers) ? object.spec.initContainers : []].exists(cs,
+          cs.exists(c, has(c.resources) &&
+            ['virtualization.baryon.io/vm', 'virtualization.baryon.io/import'].exists(r,
+              (has(c.resources.limits) && r in c.resources.limits) ||
+              (has(c.resources.requests) && r in c.resources.requests))))
+  validations:
+    - expression: "!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0"
+      message: "ephemeral containers are not allowed in Baryon Anchor Pods and import Pods"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-no-ephemeral-containers
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-no-ephemeral-containers
+  validationActions: [Deny]

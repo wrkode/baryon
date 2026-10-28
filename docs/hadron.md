@@ -52,6 +52,7 @@ The host layer (`packaging/hadron/Dockerfile`, stage `host-layer`, built
 | `/usr/lib/systemd/system/baryon-virtd.service` | systemd unit, no `[Install]` section | `packaging/hadron/files/` |
 | `/usr/lib/systemd/system/multi-user.target.wants/baryon-virtd.service` | relative symlink that enables the unit | created in the image stage |
 | `/usr/lib/modules-load.d/baryon.conf` | tun, sch_ingress, cls_u32, act_mirred, act_gact | `packaging/hadron/files/` |
+| `/usr/lib/sysctl.d/50-baryon.conf` | `kernel.yama.ptrace_scope = 1`: only an ancestor may trace a process, which the Anchor supervisor relies on while it starts (ADR 0015). Hadron also sets 1, in `/etc/sysctl.d/60-hadron-hardening.conf`; this file sets it from `/usr`, which each A/B upgrade replaces as a whole. Files that sort later, Hadron's included, override it, so it takes effect only where no later file sets the key; baryon-virtd warns at startup when the effective value is below 1 or Yama is absent. Tested: present, and scope 1 read, on the three nodes of the k0s cluster on 2026-10-28 | `packaging/hadron/files/` |
 | `/usr/lib/tmpfiles.d/baryon.conf` | `/var/log/baryon` (0750, root) and `/var/log/baryon/vms` (0700, root, entries removed after 14 days untouched) | `packaging/hadron/files/` |
 
 Why only `/usr`: on Kairos `/usr` is replaced as a whole by each A/B upgrade,

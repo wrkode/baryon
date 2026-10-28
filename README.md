@@ -50,7 +50,7 @@ the [v0.1 support matrix](docs/compatibility.md#v01-support-matrix).
 | Host upgrades through Kairos A/B and Kairos Operator `NodeOpUpgrade`, one node at a time; VMs stop and start again | Tested: manual procedures |
 | Mixed host and cluster versions within a runtime protocol major version | Tested for the pairs in [version skew](docs/compatibility.md#version-skew) |
 | VMM confinement: a distinct unprivileged host identity per VM, no capabilities, empty network namespace, seccomp, Landlock ([security.md](docs/security.md)) | Tested: the lifecycle E2E on the k0s cluster runs the confined VMM and checks the seccomp state of every VMM thread; process values measured on a single Hadron node |
-| Admission policies and namespace user roles | Tested: CI API server checks and import integrity E2E |
+| Admission policies and namespace user roles | Tested: CI API server checks and import integrity E2E. The ADR 0015 admission rules: their API server checks pass on a local k0s API server and have not yet run in CI; the image change and ephemeral container refusals are Tested by the anchor authority E2E on the k0s cluster |
 
 Evidence for each row: [testing.md](docs/testing.md#results). Status
 labels: [architecture.md](docs/architecture.md).

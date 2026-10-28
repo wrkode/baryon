@@ -563,6 +563,7 @@ Anchor Pod.
 |---|---|---|
 | `AttachRefused` | baryon-virtd | baryon-virtd refused the attach without a more specific reason, for example an invalid VM spec. |
 | `IdentityConflict` | baryon-virtd | Another VM on the node runs with the same host identity; baryon-controller places the VM elsewhere (see [Host identity](#host-identity)). |
+| `NotAnchorSupervisor` | baryon-virtd | baryon-virtd did not recognize the anchor as the Anchor supervisor (ADR 0015): the anchor is PID 1 of its container but runs in a user namespace other than the initial one, or shares baryon-virtd's mount or network namespace. Seen on a node that does not meet the [node requirements](compatibility.md#kubernetes-requirements), for example a rootless runtime. An anchor that is not PID 1 (an init injected by the runtime, a shared PID namespace) does not get this far: it refuses to run, and the container restarts with `refusing to run` in its log. |
 | `ProtocolIncompatible`, `UnsupportedFeature` | runtime protocol negotiation | The node's baryon-virtd speaks another major version, or lacks a feature the VM needs (ADR 0012). |
 | `InvalidSpec` | baryon-anchor | The anchor could not use the VM spec it was given. |
 | `StorageFailed` | baryon-virtd | baryon-virtd refuses to hand the disk to the VMM, for example a path or file kind the Anchor container does not use for its disk, or a device node outside the container's `/dev`. |
@@ -754,7 +755,11 @@ If another VM on the same node has the same identity, baryon-virtd refuses
 the VM there. baryon-controller then records the node in
 `status.identityConflictNodes`, emits an `IdentityConflict` event, replaces
 the Anchor Pod, and keeps the new pod off the recorded nodes with required
-node affinity on `metadata.name`. The list is cleared when the VM is
+node affinity on `metadata.name`. It acts only when the anchor's
+termination message starts with `IdentityConflict:` and the anchor exited
+with code 3, because other processes of the Anchor container can write the
+message (ADR 0015); a v0.1.0-rc1 anchor exits with 1, so its VM stays on
+the node until its pod is replaced. The list is cleared when the VM is
 stopped. On a cluster where every Baryon node is recorded, the VM stays not
 ready until it is stopped and started again after the conflicting VM is
 gone. Status: Implemented, with unit tests; not exercised on a cluster.

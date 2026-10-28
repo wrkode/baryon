@@ -13,8 +13,22 @@
 # Kubernetes 1.30 or later). The service account name must match
 # deploy/base/controller/rbac.yaml.
 #
-# Only CREATE is checked: container resources cannot be changed on an
-# existing pod (in-place resize covers CPU and memory only).
+# Such a pod must also keep its own PID namespace and the default host PID
+# namespace isolation: baryon-virtd accepts lifecycle calls only from the
+# init process of the Anchor container's PID namespace (ADR 0015), which
+# `shareProcessNamespace` (the pause process becomes PID 1) or `hostPID`
+# would break. baryon-controller never sets either; the validations refuse a
+# mutating webhook that does. For the same reason such a pod has exactly the
+# one container baryon-controller creates, no init containers, and runs in
+# the host user namespace (the supervisor check requires the initial user
+# namespace). Every container drops all capabilities, adds none, and is
+# neither privileged nor allowed to escalate privileges: without
+# CAP_SYS_ADMIN no process in the container can create a PID namespace of
+# its own in the initial user namespace and be its init.
+#
+# Only CREATE is checked: container resources and these fields cannot be
+# changed on an existing pod (in-place resize covers CPU and memory only).
+# Container images can be; policy/pod-immutable.yaml refuses that.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -42,6 +56,27 @@ spec:
     - expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-controller'"
       messageExpression: >-
         'only baryon-controller may create pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import; requested by ' + request.userInfo.username
+      reason: Forbidden
+    - expression: "!has(object.spec.shareProcessNamespace) || !object.spec.shareProcessNamespace"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must not share the process namespace (shareProcessNamespace)"
+      reason: Forbidden
+    - expression: "!has(object.spec.hostPID) || !object.spec.hostPID"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must not use the host PID namespace (hostPID)"
+      reason: Forbidden
+    - expression: "size(object.spec.containers) == 1 && (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0)"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must have exactly one container and no init containers"
+      reason: Forbidden
+    - expression: "!has(object.spec.hostUsers) || object.spec.hostUsers"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must run in the host user namespace (hostUsers)"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(c, has(c.securityContext) &&
+          (!has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          has(c.securityContext.allowPrivilegeEscalation) && !c.securityContext.allowPrivilegeEscalation &&
+          has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) &&
+          'ALL' in c.securityContext.capabilities.drop &&
+          (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
+      message: "containers of pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must drop all capabilities, add none, and not be privileged or allow privilege escalation"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

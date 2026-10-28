@@ -32,6 +32,8 @@ mapping would change the ownership model of every imported image.
 - baryon-virtd refuses an anchor whose uid or gid differs from its VM's
   identity (`IdentityMismatch`), and refuses a second VM with the same
   identity on a node (`IdentityConflict`): a collision is never tolerated.
+  The identity ties a process to its VM; it is not lifecycle authority,
+  which only the VM's Anchor supervisor has (ADR 0015).
 - On `IdentityConflict`, baryon-controller records the node in the VM's
   `status.identityConflictNodes`, replaces the Anchor Pod, and keeps the
   new pod off the recorded nodes with required node affinity: a
@@ -44,8 +46,10 @@ mapping would change the ownership model of every imported image.
   devices, not files: their access is governed by the device permissions
   the container runtime sets for the pod, not by Unix file ownership that
   Baryon would impose.
-- Kubernetes user namespaces may be evaluated later as additional hardening
-  for the Anchor container; they are not the VM identity contract.
+- Kubernetes user namespaces are not the VM identity contract. Anchor
+  containers in a user namespace are Not supported since ADR 0015,
+  whose supervisor check requires the initial user namespace;
+  adopting them as hardening needs a new decision.
 
 ## Consequences
 
@@ -103,3 +107,6 @@ mapping would change the ownership model of every imported image.
   requirement is ANDed into every user node selector term; a placement that
   allows only recorded nodes leaves the VM `Unschedulable`; tolerations do
   not affect the exclusion or fencing.
+- 2026-10-27: the identity was recorded as membership in the VM's runtime
+  context, not lifecycle authority (ADR 0015), and
+  user-namespaced Anchor containers became Not supported.

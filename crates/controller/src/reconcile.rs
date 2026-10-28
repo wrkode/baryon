@@ -1185,7 +1185,9 @@ fn legacy_ready(vm: &VirtualMachine, claim: &PersistentVolumeClaim) -> bool {
 const MAX_CONFLICT_NODES: usize = 16;
 
 /// The node of `pod` if its anchor ended because baryon-virtd refused the
-/// VM there for a host identity conflict.
+/// VM there for a host identity conflict: the anchor's exit code and its
+/// termination message both say so, since other processes of the container
+/// can write the message (ADR 0015).
 fn identity_conflict_node(pod: &Pod) -> Option<String> {
     let node = pod.spec.as_ref()?.node_name.clone()?;
     let refused = pod
@@ -1197,7 +1199,9 @@ fn identity_conflict_node(pod: &Pod) -> Option<String> {
         .filter(|c| c.name == anchor::ANCHOR_CONTAINER)
         .flat_map(|c| [c.state.as_ref(), c.last_state.as_ref()])
         .flatten()
-        .filter_map(|s| s.terminated.as_ref()?.message.as_deref())
+        .filter_map(|s| s.terminated.as_ref())
+        .filter(|t| t.exit_code == i32::from(baryon_runtime_api::IDENTITY_CONFLICT_EXIT_CODE))
+        .filter_map(|t| t.message.as_deref())
         .any(|m| m.trim_start().starts_with("IdentityConflict:"));
     refused.then_some(node)
 }
@@ -1275,7 +1279,7 @@ mod tests {
         use k8s_openapi::api::core::v1::{
             ContainerState, ContainerStateTerminated, ContainerStatus, PodSpec, PodStatus,
         };
-        let pod = |msg: &str| Pod {
+        let pod = |code: i32, msg: &str| Pod {
             spec: Some(PodSpec {
                 node_name: Some("node2".into()),
                 ..Default::default()
@@ -1285,7 +1289,7 @@ mod tests {
                     name: anchor::ANCHOR_CONTAINER.into(),
                     last_state: Some(ContainerState {
                         terminated: Some(ContainerStateTerminated {
-                            exit_code: 1,
+                            exit_code: code,
                             message: Some(msg.into()),
                             ..Default::default()
                         }),
@@ -1297,11 +1301,24 @@ mod tests {
             }),
             ..Default::default()
         };
+        let conflict = i32::from(baryon_runtime_api::IDENTITY_CONFLICT_EXIT_CODE);
         assert_eq!(
-            identity_conflict_node(&pod("IdentityConflict: another VM on this node")),
+            identity_conflict_node(&pod(conflict, "IdentityConflict: another VM on this node")),
             Some("node2".to_owned())
         );
-        assert_eq!(identity_conflict_node(&pod("VmmKilled: signal 9")), None);
+        assert_eq!(
+            identity_conflict_node(&pod(conflict, "VmmKilled: signal 9")),
+            None
+        );
+        // The message alone, as any process of the container could write it.
+        assert_eq!(
+            identity_conflict_node(&pod(1, "IdentityConflict: another VM on this node")),
+            None
+        );
+        assert_eq!(
+            identity_conflict_node(&pod(137, "IdentityConflict: another VM on this node")),
+            None
+        );
         assert_eq!(identity_conflict_node(&Pod::default()), None);
     }
 

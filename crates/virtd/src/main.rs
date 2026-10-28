@@ -271,6 +271,19 @@ fn preflight(cfg: &Config) -> anyhow::Result<()> {
     if !cfg.kvm_device.exists() {
         tracing::warn!(device = %cfg.kvm_device.display(), "KVM device missing; VMs cannot start on this host");
     }
+    // ADR 0015: with Yama scope 1 or higher, only an ancestor may trace the
+    // Anchor supervisor, also before it makes itself non-dumpable.
+    match std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope") {
+        Ok(s) if s.trim().parse::<u8>().is_ok_and(|v| v >= 1) => {}
+        Ok(s) => tracing::warn!(
+            ptrace_scope = s.trim(),
+            "Yama ptrace_scope is below 1; processes with a VM's host identity may trace its Anchor supervisor while it starts"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "Yama is not available; processes with a VM's host identity may trace its Anchor supervisor while it starts"
+        ),
+    }
     Ok(())
 }
 

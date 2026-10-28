@@ -70,7 +70,14 @@ impl AnchorService for Anchor {
         &self,
         req: Request<NegotiateRequest>,
     ) -> Result<Response<NegotiateResponse>, Status> {
-        anchor_peer(&req)?;
+        let peer = anchor_peer(&req)?;
+        // Read-only, so open to processes of the Anchor container; never to
+        // the VMM or the DHCP responder (ADR 0015).
+        let Ok(p) = peer.as_ref() else {
+            return Err(Status::permission_denied("not an anchor process"));
+        };
+        p.outside_host_pid_namespace()
+            .map_err(|e| Status::permission_denied(format!("NotAnchorSupervisor: {e}")))?;
         let req = req.into_inner();
         let theirs = Version::of_peer(req.version.as_ref());
         // Anchor-supplied: logged bounded.
@@ -104,13 +111,14 @@ impl AnchorService for Anchor {
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         // The names are validated later by the manager; log them bounded.
         tracing::info!(pod = %peer.cgroup.pod_uid, vm = %bounded(&spec.vm_name), ns = %bounded(&spec.vm_namespace), pid = peer.pid, "attach");
-        let (rx, guard) = self.manager.attach(peer, spec).map_err(|e| match e {
-            AttachError::InvalidSpec(_) => Status::invalid_argument(e.to_string()),
-            AttachError::SpecMismatch | AttachError::IdentityConflict => {
-                Status::failed_precondition(e.to_string())
+        let (rx, guard) = self.manager.attach(peer, spec).map_err(|e| {
+            if matches!(
+                e,
+                AttachError::NotAnchorSupervisor(_) | AttachError::Superseded
+            ) {
+                tracing::warn!(pod = %peer.cgroup.pod_uid, pid = peer.pid, error = %e, "attach refused");
             }
-            AttachError::IdentityMismatch { .. } => Status::permission_denied(e.to_string()),
-            AttachError::Internal(_) => Status::internal(e.to_string()),
+            attach_status(&e)
         })?;
         Ok(Response::new(Box::pin(status_stream(rx, guard))))
     }
@@ -123,11 +131,15 @@ impl AnchorService for Anchor {
         let pod_uid = peer.cgroup.pod_uid.clone();
         let r = req.into_inner();
         let grace = Duration::from_secs(u64::from(r.grace_period_seconds)).min(MAX_GRACE);
-        tracing::info!(pod = %pod_uid, grace_s = grace.as_secs(), final_ = r.r#final, "stop");
+        tracing::info!(pod = %pod_uid, grace_s = grace.as_secs(), final_ = r.r#final, pid = peer.pid, "stop");
         let status = self
             .manager
-            .stop(&pod_uid, grace, r.r#final)
+            .stop(peer, grace, r.r#final)
             .await
+            .map_err(|e| {
+                tracing::warn!(pod = %pod_uid, pid = peer.pid, error = %e, "stop refused");
+                Status::permission_denied(e.to_string())
+            })?
             .unwrap_or_else(|| VmStatus {
                 pod_uid,
                 phase: VmPhase::Stopped as i32,
@@ -138,6 +150,23 @@ impl AnchorService for Anchor {
         Ok(Response::new(StopResponse {
             status: Some(status),
         }))
+    }
+}
+
+/// The gRPC status of a refused attach. Anchors treat `InvalidArgument`,
+/// `FailedPrecondition`, and `PermissionDenied` as final and retry
+/// everything else.
+fn attach_status(e: &AttachError) -> Status {
+    match e {
+        AttachError::InvalidSpec(_) => Status::invalid_argument(e.to_string()),
+        AttachError::SpecMismatch | AttachError::IdentityConflict => {
+            Status::failed_precondition(e.to_string())
+        }
+        AttachError::IdentityMismatch { .. } | AttachError::NotAnchorSupervisor(_) => {
+            Status::permission_denied(e.to_string())
+        }
+        AttachError::Superseded => Status::unavailable(e.to_string()),
+        AttachError::Internal(_) => Status::internal(e.to_string()),
     }
 }
 

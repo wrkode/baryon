@@ -88,6 +88,26 @@ fn main() -> ExitCode {
         .flatten_event(true)
         .init();
     tracing::info!(build = %BUILD, "starting");
+    // Only the import container's own process may import: one started next
+    // to it (for example with kubectl exec) would find the same approval
+    // and write the claim with a source the controller never checked. It
+    // writes nothing, the termination message included.
+    if std::process::id() != 1 {
+        tracing::error!(
+            pid = std::process::id(),
+            "`import` must be the container's init process (PID 1)"
+        );
+        return ExitCode::FAILURE;
+    }
+    // Processes with the same uid (started with kubectl exec) can then
+    // neither ptrace the importer nor read its /proc entries.
+    if let Err(e) =
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+    {
+        tracing::error!(error = %e, "cannot make the process non-dumpable");
+        write_termination_message("ImportFailed: cannot make the importer non-dumpable");
+        return ExitCode::FAILURE;
+    }
     if claim_uid.trim().is_empty() {
         tracing::error!("the claim UID is empty");
         write_termination_message("ImportFailed: the claim UID is empty");

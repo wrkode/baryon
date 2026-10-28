@@ -10,6 +10,8 @@ resources:
   - controller/rbac.yaml
   - controller/deployment.yaml
   - policy/vm-resource.yaml
+  - policy/no-ephemeral-containers.yaml
+  - policy/pod-immutable.yaml
   - policy/node-agent.yaml
   - policy/controller-writes.yaml
   - policy/import-approval.yaml

@@ -18,9 +18,9 @@ files are compiled with protox.
 |---|---|
 | `crates/` | Rust workspace members (see [architecture.md](architecture.md)) |
 | `deploy/` | CRDs, namespace, controller and node agent manifests |
-| `deploy/base/policy/` | ValidatingAdmissionPolicies: `vm-resource.yaml`, `node-agent.yaml`, `controller-writes.yaml`, `import-approval.yaml` (Kubernetes 1.30 or later; 1.32 or later for the node agent policy) |
+| `deploy/base/policy/` | ValidatingAdmissionPolicies: `vm-resource.yaml`, `pod-immutable.yaml`, `no-ephemeral-containers.yaml`, `node-agent.yaml`, `controller-writes.yaml`, `import-approval.yaml` (Kubernetes 1.30 or later; 1.32 or later for the node agent policy) |
 | `deploy/base/tenant/` | ClusterRoles for namespace users, aggregated into `edit`, `admin`, and `view` |
-| `packaging/images/` | container images for anchor, node agent, controller |
+| `packaging/images/` | container images for anchor, importer, node agent, controller |
 | `packaging/hadron/` | Baryon-enabled Hadron image |
 | `packaging/versions.env` | pinned host components and checksums |
 | `hack/` | build and check scripts |
@@ -138,7 +138,11 @@ true` ([compatibility.md](compatibility.md); k0s:
 The admission policies in `deploy/base/policy/` are part of the supported
 installation ([security.md](security.md#admission-policies)). With
 `baryon-vm-resource` installed, only baryon-controller can create pods that
-request `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`;
+request `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`,
+and such pods keep the shape the Anchor supervisor check relies on (one
+container, own PID namespace, host user namespace, no capabilities; ADR
+0015); `baryon-pod-immutable` refuses changes of their container images;
+`baryon-no-ephemeral-containers` refuses ephemeral containers in them;
 `baryon-controller-writes` limits baryon-controller's PersistentVolume and
 pod updates to the import record and the import approval; and
 `baryon-import-approval` lets only baryon-controller approve an import.

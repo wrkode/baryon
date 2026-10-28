@@ -150,6 +150,11 @@ async fn import_file(
     size_bytes: u64,
     dir: &Path,
 ) -> anyhow::Result<()> {
+    // One importer per volume: an exclusive lock on the disk directory,
+    // held until the import ends (as O_EXCL does for a block device).
+    let lock = std::fs::File::open(dir).with_context(|| format!("opening {}", dir.display()))?;
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+        .with_context(|| format!("{} is being imported by another process", dir.display()))?;
     let image = dir.join(DISK_IMAGE_NAME);
     let marker = dir.join(MARKER);
     if image.exists() {
@@ -596,6 +601,19 @@ fn to_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    /// A second importer of the same volume is refused before it writes.
+    #[tokio::test]
+    async fn file_import_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::open(dir.path()).unwrap();
+        rustix::fs::flock(&held, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let e = import_file("http://127.0.0.1:9/disk.img", None, 1 << 20, dir.path())
+            .await
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("another process"), "{e:#}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn sparse_write_skips_zero_blocks() {

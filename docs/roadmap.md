@@ -56,8 +56,11 @@ v0.1.0-rc1 is published
 
 | Item | Status | Notes |
 |---|---|---|
-| AnchorService peer checks: no calls from the VMM or the DHCP responder; `Attach` and `Stop` only from the Anchor container's init process | Designed | Finding M1 of 2026-10-27 in [security.md](security.md#review-findings); part of [ADR 0014](adr/0014-guest-access.md), can ship first |
-| Disk import removed from the Anchor runtime: a separate `baryon-importer` binary and image for import Pods | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings) |
+| AnchorService peer checks: no calls from the VMM or the DHCP responder; `Attach` and `Stop` only from the Anchor supervisor | Implemented | Finding M1 of 2026-10-27 in [security.md](security.md#review-findings); [ADR 0015](adr/0015-anchor-authority.md); unit tests, CI API server checks (local run), and E2E on the k0s cluster |
+| VMM and DHCP responder in a PID namespace of their own, so they cannot signal the anchor | Planned | Residual of [ADR 0015](adr/0015-anchor-authority.md); whether Cloud Hypervisor runs correctly as PID 1 is not verified |
+| A seccomp filter in baryon-anchor after startup that denies `execve`, `execveat`, and new processes | Planned | [security.md](security.md) |
+| A per-pod limit on AnchorService connections | Planned | [security.md](security.md) |
+| Disk import removed from the Anchor runtime: a separate `baryon-importer` binary and image for import Pods | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings); unit tests and E2E on the k0s cluster |
 | Device plugin in a separate minimal process | Planned | Finding M2 of the 2026-10-05 release gate review in [security.md](security.md#review-findings) |
 | Separate build and publish jobs in the release workflow | Planned | Only the publish job would hold write tokens |
 | Release workflow check of CI results and `main` ancestry; protected release tags | Planned | Finding L1 of the 2026-10-05 release gate review, accepted for v0.1.0-rc1 ([security.md](security.md#review-findings)) |
@@ -66,7 +69,7 @@ v0.1.0-rc1 is published
 | Decide on `offload_ufo` for the guest NIC | Planned | Finding L3 of 2026-10-27 in [security.md](security.md#review-findings): checksum and TSO offloads accepted, UFO Open |
 | Nested virtualization disabled in the host's KVM module (`kvm_intel.nested=0`, `kvm_amd.nested=0`) | Planned | |
 | AppArmor or SELinux profiles for baryon-virtd and the VMM | Planned | |
-| Kubernetes user namespaces for the Anchor container | Planned (evaluation) | Needs a `/dev` check that works with bind-mounted device nodes |
+| Kubernetes user namespaces for the Anchor container | Not supported | Admission refuses `hostUsers: false` on Baryon pods because the Anchor supervisor check requires the initial user namespace ([ADR 0015](adr/0015-anchor-authority.md)). Adopting them needs a new decision, which would also need a `/dev` check that works with bind-mounted device nodes |
 | An allowlist `.dockerignore` | Planned | |
 
 ## Operations

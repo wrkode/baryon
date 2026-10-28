@@ -110,17 +110,31 @@ Which parts of the API are contract is in
 The API describes intent. It never carries Cloud Hypervisor arguments, host
 paths, PIDs, TAP names, or socket paths.
 
-### Admission policies (Implemented; Tested by the CI API server checks, on the Hadron node, and on the kind host)
+### Admission policies (Implemented; see each policy for its status)
 
-Four ValidatingAdmissionPolicies in `deploy/base/policy/`, part of the supported
+Six ValidatingAdmissionPolicies in `deploy/base/policy/`, part of the supported
 installation (see [security.md](security.md#admission-policies)):
 
 - `vm-resource.yaml` (`baryon-vm-resource`): only the baryon-controller
   service account may create pods that request `virtualization.baryon.io/vm`
   or `virtualization.baryon.io/import`, in any container or init container.
+  Tested by the CI API server checks, on the Hadron node, and on the kind
+  host. Such pods may not set `shareProcessNamespace`, `hostPID`, or
+  `hostUsers: false`, have exactly one container and no init containers,
+  and every container drops all capabilities, adds none, and cannot
+  escalate privileges (ADR 0015; Implemented, CI API server checks pass
+  locally, not yet in CI).
+- `pod-immutable.yaml` (`baryon-pod-immutable`): nobody may change the
+  container images of such pods (ADR 0015, finding M7; Implemented, CI API
+  server checks pass locally, not yet in CI; Tested on the k0s cluster by
+  `tests/e2e/anchor-authority.sh`).
+- `no-ephemeral-containers.yaml` (`baryon-no-ephemeral-containers`): nobody
+  may add ephemeral containers to such pods (ADR 0015; Implemented, CI API
+  server checks pass locally, not yet in CI; Tested on the k0s cluster by
+  `tests/e2e/anchor-authority.sh`).
 - `node-agent.yaml` (`baryon-node-agent-own-node`): baryon-node-agent may
   write only the VirtualizationNode of the node named in its pod-bound
-  service account token.
+  service account token (Tested on the Hadron node and the kind host).
 - `controller-writes.yaml` (`baryon-controller-writes`): baryon-controller
   may update an existing PersistentVolume only by adding the import record
   once, for the claim the volume is bound to, and, on pods labeled
@@ -258,10 +272,15 @@ One pod per running VM, named `<vm>-anchor`, in the VM namespace (ADR 0004):
   "restricted" (admission in a namespace with `enforce=restricted` Tested on
   the kind host)
 
-Its container runs `baryon-anchor run`. It has no init container. Anchor
+Its container runs `baryon-anchor run` as its init process (PID 1), the
+VM's Anchor supervisor: only this process may attach the VM and stop it
+(ADR 0015; Implemented, with unit tests of baryon-virtd's
+check and E2E on the k0s cluster). It
+refuses to run as any other PID, makes itself non-dumpable, and acts on
+SIGTERM only from the container runtime. It has no init container. Anchor
 Pods of earlier releases ran the importer as an init container; the
-controller no longer reads that init container as import evidence. Before attaching, the anchor negotiates the
-runtime protocol with baryon-virtd (ADR 0012): it sends its protocol version
+controller no longer reads that init container as import evidence. Before
+attaching, the anchor negotiates the runtime protocol with baryon-virtd (ADR 0012): it sends its protocol version
 and the features its VM needs, and ends with the termination message
 `ProtocolIncompatible: ...` or `UnsupportedFeature: ...` when the host
 cannot run the VM, so a cluster release and a host image that do not fit
@@ -278,8 +297,13 @@ VM namespace, owned by the VirtualMachine (ADR 0004, ADR 0006):
 - runs `baryon-importer import` from its own image, `baryon-importer`,
   which only import Pods use: the Anchor image does not contain the
   importer, so access to a running Anchor Pod gives no way to re-import
-  or overwrite the VM's disk (finding M2 of 2026-10-27). It runs as the
-  VM's host identity, with the same
+  or overwrite the VM's disk (finding M2 of 2026-10-27). The importer
+  runs only as the container's init process (PID 1), and holds its target
+  exclusively: a lock on the disk directory in filesystem mode, `O_EXCL`
+  on the device in block mode (finding M5, ADR 0015). Implemented: the
+  lock has a unit test, and the PID 1 rule is checked by
+  `tests/e2e/anchor-authority.sh` on the k0s cluster.
+  It runs as the VM's host identity, with the same
   restricted pod and container security context, claim volume, and
   scheduling fields (the VM's placement and Baryon's identity-conflict
   term) as the Anchor Pod; `restartPolicy: OnFailure`. The importer's
@@ -497,7 +521,7 @@ that no longer match.
 | baryon-controller | Kubernetes API | HTTPS | VMs, Pods (Anchor and import Pods), claims, PersistentVolumes (read, and the import record), VirtualizationNodes (read), Events |
 | baryon-node-agent | Kubernetes API | HTTPS | VirtualizationNode, including `status.vms` |
 | kubelet | baryon-node-agent | gRPC, kubelet device plugin socket | slots, allocation |
-| baryon-anchor | baryon-virtd | gRPC over `/run/baryon/anchor/virtd.sock` (0666; peer checks per connection and per attach) | attach, stop, VM status |
+| baryon-anchor | baryon-virtd | gRPC over `/run/baryon/anchor/virtd.sock` (0666; peer checks per connection and per attach; `Attach` and `Stop` only from the Anchor supervisor, ADR 0015) | attach, stop, VM status |
 | baryon-node-agent | baryon-virtd | gRPC over `/run/baryon/node/virtd.sock` (0600 in a 0700 directory; peer uid 0 required) | host info, VM list with each VM's network status |
 | baryon-virtd | Cloud Hypervisor | command line, inherited fds, HTTP over its API socket in the root-only `ctl` directory of the VM runtime directory | VM operations |
 | baryon-virtd | DHCP responder | inherited packet socket; lease as one JSON line on stdin, then a liveness probe line every 10 s; acknowledged leases, checked against the lease, and probe answers as JSON lines on stdout; any other output restarts the responder | guest addressing, liveness |
@@ -515,6 +539,7 @@ also depends on `baryon-version`.
 baryon-controller --> baryon-api, baryon-runtime-api
 baryon-node-agent --> baryon-api, baryon-host, baryon-runtime-api
 baryon-anchor ------> baryon-runtime-api
+baryon-importer ----> baryon-runtime-api
 baryon-virtd -------> baryon-runtime-api, baryon-host, baryon-cloud-hypervisor
 ```
 
@@ -525,7 +550,8 @@ baryon-virtd -------> baryon-runtime-api, baryon-host, baryon-cloud-hypervisor
 | `baryon-cloud-hypervisor` | Cloud Hypervisor command line, API client, events | no |
 | `baryon-runtime-api` | gRPC protocol, the controller-to-anchor spec, the per-VM host identity (`VmIdentity`), and the guest MAC derivation | no |
 | `baryon-virtd` | host runtime daemon | no |
-| `baryon-anchor` | Anchor Pod process and disk importer | no |
+| `baryon-anchor` | Anchor Pod process (the Anchor supervisor) | no |
+| `baryon-importer` | disk importer for import Pods, in its own image | no |
 | `baryon-node-agent` | device plugins and VirtualizationNode publisher | yes |
 | `baryon-controller` | cluster controller | yes |
 | `baryon-version` | build information | no |

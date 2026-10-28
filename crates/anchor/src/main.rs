@@ -13,6 +13,7 @@
 //! first start, and that binary is not part of the Anchor image.
 
 mod run;
+mod term;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -56,6 +57,15 @@ fn main() -> ExitCode {
         .json()
         .flatten_event(true)
         .init();
+    // Nothing is written on refusal: a process started next to the anchor
+    // (for example with kubectl exec) must not touch the readiness or
+    // termination files.
+    if let Command::Run { .. } = args.command
+        && let Err(e) = become_supervisor()
+    {
+        tracing::error!(error = %e, "refusing to run");
+        return ExitCode::FAILURE;
+    }
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -71,6 +81,26 @@ fn main() -> ExitCode {
         Command::Run { socket } => rt.block_on(run::run(socket)),
         Command::Probe => ExitCode::SUCCESS,
     }
+}
+
+/// Conditions of the Anchor supervisor (ADR 0015), set before any other
+/// thread starts: only the container's init process runs the VM, it cannot
+/// be traced or inspected by other processes with its user, and it takes
+/// SIGTERM from the container runtime only (see [`term`]).
+fn become_supervisor() -> Result<(), String> {
+    if std::process::id() != 1 {
+        return Err(format!(
+            "`run` must be the container's init process (PID 1), not PID {}",
+            std::process::id()
+        ));
+    }
+    // Processes with the same uid (started with kubectl exec, or the VM's
+    // VMM and DHCP responder) can then neither ptrace this process nor read
+    // its /proc entries (memory, descriptors, root, environment).
+    rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+        .map_err(|e| format!("cannot make the process non-dumpable: {e}"))?;
+    term::block().map_err(|e| format!("cannot block SIGTERM: {e}"))?;
+    Ok(())
 }
 
 #[cfg(test)]

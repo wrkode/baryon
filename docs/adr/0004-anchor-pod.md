@@ -210,3 +210,8 @@ start.
   import command, so access to a running Anchor Pod (for example through
   `pods/exec`) gives no way to re-import or overwrite the VM's disk
   (security.md, finding M2 of 2026-10-27). The decision is unchanged.
+- 2026-10-27: the Anchor Pod shape is part of the lifecycle authority
+  boundary (ADR 0015): one container whose entrypoint, `baryon-anchor run`,
+  is PID 1 of its own PID namespace; no init containers; no shared process
+  namespace, host PID namespace, user namespace, or ephemeral containers,
+  enforced by admission. The decision is unchanged.

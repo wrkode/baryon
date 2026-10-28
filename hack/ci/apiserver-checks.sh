@@ -225,6 +225,9 @@ spec:
   containers:
     - name: c
       image: busybox:1.36
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: {drop: [ALL]}
       resources:
         limits: {virtualization.baryon.io/vm: "1"}'
 for i in $(seq 1 30); do
@@ -254,6 +257,61 @@ out="$(printf '%s\n' "$initpod" | k apply --dry-run=server -f - 2>&1 || true)"
 echo "$out" | grep -q baryon-vm-resource || { echo "init container requesting the vm resource was not denied: $out" >&2; exit 1; }
 echo "init container vm resource pod denied as expected"
 k run plain --image=busybox:1.36 --dry-run=server -o name
+
+# A Baryon pod keeps its own PID namespace (ADR 0015), even when
+# baryon-controller creates it.
+k apply -f - < deploy/base/controller/rbac.yaml >/dev/null
+as_ctl=(--as=system:serviceaccount:baryon-system:baryon-controller)
+printf '%s\n' "$vmpod" | k "${as_ctl[@]}" apply --dry-run=server -f - >/dev/null \
+  || { echo "baryon-controller could not create a vm resource pod" >&2; exit 1; }
+for field in 'shareProcessNamespace: true' 'hostPID: true' 'hostUsers: false'; do
+  out="$(printf '%s\n' "$vmpod" | sed "s/^spec:$/spec:\n  $field/" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with $field was not denied: $out" >&2; exit 1; }
+  echo "vm resource pod with $field denied as expected"
+done
+
+# Exactly one container and no init containers, even from baryon-controller.
+twopod="$(printf '%s\n' "$vmpod" | sed 's/^spec:$/spec:\n  initContainers:\n    - {name: extra, image: busybox:1.36}/')"
+out="$(printf '%s\n' "$twopod" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
+echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with an init container was not denied: $out" >&2; exit 1; }
+echo "vm resource pod with an init container denied as expected"
+twopod="$(printf '%s\n' "$vmpod" | sed 's/^  containers:$/  containers:\n    - {name: extra, image: busybox:1.36}/')"
+out="$(printf '%s\n' "$twopod" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
+echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with two containers was not denied: $out" >&2; exit 1; }
+echo "vm resource pod with two containers denied as expected"
+
+# Every container drops all capabilities and cannot escalate, even from
+# baryon-controller.
+for sc in 's/drop: \[ALL\]/drop: [NET_RAW]/' 's/allowPrivilegeEscalation: false/allowPrivilegeEscalation: true/' \
+    's/capabilities: {drop: \[ALL\]}/capabilities: {drop: [ALL], add: [NET_ADMIN]}/' 's/allowPrivilegeEscalation: false/privileged: true/' \
+    '/securityContext:/,/capabilities:/d'; do
+  out="$(printf '%s\n' "$vmpod" | sed "$sc" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with security context edit '$sc' was not denied: $out" >&2; exit 1; }
+  echo "vm resource pod with security context edit '$sc' denied as expected"
+done
+
+# Nobody adds ephemeral containers to a Baryon pod.
+printf '%s\n' "$vmpod" | sed 's/name: vm-pod/name: ci-anchor-pod/' | k "${as_ctl[@]}" apply -f - >/dev/null
+for i in $(seq 1 30); do
+  out="$(k debug -n default ci-anchor-pod --image=busybox:1.36 -c "dbg$i" 2>&1 || true)"
+  echo "$out" | grep -q baryon-no-ephemeral-containers && break
+  sleep 2
+done
+echo "$out" | grep -q baryon-no-ephemeral-containers || { echo "ephemeral container on a Baryon pod was not denied: $out" >&2; exit 1; }
+echo "ephemeral container on a Baryon pod denied as expected"
+k run ci-plain --image=busybox:1.36 >/dev/null
+k debug -n default ci-plain --image=busybox:1.36 -c dbg >/dev/null \
+  || { echo "ephemeral container on an ordinary pod was denied" >&2; exit 1; }
+
+# Nobody changes the image of a Baryon pod; ordinary pods are unaffected.
+out="$(k set image -n default pod/ci-anchor-pod c=busybox:1.37 2>&1 || true)"
+echo "$out" | grep -q baryon-pod-immutable || { echo "image change on a Baryon pod was not denied: $out" >&2; exit 1; }
+echo "image change on a Baryon pod denied as expected"
+k label -n default pod/ci-anchor-pod ci-label=1 >/dev/null \
+  || { echo "a label change on a Baryon pod was denied" >&2; exit 1; }
+k set image -n default pod/ci-plain ci-plain=busybox:1.37 >/dev/null \
+  || { echo "image change on an ordinary pod was denied" >&2; exit 1; }
+k delete pod ci-anchor-pod ci-plain -n default --wait=false >/dev/null
 
 # baryon-controller may only add the import record to a PersistentVolume and
 # the import approval to a Baryon pod (policy/controller-writes.yaml).

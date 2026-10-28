@@ -30,6 +30,7 @@ Status values: Proposed, Accepted, Superseded, Rejected.
 | [0012](0012-protocol-versioning.md) | Runtime protocol versions, features, and negotiation | Accepted |
 | [0013](0013-live-migration.md) | Live migration is not supported | Accepted |
 | [0014](0014-guest-access.md) | Guest user data from a Secret and a serial console through the Anchor Pod | Proposed |
+| [0015](0015-anchor-authority.md) | Lifecycle authority belongs to the Anchor supervisor | Accepted |
 
 Template:
 

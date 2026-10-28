@@ -16,7 +16,6 @@ use baryon_runtime_api::v1alpha1::anchor_service_client::AnchorServiceClient;
 use baryon_runtime_api::v1alpha1::{
     AttachRequest, NegotiateRequest, NegotiateResponse, StopRequest, VmPhase, VmStatus,
 };
-use tokio::signal::unix::{SignalKind, signal};
 use tonic::transport::{Channel, Endpoint};
 use tonic::{Code, Status};
 
@@ -84,10 +83,10 @@ pub(crate) async fn run(socket: PathBuf) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let mut term = match signal(SignalKind::terminate()) {
+    let mut term = match crate::term::Term::new() {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!(error = %e, "cannot install SIGTERM handler");
+            tracing::error!(error = %e, "cannot read SIGTERM");
             return ExitCode::FAILURE;
         }
     };
@@ -148,6 +147,16 @@ fn refusal_message(msg: &str) -> String {
     }
 }
 
+/// Exit code for a refused attach: the one baryon-controller acts on for a
+/// host identity conflict, `FAILURE` for every other refusal.
+fn refusal_exit_code(message: &str) -> ExitCode {
+    if message.starts_with("IdentityConflict: ") {
+        ExitCode::from(baryon_runtime_api::IDENTITY_CONFLICT_EXIT_CODE)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// Record that baryon-virtd is unreachable; report not ready once that has
 /// lasted longer than `DISCONNECTED_GRACE`.
 fn mark_disconnected(since: &mut Option<std::time::Instant>) {
@@ -165,7 +174,7 @@ async fn connect(socket: &Path) -> Result<AnchorServiceClient<Channel>, tonic::t
 async fn session(
     client: &mut AnchorServiceClient<Channel>,
     spec: &AnchorSpec,
-    term: &mut tokio::signal::unix::Signal,
+    term: &mut crate::term::Term,
     disconnected_since: &mut Option<std::time::Instant>,
 ) -> Session {
     let required = spec.required_features();
@@ -202,8 +211,9 @@ async fn session(
             return match status.code() {
                 Code::InvalidArgument | Code::FailedPrecondition | Code::PermissionDenied => {
                     tracing::error!(code = ?status.code(), message = status.message(), "attach refused");
-                    write_termination_message(&refusal_message(status.message()));
-                    Session::Done(ExitCode::FAILURE)
+                    let message = refusal_message(status.message());
+                    write_termination_message(&message);
+                    Session::Done(refusal_exit_code(&message))
                 }
                 _ => {
                     tracing::warn!(code = ?status.code(), message = status.message(), "attach failed");
@@ -293,14 +303,38 @@ fn write_status(status: Option<&VmStatus>) {
         }
         None => "VM_PHASE_UNSPECIFIED Disconnected\n".to_owned(),
     };
-    let dir = Path::new(ANCHOR_STATE_DIR);
-    let tmp = dir.join("status.tmp");
-    let result = std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::write(&tmp, line))
-        .and_then(|()| std::fs::rename(&tmp, status_path()));
-    if let Err(e) = result {
+    if let Err(e) = write_status_in(Path::new(ANCHOR_STATE_DIR), &line) {
         tracing::warn!(error = %e, "cannot write readiness status");
     }
+}
+
+/// Write `line` to `<dir>/status` through a new temporary file, without
+/// following symbolic links: other processes of the container can write the
+/// directory (ADR 0015).
+fn write_status_in(dir: &Path, line: &str) -> std::io::Result<()> {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+    match std::fs::create_dir(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
+    }
+    let dirfd = rustix::fs::open(
+        dir,
+        OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    match rustix::fs::unlinkat(&dirfd, "status.tmp", AtFlags::empty()) {
+        Err(rustix::io::Errno::NOENT) | Ok(()) => {}
+        Err(e) => return Err(e.into()),
+    }
+    let fd = rustix::fs::openat(
+        &dirfd,
+        "status.tmp",
+        OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::WRONLY | OFlags::CLOEXEC,
+        Mode::from_raw_mode(0o644),
+    )?;
+    std::io::Write::write_all(&mut std::fs::File::from(fd), line.as_bytes())?;
+    rustix::fs::renameat(&dirfd, "status.tmp", &dirfd, "status")?;
+    Ok(())
 }
 
 /// Readiness: the VM is running and the guest produced boot evidence.
@@ -382,6 +416,27 @@ mod tests {
     }
 
     #[test]
+    fn status_is_written_without_following_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        write_status_in(&state, "VM_PHASE_RUNNING GuestBooted\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(state.join("status")).unwrap(),
+            "VM_PHASE_RUNNING GuestBooted\n"
+        );
+        // A link planted as the temporary file is removed, not followed.
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&outside, state.join("status.tmp")).unwrap();
+        write_status_in(&state, "VM_PHASE_UNSPECIFIED Disconnected\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "unchanged");
+        // A link as the directory itself is refused.
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(&state, &linked).unwrap();
+        assert!(write_status_in(&linked, "x\n").is_err());
+    }
+
+    #[test]
     fn refusals_keep_their_reason() {
         assert_eq!(
             refusal_message("IdentityConflict: another VM on this node"),
@@ -392,5 +447,17 @@ mod tests {
             "AttachRefused: invalid VM spec: vcpus must be between 1 and 256"
         );
         assert_eq!(refusal_message("x"), "AttachRefused: x");
+    }
+
+    #[test]
+    fn only_an_identity_conflict_has_its_exit_code() {
+        let code = |m: &str| format!("{:?}", refusal_exit_code(m));
+        let conflict = format!(
+            "{:?}",
+            ExitCode::from(baryon_runtime_api::IDENTITY_CONFLICT_EXIT_CODE)
+        );
+        assert_eq!(code("IdentityConflict: another VM on this node"), conflict);
+        assert_ne!(code("AttachRefused: x"), conflict);
+        assert_ne!(code("NotAnchorSupervisor: x"), conflict);
     }
 }

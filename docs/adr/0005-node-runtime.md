@@ -180,3 +180,6 @@ Model B, with the VMM placed inside the Anchor container's cgroup:
   installs Cloud Hypervisor's own filter, before the VM is created, so
   Baryon's filter is the only one on that thread only until then; in the
   DHCP responder it remains the only filter. The decision is unchanged.
+- 2026-10-27: ADR 0015 relies on the VMM and the DHCP responder running in
+  baryon-virtd's PID namespace: AnchorService calls from that namespace are
+  refused. The decision is unchanged.

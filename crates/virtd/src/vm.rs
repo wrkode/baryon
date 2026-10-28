@@ -25,7 +25,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -147,6 +147,10 @@ impl AnchorRef {
 enum Command {
     Attach(AnchorRef),
     Detach,
+    /// The init process of another container of the pod attached while this
+    /// VM's anchor was gone: the container that held the VM was replaced.
+    /// The VMM is killed so the new container gets a VM of its own.
+    Replaced,
     Stop {
         grace: Duration,
         final_: bool,
@@ -170,6 +174,14 @@ pub enum AttachError {
     IdentityConflict,
     #[error("the caller (uid {uid}, gid {gid}) does not run as the host identity of VM {vm_uid}")]
     IdentityMismatch { uid: u32, gid: u32, vm_uid: String },
+    /// The caller is not the VM's Anchor supervisor (ADR 0015). The message
+    /// starts with a machine-readable reason.
+    #[error("NotAnchorSupervisor: {0}")]
+    NotAnchorSupervisor(String),
+    /// The VM of this pod belongs to a container that is being replaced; it
+    /// is being stopped and the caller should retry.
+    #[error("the VM of this pod belongs to a previous container and is being stopped; retry")]
+    Superseded,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -186,6 +198,70 @@ pub struct VmEntry {
     block_devices: Mutex<Vec<u64>>,
     status: watch::Sender<VmStatus>,
     cmd: mpsc::Sender<Command>,
+    /// Container cgroup (as in [`PodCgroup::container_path`]) that holds the
+    /// VMM. The VM's anchor is the init process of this container (ADR
+    /// 0015); the VMM dies with the container.
+    container_cgroup: String,
+    /// The anchor process that lifecycle calls are accepted from.
+    anchor: Mutex<Option<RegisteredAnchor>>,
+}
+
+/// The process registered as a VM's anchor.
+#[derive(Debug)]
+struct RegisteredAnchor {
+    pid: i32,
+    pidfd: OwnedFd,
+}
+
+impl RegisteredAnchor {
+    fn of(peer: &AnchorPeer) -> io::Result<Self> {
+        Ok(Self {
+            pid: peer.pid,
+            pidfd: peer.pidfd.try_clone()?,
+        })
+    }
+
+    fn alive(&self) -> bool {
+        crate::peer::pidfd_alive(self.pidfd.as_fd())
+    }
+
+    /// Whether `peer` is this process. The pids are compared first, then
+    /// both pidfds must show their process alive: two live processes never
+    /// share a pid, so the connection's process and the registered one are
+    /// the same.
+    fn is(&self, peer: &AnchorPeer) -> bool {
+        peer.pid == self.pid && crate::peer::pidfd_alive(peer.pidfd.as_fd()) && self.alive()
+    }
+}
+
+impl VmEntry {
+    fn registered(&self) -> std::sync::MutexGuard<'_, Option<RegisteredAnchor>> {
+        self.anchor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether `peer` may stop the VM: its live registered anchor, or, when
+    /// no registered anchor is alive (after a baryon-virtd restart, before
+    /// the anchor reattached), a supervisor in the container that holds the
+    /// VMM, which is then registered as for an attach.
+    fn may_stop(&self, peer: &AnchorPeer) -> bool {
+        let mut registered = self.registered();
+        match registered.as_ref() {
+            Some(a) if a.is(peer) => true,
+            Some(a) if a.alive() => false,
+            _ if peer.cgroup.container_path == self.container_cgroup => {
+                match RegisteredAnchor::of(peer) {
+                    Ok(a) => {
+                        *registered = Some(a);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Ends an anchor session when dropped.
@@ -257,6 +333,10 @@ impl Manager {
         peer: &AnchorPeer,
         spec: VmSpec,
     ) -> Result<(watch::Receiver<VmStatus>, SessionGuard), AttachError> {
+        // Lifecycle authority first (ADR 0015): only an Anchor supervisor,
+        // never a process that merely has the VM's identity.
+        peer.supervisor()
+            .map_err(AttachError::NotAnchorSupervisor)?;
         validate_spec(&spec)?;
         // The controller runs each Anchor Pod as its VM's host identity.
         // Requiring the same identity here means a pod cannot drive a VM it
@@ -276,6 +356,33 @@ impl Manager {
         if let Some(entry) = vms.get(&pod_uid) {
             if entry.spec != spec {
                 return Err(AttachError::SpecMismatch);
+            }
+            {
+                let mut registered = entry.registered();
+                match registered.as_ref() {
+                    // A reconnect of the registered anchor process.
+                    Some(a) if a.is(peer) => {}
+                    // A live anchor is never replaced.
+                    Some(a) if a.alive() => {
+                        return Err(AttachError::NotAnchorSupervisor(
+                            "another process is the anchor of this VM".into(),
+                        ));
+                    }
+                    // No live anchor: after a baryon-virtd restart, or after
+                    // the anchor exited. Only the init of the container that
+                    // holds the VMM may take the VM over.
+                    _ if peer.cgroup.container_path != entry.container_cgroup => {
+                        tracing::info!(pod = %pod_uid, "attach from a new container of the pod; stopping the VM of the previous container");
+                        let _ = entry.cmd.try_send(Command::Replaced);
+                        return Err(AttachError::Superseded);
+                    }
+                    _ => {
+                        *registered = Some(
+                            RegisteredAnchor::of(peer)
+                                .map_err(|e| AttachError::Internal(e.to_string()))?,
+                        );
+                    }
+                }
             }
             let rx = entry.status.subscribe();
             entry
@@ -306,6 +413,10 @@ impl Manager {
             block_devices: Mutex::new(Vec::new()),
             status: status_tx,
             cmd: cmd_tx.clone(),
+            container_cgroup: peer.cgroup.container_path.clone(),
+            anchor: Mutex::new(Some(
+                RegisteredAnchor::of(peer).map_err(|e| AttachError::Internal(e.to_string()))?,
+            )),
         });
         vms.insert(pod_uid.clone(), entry.clone());
         drop(vms);
@@ -316,9 +427,29 @@ impl Manager {
         Ok((status_rx, SessionGuard { cmd: cmd_tx }))
     }
 
-    /// Stop the VM of a pod and wait until it has stopped.
-    pub async fn stop(&self, pod_uid: &str, grace: Duration, final_: bool) -> Option<VmStatus> {
-        let entry = self.lock().get(pod_uid).cloned()?;
+    /// Stop the VM of the caller's pod and wait until it has stopped. Only
+    /// the VM's live registered anchor may (ADR 0015); `Ok(None)` when the
+    /// pod has no VM.
+    pub async fn stop(
+        &self,
+        peer: &AnchorPeer,
+        grace: Duration,
+        final_: bool,
+    ) -> Result<Option<VmStatus>, AttachError> {
+        peer.supervisor()
+            .map_err(AttachError::NotAnchorSupervisor)?;
+        let Some(entry) = self.lock().get(&peer.cgroup.pod_uid).cloned() else {
+            return Ok(None);
+        };
+        if !entry.may_stop(peer) {
+            return Err(AttachError::NotAnchorSupervisor(
+                "only the VM's registered anchor process may stop it".into(),
+            ));
+        }
+        Ok(self.stop_entry(&entry, grace, final_).await)
+    }
+
+    async fn stop_entry(&self, entry: &VmEntry, grace: Duration, final_: bool) -> Option<VmStatus> {
         let (reply, rx) = oneshot::channel();
         if entry
             .cmd
@@ -413,8 +544,16 @@ impl Manager {
         if vmm::start_time(rec.vmm_pid).ok() != Some(rec.vmm_start_time) {
             return Err("process exited during recovery".into());
         }
-        let spec_bytes = record::from_hex(&rec.spec_hex).ok_or("invalid spec encoding")?;
-        let spec = VmSpec::decode(spec_bytes.as_slice()).map_err(|e| e.to_string())?;
+        // From here on the pidfd is the recorded VMM. A record that cannot be
+        // adopted must not leave it running: the reattaching anchor would
+        // start a second VMM on the same disk.
+        let unadoptable = |reason: String| {
+            let _ = vmm::signal(pidfd.as_fd(), rec.vmm_pid, rustix::process::Signal::KILL);
+            format!("{reason}; the VMM was killed")
+        };
+        let spec_bytes = record::from_hex(&rec.spec_hex)
+            .ok_or_else(|| unadoptable("invalid spec encoding".into()))?;
+        let spec = VmSpec::decode(spec_bytes.as_slice()).map_err(|e| unadoptable(e.to_string()))?;
 
         let mut status = initial_status(&rec.pod_uid, &spec, self);
         // Running means the guest showed boot evidence; that is known only
@@ -439,6 +578,14 @@ impl Manager {
 
         let (status_tx, _) = watch::channel(status);
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        // The VMM runs in the Anchor container's cgroup; that container's
+        // init is the only process that may reattach (ADR 0015).
+        let container_cgroup = Path::new(&rec.vmm_cgroup)
+            .strip_prefix(&self.cfg.cgroup_root)
+            .map(|p| format!("/{}", p.display()))
+            .map_err(|_| {
+                unadoptable("the recorded VMM cgroup is outside the cgroup root".into())
+            })?;
         let entry = Arc::new(VmEntry {
             pod_uid: rec.pod_uid.clone(),
             spec,
@@ -446,6 +593,8 @@ impl Manager {
             block_devices: Mutex::new(rec.block_devices.clone()),
             status: status_tx,
             cmd: cmd_tx,
+            container_cgroup,
+            anchor: Mutex::new(None),
         });
         self.lock().insert(rec.pod_uid.clone(), entry.clone());
         self.bump();
@@ -1443,6 +1592,10 @@ impl Supervisor {
                 cmd = self.cmd_rx.recv() => match cmd {
                     Some(Command::Attach(anchor)) => self.on_attach(anchor).await,
                     Some(Command::Detach) => self.on_detach(),
+                    Some(Command::Replaced) => {
+                        tracing::warn!(pod = %self.pod_uid(), "the pod's container was replaced; killing the VMM of the previous container");
+                        self.kill_now("AnchorContainerReplaced");
+                    }
                     Some(Command::Stop { grace, final_, reply }) => {
                         self.stop_replies.push(reply);
                         self.final_stop |= final_;
@@ -1480,7 +1633,9 @@ impl Supervisor {
     /// The anchor process exited. If the pod is being torn down (a final
     /// stop is in progress, or no other process is left in the pod), the
     /// VMM must be gone before kubelet tears down volumes: kill it now.
-    /// Otherwise the anchor container is restarting and may reattach.
+    /// Otherwise the anchor container is restarting: the container runtime
+    /// stops the VMM with the old container's cgroup, and the new
+    /// container's anchor is never registered for this VM (ADR 0015).
     fn on_anchor_exit(&mut self) {
         self.anchor_exited = true;
         if self.final_stop {
@@ -1978,20 +2133,331 @@ mod tests {
         )
     }
 
+    const CONTAINER: &str = "/kubepods.slice/kubepods-podx.slice/cri-containerd-x.scope";
+
+    /// A record that names a live VMM but cannot be adopted kills that VMM
+    /// instead of leaving it running next to the VM the anchor starts again.
+    #[test]
+    fn an_unadoptable_live_vmm_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path().canonicalize().unwrap();
+        let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap();
+        std::fs::copy(sleep, dir.join("cloud-hypervisor")).unwrap();
+        let m = test_manager(&dir);
+        let valid = record::to_hex(&spec().encode_to_vec());
+        for (spec_hex, vmm_cgroup) in [
+            (
+                "zz".to_owned(),
+                dir.join("cgroup").join("x").display().to_string(),
+            ),
+            (valid, "/elsewhere/x".to_owned()),
+        ] {
+            let mut vmm = std::process::Command::new(dir.join("cloud-hypervisor"))
+                .arg("60")
+                .spawn()
+                .unwrap();
+            let pid = i32::try_from(vmm.id()).unwrap();
+            let rec = VmRecord {
+                version: record::RECORD_VERSION,
+                pod_uid: "p".into(),
+                vm_uid: "v".into(),
+                vm_namespace: "default".into(),
+                vm_name: "vm1".into(),
+                spec_hex,
+                vmm_pid: pid,
+                vmm_start_time: vmm::start_time(pid).unwrap(),
+                vmm_uid: 1_000_000_123,
+                pod_interface: "eth0".into(),
+                vmm_cgroup,
+                pod_cgroup: String::new(),
+                hypervisor_version: "v53.0".into(),
+                started_at_unix_ms: 1,
+                guest_mac: "02:00:00:00:00:01".into(),
+                guest_booted_at_unix_ms: 0,
+                block_devices: vec![],
+                dhcp_last_ack_unix_ms: 0,
+            };
+            let err = m.adopt(&rec).unwrap_err();
+            assert!(err.contains("the VMM was killed"), "{err}");
+            let status = vmm.wait().unwrap();
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL)
+            );
+            assert!(m.lock().is_empty());
+        }
+    }
+
+    /// A peer that is the init of a container PID namespace (the Anchor
+    /// supervisor), with the namespaces of a container.
     fn peer(uid: u32, gid: u32, pod_uid: &str) -> AnchorPeer {
-        let me = rustix::process::getpid();
+        peer_of(rustix::process::getpid(), uid, gid, pod_uid)
+    }
+
+    fn peer_of(pid: rustix::process::Pid, uid: u32, gid: u32, pod_uid: &str) -> AnchorPeer {
+        let own = crate::peer::own_namespaces().unwrap();
+        let other = |n: crate::peer::NsId| crate::peer::NsId {
+            dev: n.dev,
+            ino: n.ino.wrapping_add(1000),
+        };
         AnchorPeer {
-            pid: me.as_raw_nonzero().get(),
+            pid: pid.as_raw_nonzero().get(),
             uid,
             gid,
             groups: vec![gid],
-            pidfd: rustix::process::pidfd_open(me, rustix::process::PidfdFlags::empty()).unwrap(),
+            pidfd: rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap(),
             cgroup: PodCgroup {
                 pod_uid: pod_uid.into(),
                 pod_path: "/kubepods.slice/kubepods-podx.slice".into(),
-                container_path: "/kubepods.slice/kubepods-podx.slice/cri-containerd-x.scope".into(),
+                container_path: CONTAINER.into(),
+            },
+            nspid: vec![pid.as_raw_nonzero().get(), 1],
+            namespaces: crate::peer::Namespaces {
+                user: own.user,
+                pid: other(own.pid),
+                mnt: other(own.mnt),
+                net: other(own.net),
             },
         }
+    }
+
+    /// An entry for `pod` as if created by an anchor, without a supervisor;
+    /// returns the command receiver to observe what the manager sends.
+    fn bound_entry(
+        m: &Manager,
+        pod: &str,
+        anchor: Option<RegisteredAnchor>,
+    ) -> mpsc::Receiver<Command> {
+        let (status, _) = watch::channel(VmStatus::default());
+        let (cmd, cmd_rx) = mpsc::channel(4);
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        m.lock().insert(
+            pod.into(),
+            Arc::new(VmEntry {
+                pod_uid: pod.into(),
+                spec: spec(),
+                vmm_uid: id.uid(),
+                block_devices: Mutex::new(Vec::new()),
+                status,
+                cmd,
+                container_cgroup: CONTAINER.into(),
+                anchor: Mutex::new(anchor),
+            }),
+        );
+        cmd_rx
+    }
+
+    /// A live process other than the test process.
+    fn other_process() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap()
+    }
+
+    fn registered(pid: u32) -> RegisteredAnchor {
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        RegisteredAnchor {
+            pid: pid.as_raw_nonzero().get(),
+            pidfd: rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap(),
+        }
+    }
+
+    /// Finding M1 of 2026-10-27: processes with the VM's identity that are
+    /// not the Anchor supervisor cannot attach, and a refused attach creates
+    /// nothing.
+    #[test]
+    fn only_the_anchor_supervisor_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        let own = crate::peer::own_namespaces().unwrap();
+
+        // A process started with kubectl exec in the Anchor container.
+        let mut exec = peer(id.uid(), id.gid(), "pod-a");
+        exec.nspid = vec![exec.pid, 27];
+        // The VMM or the DHCP responder: the host PID and mount namespaces.
+        let mut vmm = peer(id.uid(), id.gid(), "pod-a");
+        vmm.nspid = vec![vmm.pid];
+        vmm.namespaces.pid = own.pid;
+        vmm.namespaces.mnt = own.mnt;
+        // A process that created a user and a PID namespace to be PID 1.
+        let mut nested = peer(id.uid(), id.gid(), "pod-a");
+        nested.namespaces.user.ino = own.user.ino.wrapping_add(1);
+        for p in [exec, vmm, nested] {
+            match m.attach(&p, spec()) {
+                Err(e @ AttachError::NotAnchorSupervisor(_)) => {
+                    assert!(e.to_string().starts_with("NotAnchorSupervisor: "));
+                }
+                other => panic!("expected NotAnchorSupervisor, got {other:?}"),
+            }
+        }
+        assert!(m.list().is_empty(), "a refused attach must not create a VM");
+    }
+
+    #[test]
+    fn a_live_anchor_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        let mut child = other_process();
+        let mut rx = bound_entry(&m, "pod-a", Some(registered(child.id())));
+        // Another container init of the same container cgroup, while the
+        // registered anchor lives.
+        match m.attach(&peer(id.uid(), id.gid(), "pod-a"), spec()) {
+            Err(AttachError::NotAnchorSupervisor(msg)) => assert!(msg.contains("another process")),
+            other => panic!("expected NotAnchorSupervisor, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "nothing reaches the supervisor");
+        // The registered process itself reconnects.
+        let anchor = peer_of(
+            rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+            id.uid(),
+            id.gid(),
+            "pod-a",
+        );
+        assert!(m.attach(&anchor, spec()).is_ok());
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(_))));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn without_a_live_anchor_only_the_vmms_container_takes_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        // After a baryon-virtd restart: no anchor registered. A container
+        // init of another container of the pod is not taken; the VM of the
+        // previous container is stopped and the caller retries.
+        let mut rx = bound_entry(&m, "pod-a", None);
+        let mut other = peer(id.uid(), id.gid(), "pod-a");
+        other.cgroup.container_path = format!("{CONTAINER}-new");
+        assert!(matches!(
+            m.attach(&other, spec()),
+            Err(AttachError::Superseded)
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Command::Replaced)));
+        // The init of the VMM's container is taken and registered.
+        assert!(m.attach(&peer(id.uid(), id.gid(), "pod-a"), spec()).is_ok());
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(_))));
+
+        // The registered anchor exited (its container is restarting): the
+        // same rule applies.
+        let mut child = other_process();
+        let dead = registered(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut rx = bound_entry(&m, "pod-b", Some(dead));
+        let mut other_b = peer(id.uid(), id.gid(), "pod-b");
+        other_b.cgroup.container_path = format!("{CONTAINER}-new");
+        assert!(matches!(
+            m.attach(&other_b, spec()),
+            Err(AttachError::Superseded)
+        ));
+        assert!(matches!(rx.try_recv(), Ok(Command::Replaced)));
+        assert!(m.attach(&peer(id.uid(), id.gid(), "pod-b"), spec()).is_ok());
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(_))));
+    }
+
+    #[tokio::test]
+    async fn only_the_registered_anchor_stops_the_vm() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        let mut child = other_process();
+        let rx = bound_entry(&m, "pod-a", Some(registered(child.id())));
+        drop(rx);
+        // The test process is a container init of the pod but not the
+        // registered anchor.
+        match m
+            .stop(&peer(id.uid(), id.gid(), "pod-a"), Duration::ZERO, true)
+            .await
+        {
+            Err(AttachError::NotAnchorSupervisor(msg)) => {
+                assert!(msg.contains("registered anchor"))
+            }
+            other => panic!("expected NotAnchorSupervisor, got {other:?}"),
+        }
+        // A process started with kubectl exec.
+        let mut exec = peer(id.uid(), id.gid(), "pod-a");
+        exec.nspid = vec![exec.pid, 27];
+        assert!(matches!(
+            m.stop(&exec, Duration::ZERO, true).await,
+            Err(AttachError::NotAnchorSupervisor(_))
+        ));
+        // The registered anchor may; with the supervisor gone the current
+        // status is returned.
+        let anchor = peer_of(
+            rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+            id.uid(),
+            id.gid(),
+            "pod-a",
+        );
+        assert!(matches!(
+            m.stop(&anchor, Duration::ZERO, true).await,
+            Ok(Some(_))
+        ));
+        // A pod without a VM: nothing to stop.
+        assert!(matches!(
+            m.stop(&peer(id.uid(), id.gid(), "pod-z"), Duration::ZERO, true)
+                .await,
+            Ok(None)
+        ));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// The registered anchor is matched by its pid and a live pidfd of the
+    /// caller as well: a connection whose process is gone does not match a
+    /// registered process that now has the same pid.
+    #[test]
+    fn a_dead_caller_never_matches_the_registered_anchor() {
+        let mut child = other_process();
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        let reg = registered(child.id());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        let mut caller = peer_of(pid, id.uid(), id.gid(), "pod-a");
+        assert!(reg.is(&caller));
+        let mut gone = other_process();
+        caller.pidfd = rustix::process::pidfd_open(
+            rustix::process::Pid::from_raw(gone.id() as i32).unwrap(),
+            rustix::process::PidfdFlags::empty(),
+        )
+        .unwrap();
+        gone.kill().unwrap();
+        gone.wait().unwrap();
+        assert!(!reg.is(&caller));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// After a baryon-virtd restart, before the anchor reattached, the
+    /// anchor's Stop is accepted by the takeover rule of Attach: only from
+    /// the container that holds the VMM, which is then registered.
+    #[tokio::test]
+    async fn stop_before_reattach_follows_the_takeover_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = test_manager(dir.path());
+        let id = VmIdentity::for_vm(&spec().vm_uid).unwrap();
+        let rx = bound_entry(&m, "pod-a", None);
+        drop(rx);
+        let mut other = peer(id.uid(), id.gid(), "pod-a");
+        other.cgroup.container_path = format!("{CONTAINER}-new");
+        assert!(matches!(
+            m.stop(&other, Duration::ZERO, true).await,
+            Err(AttachError::NotAnchorSupervisor(_))
+        ));
+        let anchor = peer(id.uid(), id.gid(), "pod-a");
+        assert!(matches!(
+            m.stop(&anchor, Duration::ZERO, true).await,
+            Ok(Some(_))
+        ));
+        let entry = m.lock().get("pod-a").cloned().unwrap();
+        assert!(entry.registered().as_ref().is_some_and(|a| a.is(&anchor)));
     }
 
     #[test]
@@ -2026,6 +2492,8 @@ mod tests {
                 block_devices: Mutex::new(devs),
                 status,
                 cmd,
+                container_cgroup: CONTAINER.into(),
+                anchor: Mutex::new(None),
             })
         };
         let dev = rustix::fs::makedev(251, 0);
@@ -2064,6 +2532,8 @@ mod tests {
                 block_devices: Mutex::new(Vec::new()),
                 status,
                 cmd,
+                container_cgroup: CONTAINER.into(),
+                anchor: Mutex::new(None),
             }),
         );
         let err = m

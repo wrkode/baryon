@@ -98,6 +98,7 @@ COPY --from=manifest /out/components.json /usr/share/baryon/components.json
 COPY --chmod=0644 packaging/hadron/files/usr/lib/systemd/system/baryon-virtd.service /usr/lib/systemd/system/baryon-virtd.service
 COPY --chmod=0644 packaging/hadron/files/usr/lib/modules-load.d/baryon.conf /usr/lib/modules-load.d/baryon.conf
 COPY --chmod=0644 packaging/hadron/files/usr/lib/tmpfiles.d/baryon.conf /usr/lib/tmpfiles.d/baryon.conf
+COPY --chmod=0644 packaging/hadron/files/usr/lib/sysctl.d/50-baryon.conf /usr/lib/sysctl.d/50-baryon.conf
 
 FROM ${HADRON_IMAGE} AS image
 ARG BARYON_VERSION

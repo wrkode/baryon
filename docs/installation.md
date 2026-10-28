@@ -631,7 +631,8 @@ Baryon has two parts that are upgraded separately
 ([version skew](compatibility.md#version-skew)):
 
 - the cluster release: CRDs, baryon-controller, baryon-node-agent, the
-  anchor image, RBAC, admission policies; upgraded with `kubectl apply`
+  anchor and importer images, RBAC, admission policies; upgraded with
+  `kubectl apply`
 - the host image: the Baryon-enabled Hadron image with baryon-virtd and
   Cloud Hypervisor; upgraded through Kairos, one node at a time
 

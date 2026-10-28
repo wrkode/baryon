@@ -544,6 +544,9 @@ host identity, so baryon-virtd refused this one there.
 
 What happens: baryon-controller replaces the Anchor Pod and keeps the new
 one off the recorded nodes; no action is needed while another node fits.
+It does so only when the anchor exited with code 3 as well as the
+message, so an Anchor Pod with a v0.1.0-rc1 anchor (exit code 1) stays on
+the node; delete that pod to replace it with the current anchor image.
 On a cluster where every Baryon node is recorded, the VM stays not ready.
 Status: Implemented, unit tests; not exercised on a cluster.
 
@@ -556,6 +559,29 @@ kubectl get virtualmachine <vm> -n <namespace> -o jsonpath='{.status.identityCon
 Fix when no node is left: stop the VM (`runPolicy: Stopped`, which clears
 the list) and start it again after the conflicting VM is gone
 ([Host identity](api.md#host-identity)).
+
+### NotAnchorSupervisor
+
+Symptom: `Running` and `Ready` False with reason `NotAnchorSupervisor`.
+baryon-virtd refused the anchor: it is the init process of its container,
+but not in the initial user namespace, or in baryon-virtd's mount or
+network namespace (ADR 0015).
+
+Cause: the node's container runtime does not meet the
+[node requirements](compatibility.md#kubernetes-requirements), for example
+a rootless runtime or one that runs containers in a user namespace.
+Baryon pods cannot request a user namespace through the API (admission
+refuses `hostUsers: false`), so the cause is node or runtime configuration.
+
+Confirm on the node: `journalctl -u baryon-virtd` shows `attach refused`
+with the pod UID and the reason.
+
+Related symptom: the Anchor container restarts repeatedly, its log shows
+`refusing to run` with "must be the container's init process", and the VM
+reports no reason from baryon-virtd. The anchor is not PID 1 of its
+container: the runtime injects an init process or shares a PID namespace
+between containers. The anchor refuses before it connects and writes no
+termination message.
 
 ### NetworkReady False or Unknown
 

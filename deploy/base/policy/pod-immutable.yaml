@@ -1,0 +1,56 @@
+# Nobody may change the container images of a pod that requests the
+# virtualization.baryon.io/vm or virtualization.baryon.io/import extended
+# resources, that is, of Anchor Pods and import Pods (ADR 0015).
+#
+# The image of a container is a mutable field of a pod, and kubelet restarts
+# a container whose image changed regardless of the pod's restart policy. The
+# new image's entrypoint would be the init process of the Anchor container,
+# and so the VM's Anchor supervisor, or the importer of an approved import
+# Pod with the claim mounted. baryon-controller never changes an image: it
+# replaces the pod instead. Only `pods` is matched, so `pods/status`,
+# `pods/resize`, and the metadata patches of baryon-controller are not
+# affected; `pods/ephemeralcontainers` has its own policy.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-pod-immutable
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: requests-baryon-resource
+      expression: >-
+        [oldObject.spec.containers,
+         has(oldObject.spec.initContainers) ? oldObject.spec.initContainers : []].exists(cs,
+          cs.exists(c, has(c.resources) &&
+            ['virtualization.baryon.io/vm', 'virtualization.baryon.io/import'].exists(r,
+              (has(c.resources.limits) && r in c.resources.limits) ||
+              (has(c.resources.requests) && r in c.resources.requests))))
+  validations:
+    - expression: >-
+        object.spec.containers.all(c, oldObject.spec.containers.exists(o,
+          o.name == c.name && o.image == c.image)) &&
+        (!has(object.spec.initContainers) || object.spec.initContainers.all(c,
+          has(oldObject.spec.initContainers) && oldObject.spec.initContainers.exists(o,
+            o.name == c.name && o.image == c.image)))
+      message: "the container images of Baryon Anchor Pods and import Pods cannot be changed"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-pod-immutable
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-pod-immutable
+  validationActions: [Deny]

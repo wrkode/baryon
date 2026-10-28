@@ -1,7 +1,7 @@
 # 0009: gRPC over Unix sockets between node components and baryon-virtd
 
 Status: Accepted
-Date: 2026-10-02, revised 2026-10-03
+Date: 2026-10-02, revised 2026-10-03 and 2026-10-27
 
 ## Context
 
@@ -21,10 +21,15 @@ disks from the caller's process (ADR 0005, ADR 0006).
   `baryon.runtime.v1alpha1`, defined in `crates/runtime-api/proto/`, compiled
   with protox so no `protoc` is needed.
 - Two sockets with separate services:
-  - `/run/baryon/anchor/virtd.sock`: `AnchorService` (`Attach` server stream,
-    `Stop`). A caller can only act on the VM of its own pod, identified from
-    peer credentials; requests from processes that are not in a pod cgroup or
-    run as root are refused.
+  - `/run/baryon/anchor/virtd.sock`: `AnchorService` (`Negotiate`, from
+    ADR 0012; `Attach` server stream; `Stop`). A caller can only act on
+    the VM of its own pod, identified from peer credentials; requests from processes that are not in a pod cgroup or
+    run as root are refused. Peer credentials and the VM's host identity
+    prove that the caller belongs to the VM's runtime context, not that it
+    may control the VM: `Attach` and `Stop` are accepted only from the VM's
+    Anchor supervisor (ADR 0015). `Negotiate` is read-only and names no
+    VM; it is refused from baryon-virtd's PID namespace, where the VMM and
+    the DHCP responder run.
   - `/run/baryon/node/virtd.sock`: `NodeService` (`GetRuntimeInfo`,
     `GetHost`, `WatchVms`). Read-only.
 - Both report `RuntimeInfo` (baryon-virtd version, protocol, Cloud Hypervisor
@@ -58,7 +63,9 @@ disks from the caller's process (ADR 0005, ADR 0006).
   can reach the anchor socket. The ValidatingAdmissionPolicy in
   `deploy/base/policy/vm-resource.yaml` lets only baryon-controller create pods
   that request it, and baryon-virtd requires the caller to run as the host
-  identity of the VM it names (see [security.md](../security.md)).
+  identity of the VM it names (see [security.md](../security.md)). The
+  identity check alone is not lifecycle authority; ADR 0015 defines who may
+  call `Attach` and `Stop`.
 - The node socket is owner-only (0600 in a 0700 directory) and NodeService
   additionally requires peer uid 0, which baryon-node-agent has (without
   capabilities).
@@ -104,3 +111,7 @@ disks from the caller's process (ADR 0005, ADR 0006).
 - 2026-10-03: baryon-virtd accepts only the two Anchor container disk paths
   with their kinds; the note to replace the path with a disk slot at the
   next major version was recorded.
+- 2026-10-27: the identity check no longer authorizes lifecycle calls on
+  its own; `Attach` and `Stop` require the Anchor supervisor (ADR 0015;
+  finding M1 of 2026-10-27). `Negotiate` (ADR 0012) is listed
+  with its caller rule.

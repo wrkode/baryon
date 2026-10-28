@@ -122,9 +122,9 @@ carries `-dirty`; release builds come from the clean tag and never do.
    `git push origin v<version>`. The workflow builds, publishes, and
    creates the GitHub release; a version with a prerelease part becomes a
    prerelease. It creates attestations only when the repository is public.
-6. If the repository is public, make the four ghcr.io packages
+6. If the repository is public, make the five ghcr.io packages
    (`baryon-controller`, `baryon-node-agent`, `baryon-anchor`,
-   `baryon-hadron`) public in their package settings on GitHub. Packages
+   `baryon-importer`, `baryon-hadron`) public in their package settings on GitHub. Packages
    published from a personal account start private, and the images must
    be public for an installation without credentials. While the
    repository is private, this step does not apply: its packages stay

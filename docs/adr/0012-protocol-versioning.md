@@ -105,7 +105,8 @@ express a breaking change except changing the package.
 - Cluster objects of the previous release: the controller of release N
   understands Anchor Pods of release N-1 that are still running: the reason
   vocabulary in their termination messages (for example
-  `IdentityConflict`), the container names `anchor` and `import`, the
+  `IdentityConflict`) together with the anchor exit codes that go with
+  them (ADR 0015), the container names `anchor` and `import`, the
   annotations `virtualization.baryon.io/spec-hash` and
   `virtualization.baryon.io/restartedAt`, and, for disks imported by an
   earlier release, the claim annotation `virtualization.baryon.io/imported-from`
@@ -192,3 +193,9 @@ express a breaking change except changing the package.
   (ADR 0008 revision of 2026-10-05). A host report whose schema version
   the node agent does not read is reported `ProtocolIncompatible`, not
   `RuntimeUnreachable`.
+- 2026-10-28: the anchor's exit code is part of the termination message
+  contract. baryon-controller acts on an `IdentityConflict` only with the
+  anchor's dedicated exit code 3 (ADR 0015). Exception for the move from
+  v0.1.0-rc1: an rc1 anchor exits with 1 on an identity conflict, so a new
+  controller does not move that VM away from the node; the VM stays not
+  ready there until its Anchor Pod is replaced.
