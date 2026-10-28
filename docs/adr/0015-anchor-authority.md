@@ -222,9 +222,10 @@ Defense in depth:
 
 The policies are ValidatingAdmissionPolicies with `failurePolicy: Fail`.
 The API server checks in `hack/ci/apiserver-checks.sh` cover every rule
-above; they pass against a local k0s API server and are not yet run in
-CI. `tests/e2e/anchor-authority.sh` also checks the ephemeral container
-and image change refusals on a cluster of Baryon nodes.
+above; they pass in CI (the `crds` job, a single-node k0s API server in a
+container, which is not a Baryon node). `tests/e2e/anchor-authority.sh`
+also checks the ephemeral container and image change refusals on a
+cluster of Baryon nodes.
 
 Cluster administrators remain trusted. They can remove or change these
 policies, create privileged or host-namespace pods, and act on nodes as
@@ -355,9 +356,9 @@ new:
 - The check depends on `SO_PEERPIDFD` (Linux 6.5 or later, already
   required) and on the `NSpid` field in pidfd fdinfo, present on the same
   kernels.
-- The console bridge of ADR 0014 has no lifecycle authority. Any future
-  process that needs it requires its own decision; no process inherits it
-  from the VM's identity.
+- The console session processes of ADR 0014 (`baryon-anchor console`)
+  have no lifecycle authority. Any future process that needs it requires
+  its own decision; no process inherits it from the VM's identity.
 
 ## Alternatives considered
 
@@ -397,3 +398,6 @@ new:
 - 2026-10-28: Accepted after the architecture and security reviews and
   the E2E anchor authority and regression suites on the k0s cluster
   (docs/testing.md).
+- 2026-10-28: the reference to ADR 0014 names its console session
+  processes; ADR 0014 chose `pods/exec`, which has no console bridge
+  container.

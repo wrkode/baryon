@@ -122,15 +122,15 @@ installation (see [security.md](security.md#admission-policies)):
   host. Such pods may not set `shareProcessNamespace`, `hostPID`, or
   `hostUsers: false`, have exactly one container and no init containers,
   and every container drops all capabilities, adds none, and cannot
-  escalate privileges (ADR 0015; Implemented, CI API server checks pass
-  locally, not yet in CI).
+  escalate privileges (ADR 0015; Implemented, CI API server checks pass in
+  CI).
 - `pod-immutable.yaml` (`baryon-pod-immutable`): nobody may change the
   container images of such pods (ADR 0015, finding M7; Implemented, CI API
-  server checks pass locally, not yet in CI; Tested on the k0s cluster by
+  server checks pass in CI; Tested on the k0s cluster by
   `tests/e2e/anchor-authority.sh`).
 - `no-ephemeral-containers.yaml` (`baryon-no-ephemeral-containers`): nobody
   may add ephemeral containers to such pods (ADR 0015; Implemented, CI API
-  server checks pass locally, not yet in CI; Tested on the k0s cluster by
+  server checks pass in CI; Tested on the k0s cluster by
   `tests/e2e/anchor-authority.sh`).
 - `node-agent.yaml` (`baryon-node-agent-own-node`): baryon-node-agent may
   write only the VirtualizationNode of the node named in its pod-bound

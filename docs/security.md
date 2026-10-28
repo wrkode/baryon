@@ -28,10 +28,13 @@ release workflow, the supply chain, and the node agent's privileges (see
 [Release and supply chain](#release-and-supply-chain)).
 Findings and their resolution are listed in
 [Review findings](#review-findings).
-On 2026-10-27 ADR 0014 (guest user data from a Secret and a serial console
-through the Anchor Pod; Proposed) and the move to Cloud Hypervisor v54.0
+On 2026-10-27 ADR 0014 (guest configuration from a Secret and a serial
+console through the Anchor Pod) and the move to Cloud Hypervisor v54.0
 were reviewed, and on 2026-10-27 and 2026-10-28 two gate reviews covered
-the M1 and M2 fixes (ADR 0015, Accepted) ([Review findings](#review-findings)).
+the M1 and M2 fixes (ADR 0015, Accepted). On 2026-10-28 the rewritten
+ADR 0014 (`spec.guestConfig.userDataSecretRef`, the seed built by
+baryon-anchor, the console through `pods/exec`; Accepted as a design) was
+reviewed ([Review findings](#review-findings)).
 
 ## Trust boundaries
 
@@ -152,7 +155,7 @@ that.
 
 | Socket | Mode | Directory | Authorization | Status |
 |---|---|---|---|---|
-| `/run/baryon/anchor/virtd.sock` | 0666 | `/run/baryon/anchor`, 0755 | Per connection: `SO_PEERCRED` and `SO_PEERPIDFD`; the caller must be non-root and in a pod cgroup. Per attach: the caller's uid and gid must equal the host identity of the VM named in the request (`IdentityMismatch` otherwise), and no other VM on the node may have that identity (`IdentityConflict`). `Attach` and `Stop` additionally require the VM's Anchor supervisor (ADR 0015, `NotAnchorSupervisor` otherwise); no call is accepted from baryon-virtd's PID namespace. | Implemented, Tested (identity check); the conflict refusal and the supervisor check are Implemented with unit tests |
+| `/run/baryon/anchor/virtd.sock` | 0666 | `/run/baryon/anchor`, 0755 | Per connection: `SO_PEERCRED` and `SO_PEERPIDFD`; the caller must be non-root and in a pod cgroup. Per attach: the caller's uid and gid must equal the host identity of the VM named in the request (`IdentityMismatch` otherwise), and no other VM on the node may have that identity (`IdentityConflict`). `Attach` and `Stop` additionally require the VM's Anchor supervisor (ADR 0015, `NotAnchorSupervisor` otherwise); no call is accepted from baryon-virtd's PID namespace. `Console` (ADR 0014, Designed): only from a process in the container cgroup that holds the VM's VMM, with the VM's host identity, outside baryon-virtd's PID namespace and in the registered anchor's PID namespace; refused while the VM has no live registered anchor; never lifecycle authority. Per pod UID, bounded concurrent connections and `Console` streams, and identification off the accept loop with a timeout (Designed; today the socket has no per-pod limits). | Implemented, Tested (identity check); the conflict refusal and the supervisor check are Implemented with unit tests |
 | `/run/baryon/node/virtd.sock` | 0600, root | `/run/baryon/node`, 0700 | File mode, and NodeService requires peer uid 0 | Implemented, Tested |
 | `/run/baryon/vms/<pod-uid>/ctl/api.sock` (Cloud Hypervisor API) | root | `ctl`, 0700, root | File permissions only; the REST API has no authentication. baryon-virtd binds it and passes the listener fd to the VMM, which never needs the path. | Implemented, Tested |
 | `/run/baryon/vms/<pod-uid>/vmm/serial.sock` | created by the VMM | `vmm`, a private tmpfs, 0700, owned by the VM's identity | File permissions; baryon-virtd connects only through a checked `O_PATH` descriptor (see VMM confinement) | Implemented, Tested |
@@ -174,8 +177,8 @@ spec and become the VM's anchor (finding M1 of 2026-10-27).
 Lifecycle authority (ADR 0015). Status: Implemented, with unit
 tests in `crates/virtd/src/peer.rs`, `crates/virtd/src/vm.rs`,
 `crates/anchor/src/term.rs`, and `crates/anchor/src/run.rs`, and the CI API
-server checks for admission (passed on a local k0s API server, not yet run
-in CI); the E2E `tests/e2e/anchor-authority.sh` (Kubernetes paths: exec,
+server checks for admission (pass in CI); the E2E
+`tests/e2e/anchor-authority.sh` (Kubernetes paths: exec,
 ephemeral containers, image changes, container restart, Anchor Pod
 replacement, baryon-virtd restart, node reboot, deletion) passes on the
 k0s cluster. baryon-virtd's refusal of exec'd processes, the VMM,
@@ -292,15 +295,15 @@ the k0s cluster, which runs with both installed and checks that a namespace
 user cannot set an import approval (see [testing.md](testing.md#results)).
 `baryon-pod-immutable`, `baryon-no-ephemeral-containers`, and the ADR 0015
 rules of `baryon-vm-resource` are Implemented; their CI API server checks
-pass on a local k0s API server and have not yet run in CI, and
+pass in CI, and
 `tests/e2e/anchor-authority.sh` checks the image change and ephemeral
 container refusals on the k0s cluster.
 
 | Policy | Rule |
 |---|---|
-| `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. Such pods may not set `shareProcessNamespace`, `hostPID`, or `hostUsers: false`, have exactly one container and no init containers, and every container drops all capabilities, adds none, and is neither privileged nor allowed to escalate privileges (ADR 0015). CI checks: each is denied even for baryon-controller; these checks pass on a local k0s API server, not yet in CI. |
-| `baryon-pod-immutable` | Nobody may change the container images of a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015, finding M7). kubelet restarts a container whose image changed regardless of the restart policy, so without this policy a namespace user who can update pods would run an image of their choice as the Anchor supervisor, or as the importer with the approval and the claim mounted. CI checks: changing the image of a pod that requests the vm resource is denied, a label change on it is allowed, and changing the image of another pod is allowed. Status: Implemented; the CI API server checks pass on a local k0s API server, not yet in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod and import Pod) |
-| `baryon-no-ephemeral-containers` | Nobody may add ephemeral containers to a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015). An ephemeral container is never allocated the vm resource and gets no anchor socket; the policy keeps an image of the requester's choice from running as the VM's identity with the pod's volumes and network namespace. CI checks: adding an ephemeral container to a pod that requests the vm resource is denied; to another pod it is allowed. Status: Implemented; the CI API server checks pass on a local k0s API server, not yet in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod) |
+| `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. Such pods may not set `shareProcessNamespace`, `hostPID`, or `hostUsers: false`, have exactly one container and no init containers, and every container drops all capabilities, adds none, and is neither privileged nor allowed to escalate privileges (ADR 0015). CI checks: each is denied even for baryon-controller; these checks pass in CI. Designed (ADR 0014): the same restriction for the placement-only feature resource of guest configuration, and `hostIPC` is refused. |
+| `baryon-pod-immutable` | Nobody may change the container images of a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015, finding M7). kubelet restarts a container whose image changed regardless of the restart policy, so without this policy a namespace user who can update pods would run an image of their choice as the Anchor supervisor, or as the importer with the approval and the claim mounted. CI checks: changing the image of a pod that requests the vm resource is denied, a label change on it is allowed, and changing the image of another pod is allowed. Status: Implemented; the CI API server checks pass in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod and import Pod) |
+| `baryon-no-ephemeral-containers` | Nobody may add ephemeral containers to a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015). An ephemeral container is never allocated the vm resource and gets no anchor socket; the policy keeps an image of the requester's choice from running as the VM's identity with the pod's volumes and network namespace. CI checks: adding an ephemeral container to a pod that requests the vm resource is denied; to another pod it is allowed. Status: Implemented; the CI API server checks pass in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod) |
 | `baryon-node-agent-own-node` | baryon-node-agent may create or update only the VirtualizationNode named after the node in its token (`userInfo.extra["authentication.kubernetes.io/node-name"]`). Requests without that information are denied. |
 | `baryon-controller-writes` | Updates of PersistentVolumes and pods by baryon-controller. A PersistentVolume may only gain the annotation `virtualization.baryon.io/disk-import` when it has none, with spec, labels, finalizers, owner references, and every other annotation unchanged; the volume must be Bound, and the record must have the form `{"vmUID":"<uuid>","claimUID":"<claimRef.uid>","source":"sha256:<64 hex>"}` with the volume's own `claimRef.uid`. A pod update may change only the annotations `virtualization.baryon.io/import-approved` and `virtualization.baryon.io/vm-label-keys` and labels whose key is not reserved, with spec, finalizers, owner references, and every other annotation unchanged, and only on pods labeled `app.kubernetes.io/managed-by=baryon`. Reserved keys: `app.kubernetes.io/managed-by`, and keys whose prefix is `baryon.io`, `kubernetes.io`, `k8s.io`, or a subdomain of them other than `app.kubernetes.io` (the same rule as `reserved_label` in `crates/controller/src/anchor.rs`). CI checks: a PV spec change, another PV annotation, a record for another claim, rewriting and removing the record, and annotating an unmanaged pod are denied; adding the record for the bound claim and approving a Baryon pod are allowed. Copying `app` and `app.kubernetes.io/name` and recording their keys is allowed; adding `node.kubernetes.io/x`, changing `app.kubernetes.io/managed-by`, adding `virtualization.baryon.io/vm-name`, and relabeling an unmanaged pod are denied. |
 | `baryon-import-approval` | Nobody but baryon-controller may set, change, or remove the annotation `virtualization.baryon.io/import-approved` on any pod, at creation or by update. Namespace users can patch pods, so without this policy they could approve an import into a volume the controller would refuse. CI checks: another user changing, removing, or setting the approval is denied; another user changing other annotations of a pod with an approval is allowed. |
@@ -389,15 +392,17 @@ rights only to cluster administrators. Status: Documented.
 
 | Right | What it gives | Status |
 |---|---|---|
-| `create` or `update` on VirtualMachines with `spec.userData.secretRef` | The guest receives the named Secret's `userdata` key, and anyone who can log in to the guest can read it. Without an admission check this would be read access to every Secret of the namespace for any subject bound to `baryon-vm-edit`, which has no rights on Secrets; the admission policy `baryon-vm-user-data` (Designed) requires that the requester may `get` the referenced Secret | Designed |
+| `create` or `update` on VirtualMachines with `spec.guestConfig.userDataSecretRef` | The guest receives the named Secret's `userdata` key, and anyone who can log in to the guest can read it. Without an admission check this would be read access to every Secret of the namespace for any subject bound to `baryon-vm-edit`, which has no rights on Secrets. The admission policy `baryon-vm-guest-config` (Designed) requires that the requester may `get` the Secret when the reference is set or changed; it is load-bearing and fails open when absent, so it ships before the field and baryon-controller checks that it exists. The check is a snapshot: like a Deployment, every later Anchor Pod gets the Secret's current content, including content written after the requester lost access. Revocation is removing the reference or the VM | Designed |
+| `update` or `patch` on a Secret that a VirtualMachine references | Control of what the guest's agent runs, typically as root, at the VM's next start | Designed (ADR 0014); inherent to user data |
 | `create` on `pods/exec` for an import Pod | Running a program of the import image in the import container while an import is pending, as the VM's identity, with the claim mounted read-write. The import image contains only `baryon-importer`, which refuses to run unless it is the container's init process and holds its target exclusively, so an exec'd importer cannot write a second image (finding M5). This holds only while the image cannot be replaced (`baryon-pod-immutable`, finding M7) | Implemented; the file import lock has a unit test, and the PID 1 rule is checked by `tests/e2e/anchor-authority.sh` while the import Pod runs; Tested (k0s cluster, both volume modes) |
-| `create` on `pods/exec` for an Anchor Pod | The VM's console (ADR 0014, Designed), including taking over another session and the last 16 KiB of output. Already in v0.1: opening `/dev/kvm` within the pod's limits, using up the pod's resources until the VM fails, and writing the anchor's readiness file, which can show the VM `Ready` while its guest is down. Up to v0.1.0-rc1 also stopping the VM and attaching as its anchor (finding M1, fixed: lifecycle calls require the Anchor supervisor, ADR 0015). Up to v0.1.0-rc1 also, in block mode, overwriting the running VM's root disk with `baryon-anchor import` (finding M2, fixed: the Anchor image has no import code). Grant it as the right to operate the VM, not to view it | Implemented (exec path); console Designed |
-| `pods/ephemeralcontainers` on an Anchor Pod | Nothing: `baryon-no-ephemeral-containers` refuses ephemeral containers in Anchor Pods and import Pods (ADR 0015). Without the policy, everything above from an image of the requester's choice | Implemented; the CI API server checks pass on a local k0s API server, not yet in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` |
-| `update` or `patch` on pods, for an Anchor Pod or an import Pod | Labels and annotations, within the other policies (`baryon-import-approval` keeps the import approval to baryon-controller). Not the container image: `baryon-pod-immutable` refuses that. Without the policy, kubelet would restart the container with an image of the requester's choice as its init process, which in an Anchor Pod is the VM's Anchor supervisor and in an import Pod writes the claim under the approval while the volume records the checked source (finding M7) | Implemented; the CI API server checks pass on a local k0s API server, not yet in CI; E2E `tests/e2e/anchor-authority.sh` passed on the k0s cluster |
+| `create` on `pods/exec` for an Anchor Pod | The VM's console (ADR 0014, Designed), including taking over another session and the last 16 KiB of output; reading the referenced user data (the Secret volume and the seed) through whatever the Anchor image can run; opening connections and `Console` streams on the node's shared anchor socket within per-pod limits (Designed). On Kubernetes before 1.35, `get` on `pods/exec` is enough to open a session over WebSocket. Already in v0.1: opening `/dev/kvm` within the pod's limits, using up the pod's resources until the VM fails, and writing the anchor's readiness file, which can show the VM `Ready` while its guest is down. Up to v0.1.0-rc1 also stopping the VM and attaching as its anchor (finding M1, fixed: lifecycle calls require the Anchor supervisor, ADR 0015). Up to v0.1.0-rc1 also, in block mode, overwriting the running VM's root disk with `baryon-anchor import` (finding M2, fixed: the Anchor image has no import code). Grant it as the right to operate the VM, not to view it | Implemented (exec path); console Designed |
+| `pods/ephemeralcontainers` on an Anchor Pod | Nothing: `baryon-no-ephemeral-containers` refuses ephemeral containers in Anchor Pods and import Pods (ADR 0015). Without the policy, everything above from an image of the requester's choice | Implemented; the CI API server checks pass in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` |
+| `update` or `patch` on pods, for an Anchor Pod or an import Pod | Labels and annotations, within the other policies (`baryon-import-approval` keeps the import approval to baryon-controller). Not the container image: `baryon-pod-immutable` refuses that. Without the policy, kubelet would restart the container with an image of the requester's choice as its init process, which in an Anchor Pod is the VM's Anchor supervisor and in an import Pod writes the claim under the approval while the volume records the checked source (finding M7) | Implemented; the CI API server checks pass in CI; E2E `tests/e2e/anchor-authority.sh` passed on the k0s cluster |
 
 RBAC can narrow these rights to named pods (`resourceNames`), not by
-label. baryon-controller does not read Secrets; kubelet mounts the Secret
-into the Anchor Pod, mode 0440, group the VM's gid. A compromised
+label. baryon-controller does not read Secrets; kubelet mounts only the
+Secret's `userdata` key into the Anchor Pod, never into the import Pod
+(read-only, mode 0440, group the VM's gid, `optional: true`). A compromised
 baryon-controller can already mount any Secret of any namespace into a pod
 it creates (cluster-wide pod `create`).
 
@@ -678,8 +683,8 @@ Remaining hardening:
   checked from inside a v0.1.0-rc1 guest). Fixed on `main`: a guest on the
   k0s cluster with Cloud Hypervisor v54.0 had no `vmx` or `svm` flag in
   `/proc/cpuinfo` (Tested by a manual check on 2026-10-27,
-  [testing.md](testing.md#cloud-hypervisor-v540)). Whether v0.1.0 carries
-  the fix is an owner decision (Planned, [roadmap.md](roadmap.md#v010)).
+  [testing.md](testing.md#cloud-hypervisor-v540)). v0.1.0-rc2 carries the
+  fix ([release notes](release-notes/v0.1.0-rc2.md)).
 - DHCP: guest-sent DHCP frames are parsed by the DHCP responder process,
   not by baryon-virtd. The responder runs with the VMM's confinement (the
   VM's identity, no capabilities, `no_new_privs`, empty network namespace, Anchor
@@ -847,17 +852,25 @@ Remaining hardening:
   echoes and prints during a session (commands typed at a shell and their
   output, and anything cloud-init prints from user data), for the same 14
   days. A new console session first receives the last 16 KiB of console
-  output, so it can see what an earlier session displayed: read-only
-  sessions are not a confidentiality boundary.
-- Guest user data (ADR 0014, Designed): kubelet mounts the referenced
-  Secret into the Anchor Pod (a tmpfs volume, mode 0440, group the VM's
-  gid), and baryon-anchor writes the seed image to the pod's `/dev/shm`;
-  both are removed with the pod. baryon-controller and baryon-virtd never
-  read or store the content. Termination messages and VM status carry the
-  reason and the size only, because Pod status is readable without rights
-  on Secrets. The seed disk stays attached while the VM runs, so any guest
-  process that can read it can read the user data; user data is never
-  protected from the host.
+  output, so it can see what an earlier session displayed: sessions are
+  not a confidentiality boundary from each other.
+- Guest user data (ADR 0014, Designed): kubelet mounts only the
+  referenced Secret's `userdata` key into the Anchor Pod (a tmpfs volume,
+  mode 0440, group the VM's gid). baryon-anchor writes the seed image to
+  `/dev/shm/baryon-anchor/` in the pod. `/dev/shm` belongs to the pod
+  sandbox, so it outlives an Anchor container restart; the new anchor
+  replaces the seed left by the previous container. Both are removed with
+  the pod; `hostIPC` is refused so the seed never lands in the node's
+  `/dev/shm`. baryon-controller and baryon-virtd never read or store the
+  content; baryon-virtd opens the seed without following symbolic links
+  and accepts only a regular file of the fixed size, owned by the VM's
+  uid, on the container's `/dev/shm`. Termination messages and VM status
+  carry the reason and the limit only, because Pod status is readable
+  without rights on Secrets. Processes with the VM's identity can read
+  and replace the seed; that gives them nothing the guest does not have.
+  The seed disk stays attached while the VM runs, so any guest process
+  that can read it can read the user data; user data is never protected
+  from the host.
 
 ## Cleanup and stale state
 
@@ -874,6 +887,9 @@ Remaining hardening:
   it.
 - VMM tmpfs: unmounted (lazily) with the runtime directory when the VM
   ends, and when a stale runtime directory is found at startup.
+- Seed image (ADR 0014, Designed): survives an Anchor container restart
+  in the pod's `/dev/shm`; replaced by the next anchor before its first
+  `Attach`; removed with the pod. No node-side cleanup.
 - Pod teardown while baryon-virtd is down: the container runtime stops the
   VMM with the Anchor container, before volumes are unmounted (measured; see
   [runtime-boundary.md](runtime-boundary.md)).
@@ -1142,7 +1158,7 @@ on 2026-10-28):
 
 | Finding | Severity | Status |
 |---|---|---|
-| H1: a Secret reference in a VirtualMachine would give subjects bound to `baryon-vm-edit`, which has no rights on Secrets, read access to any Secret of the namespace | High | Resolved in the ADR: admission policy `baryon-vm-user-data` (Designed) |
+| H1: a Secret reference in a VirtualMachine would give subjects bound to `baryon-vm-edit`, which has no rights on Secrets, read access to any Secret of the namespace | High | Resolved in the ADR: admission policy `baryon-vm-guest-config` on `spec.guestConfig.userDataSecretRef` (Designed; the draft named them `baryon-vm-user-data` and `spec.userData.secretRef`) |
 | H2: user data in `VmSpec` would be stored in the runtime record or break the identical-spec reattach after a baryon-virtd restart or a Secret edit | High | Resolved in the ADR: baryon-anchor builds the seed and passes it as a disk; baryon-virtd never handles user data |
 | M1: any process in the pod cgroup with the VM's identity, including exec'd processes, the VMM, and the DHCP responder, can call `Stop` and `Attach`, and the newest attach becomes the VM's anchor | Medium | Fixed (ADR 0015): lifecycle calls only from the Anchor supervisor, bound to one live process; non-dumpable anchor with SIGTERM from root only; admission refuses `shareProcessNamespace`, `hostPID`, `hostUsers: false`, extra containers, and ephemeral containers. Unit tests, CI API server checks (local run), and E2E `tests/e2e/anchor-authority.sh` on the k0s cluster |
 | M2: `pods/exec` on a block-mode Anchor Pod allows overwriting the running VM's root disk with `baryon-anchor import`, whose approval is optional on its command line | Medium | Fixed: the importer is a separate binary and image, `baryon-importer`, used only by import Pods, and requires the approval file and the claim UID; `baryon-anchor` has no import command. Unit tests; E2E `tests/e2e/anchor-authority.sh` and the import E2E suites on the k0s cluster |
@@ -1157,15 +1173,31 @@ on 2026-10-28):
 | L13: the authority E2E skipped the exec'd importer check when the import ended first, and reported the SIGTERM check as passed on an empty anchor log | Low | Fixed: both are failures now; the SIGTERM check requires the anchor's own log line |
 | N7: baryon-virtd left a live VMM running when its runtime record could not be adopted after a restart, so a reattaching anchor would start a second VMM on the same disk | Note | Fixed: baryon-virtd kills that VMM through its pidfd (unit test) |
 | N8: baryon-importer was dumpable | Note | Fixed: it makes itself non-dumpable after its PID 1 check |
-| M3: guest terminal output would reach the operator's terminal unfiltered | Medium | Resolved in the ADR: output filtering in `baryon-anchor console` (Designed) |
+| M3: guest terminal output would reach the operator's terminal unfiltered | Medium | Resolved in the ADR: output filtering in `baryon-anchor console` (Designed); allow-list made precise (L14) |
 | M4: console and user data bounds were anchor-side only; no explicit gRPC message limits; Cloud Hypervisor's serial input queue is unbounded | Medium | Resolved in the ADR: bounds enforced by baryon-virtd (Designed) |
 | L1: the Landlock writable-directory rationale and the VMM directory contents were stale for v54.0 (`serial.sock.lock`) | Low | Documented; removal of the rule with v54.0 Open |
 | L2: the reason for `AF_NETLINK` in Cloud Hypervisor's VMM thread filter was not cited | Low | Documented (upstream commit 98b1d50a0b); Baryon keeps it denied |
 | L3: virtio-net offloads on re-expose the kernel's header validation to guest-chosen values; UFO likely unneeded | Low | Accepted (checksum, TSO); UFO Open; re-evaluate on TAP or virtio-net header advisories |
-| L4: v0.1.0-rc1 (Cloud Hypervisor v53.0 default) exposed nested virtualization to guests on hosts whose KVM module allows it | Low | Fixed on `main` (`nested=off`): no `vmx` or `svm` flag inside a guest on the k0s cluster; v0.1.0 open ([roadmap.md](roadmap.md)) |
+| L4: v0.1.0-rc1 (Cloud Hypervisor v53.0 default) exposed nested virtualization to guests on hosts whose KVM module allows it | Low | Fixed on `main` for v0.1.0-rc2 (`nested=off`): no `vmx` or `svm` flag inside a guest on the k0s cluster |
 | L5: console log content during sessions, the replay, termination messages, and the guest-side lifetime of user data were not recorded | Low | Documented (ADR 0014 Consequences, Data handling) |
 | L6: console sessions cannot be attributed to a Kubernetes user by baryon-virtd | Low | Designed: session IDs and an audit rule example |
-| L7: plain `kubectl exec` by pod name can reach a pod another user created under that name while the VM is stopped | Low | Designed: baryonctl checks that the pod's controller owner reference is the VirtualMachine's UID |
+| L7: plain `kubectl exec` by pod name can reach a pod another user created under that name while the VM is stopped | Low | Designed: baryonctl checks the pod's controller owner reference and that its container requests the vm resource (L16); plain `kubectl exec` has no such check |
+
+Findings of the 2026-10-28 review of the rewritten ADR 0014 (Accepted as
+a design; nothing implemented):
+
+| Finding | Severity | Status |
+|---|---|---|
+| M8: the placement-only feature resource of guest configuration was not restricted, so any pod creator could use up its capacity on every node | Medium | Resolved in the ADR: `baryon-vm-resource` and `baryon-pod-immutable` cover it (Designed) |
+| M9: `baryon-vm-guest-config` fails open when absent | Medium | Resolved in the ADR: classified load-bearing, shipped in a refusing form one release before the field, checked by baryon-controller, CI API server checks (Designed) |
+| M10: the pod's `/dev/shm` outlives the Anchor container, so a seed created as a new file blocks a restart or is reused stale | Medium | Resolved in the ADR: the new anchor replaces it fd-relative (Designed) |
+| M11: the node-wide anchor socket has no per-pod connection or stream limits, and `Console` adds long-lived streams from exec'd processes | Medium | Resolved in the ADR: per-pod limits, identification off the accept loop (Designed) |
+| L14: the terminal filter allow-list was by final byte only (private-prefix SGR, reporting modes, DECRQM, XTVERSION, ENQ, `ESC Z`, C1) | Low | Resolved in the ADR (Designed) |
+| L15: the Secret check is a snapshot with Deployment-like semantics; Secret writers control what the guest runs | Low | Documented |
+| L16: baryonctl's owner reference check can be forged by a pod creator | Low | Resolved in the ADR: the vm resource request is required as well (Designed) |
+| L17: `hostIPC` was not refused, which would put the seed in the node's `/dev/shm` | Low | Resolved in the ADR (Designed) |
+| L18: the seed open, the `Console` caller rule, and the projected Secret keys were imprecise | Low | Resolved in the ADR (Designed) |
+| N9: ADR 0015 named a console bridge that the chosen design does not have; a controller downgrade could start a referencing VM without its user data | Note | Resolved: ADR 0015 wording corrected; a downgrade below the release that adds the field is documented as not supported |
 
 Dependency check of 2026-10-05: cargo audit 0.22.2 and cargo deny 0.20.2
 report no vulnerabilities in the Rust dependencies. Cloud Hypervisor
