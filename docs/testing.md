@@ -22,6 +22,7 @@ far. Other documents state a status label and link to
 | E2E node agent outage | `tests/e2e/node-agent-outage.sh` | a baryon-controller restart while the node agent of one node is down, and a node agent outage right after a controller restart: the outage VM reports `NetworkReady` Unknown (`RuntimeUnreachable`) and never True from the stale report, while an unrelated VM on another node is unaffected. Status: Tested on the k0s cluster ([Results](#k0s-cluster)) | at least two Baryon nodes, a cluster no other test uses at the same time | no |
 | E2E hostile disk | `tests/e2e/hostile-disk.sh` | a claim whose `disk.img` is a block device node made by a pod is refused (`StorageFailed`) and no VMM starts | a cluster of Baryon nodes and a namespace that admits a root pod with the runtime's default capabilities | no |
 | E2E anchor authority | `tests/e2e/anchor-authority.sh` | ADR 0015 through Kubernetes paths: the import Pod runs the importer image, not the anchor image; an exec'd importer refuses to run while the import Pod runs (the check fails if the import ends first); the import Pod's image cannot be changed; no import command, no importer binary, and no shell in the Anchor container; an exec'd `baryon-anchor run` refuses to run and the VM, the Anchor Pod's readiness, and its restart count are unchanged; ephemeral containers and an image change refused on the Anchor Pod, and its container does not restart; Anchor Pod replacement does not import again and leaves the import record unchanged; on replacement and VM deletion the anchor logs that it acted on the runtime's SIGTERM, never that it ignored one. With `NODE_SHELL`: the anchor is not dumpable and Yama `ptrace_scope` is 1 or higher on its node; after a baryon-virtd restart the same anchor attaches again with the same VMM and no refusals; after its container is killed the restarted anchor holds the VM with a new VMM; replacement and deletion end with the anchor's final `Stop` and no refused attach or stop; the new anchor is attached. With `REBOOT=1`: the new Anchor Pod after a node reboot holds the VM. baryon-virtd's refusal of other callers is covered by its unit tests only. Status: Tested on the k0s cluster ([Results](#anchor-authority-change)) | a cluster of Baryon nodes, `NODE_SHELL` for the host checks, `STORAGE_CLASS` and `VOLUME_MODE` | no |
+| E2E guest policy | `tests/e2e/guest-policy.sh` | the Cloud Hypervisor options Baryon writes explicitly: with `NODE_SHELL`, the VMM version and `nested=off`, `offload_csum=on`, and `offload_tso=on` on its command line; with `GUEST_SHELL`, no `vmx` or `svm` flag in the guest and the negotiated virtio-net checksum and TSO features; with `GUEST_SHELL` and `MIN_MBPS`, a broad throughput floor from a pod on the VM's node, to catch a lost offload. Each part is skipped (logged, not counted) when its variable is unset. Status: Implemented; no recorded result yet | a cluster of Baryon nodes, `NODE_SHELL` for the host checks; for the guest checks, a guest image with a login (`IMAGE_URL`) and a `GUEST_SHELL` wrapper; for the floor, iperf3 in the guest and an iperf3 client image (`IPERF_IMAGE`, default `alpine:3.22`, which needs a package mirror) | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
 | Identity conflict suite | Planned | the `IdentityConflict` replacement path across nodes | a multi-node cluster of Baryon nodes | no |
@@ -105,8 +106,7 @@ to confirm that:
   admits it on a plain pod; `baryon-pod-immutable` denies `kubectl set
   image` on such a pod, admits a label change on it, and admits an image
   change on a plain pod. These two pods are created, not dry runs, and
-  deleted afterwards. The checks in this item and the previous one passed
-  on a local k0s API server and have not yet run in CI
+  deleted afterwards. The checks in this item and the previous one pass in CI
 
 It then applies the controller RBAC and, impersonating baryon-controller's
 service account against a PersistentVolume bound to a claim, a Baryon pod,
@@ -149,6 +149,7 @@ virtualization evidence.
 | `tests/e2e/skew.sh` | one VM per node under the current version mix; needs `NODE_SHELL` |
 | `tests/e2e/anchor-authority.sh` | lifecycle authority of the Anchor supervisor and no import path in a running pod (ADR 0015); needs `NODE_SHELL` for the host checks, `REBOOT=1` for the node reboot |
 | `tests/e2e/hostile-disk.sh` | a hostile `disk.img` is refused |
+| `tests/e2e/guest-policy.sh` | Cloud Hypervisor guest policy: VMM version, `nested=off`, and the virtio-net offloads on the host (`NODE_SHELL`) and in the guest (`GUEST_SHELL`, invoked as `$GUEST_SHELL <guest-address> sh -c <command>`), and an optional throughput floor (`MIN_MBPS`); the default Debian image has no login, so the guest checks need an image with credentials |
 | `tests/e2e/import-integrity.sh` | integrity of a block-mode import against stale data and namespace users; needs `NODE_SHELL`, `STORAGE_CLASS` (block volumes), and a namespace that admits root pods |
 | `tests/e2e/placement.sh` | VM placement and VM labels; needs `NODE_SHELL` and at least three Baryon nodes |
 | `tests/e2e/network-health.sh` | DHCP responder supervision, liveness probes, and `NetworkReady`; needs `NODE_SHELL` (exits with status 2 without it); refuses to run (status 2) if the baryon-node-agent DaemonSet already has an affinity |
@@ -355,12 +356,14 @@ Anchor Pod.
 `lib.sh` reads the following; `lifecycle.sh` also reads `PROBE_IMAGE` and
 `SKIP_NETWORK`; `multinode.sh` and `hostile-disk.sh` read `PROBE_IMAGE`;
 `multinode.sh`, `storage.sh`, `skew.sh`, `hostile-disk.sh`,
-`import-integrity.sh`, `placement.sh`, `network-health.sh`, and
-`node-agent-outage.sh` read `STORAGE_CLASS` (required by
-`import-integrity.sh`); `network-health.sh`
-reads `REBOOT`; `import-integrity.sh` also reads `PROBE_IMAGE` and
-`SCAN_IMAGE`; `storage.sh` reads `VOLUME_MODE`; `skew.sh` reads
-`EXPECT_MIXED`.
+`import-integrity.sh`, `placement.sh`, `network-health.sh`,
+`node-agent-outage.sh`, and `anchor-authority.sh` read `STORAGE_CLASS`
+(required by `import-integrity.sh`); `network-health.sh` and
+`anchor-authority.sh` read `REBOOT`; `import-integrity.sh` also reads
+`PROBE_IMAGE` and `SCAN_IMAGE`; `storage.sh` and `anchor-authority.sh`
+read `VOLUME_MODE`; `skew.sh` reads `EXPECT_MIXED`; `guest-policy.sh`
+reads `GUEST_SHELL`, `MIN_MBPS`, `IPERF_IMAGE`, and
+`EXPECT_CH_VERSION`.
 
 | Variable | Meaning |
 |---|---|
@@ -374,10 +377,14 @@ reads `REBOOT`; `import-integrity.sh` also reads `PROBE_IMAGE` and
 | `PROBE_IMAGE` | image with `sh`, `nc`, and `ping` for the probe pod (default: `busybox:1.36`) |
 | `SKIP_NETWORK` | `1` skips the SSH, Service, and ping checks and the probe pod |
 | `STORAGE_CLASS` | StorageClass of the root disk claims (default: the cluster's default StorageClass) |
-| `VOLUME_MODE` | `storage.sh` only: `Filesystem` (default) or `Block` |
+| `VOLUME_MODE` | `storage.sh` and `anchor-authority.sh`: `Filesystem` (default) or `Block` |
 | `EXPECT_MIXED` | `skew.sh` only: `1` fails unless the nodes run at least two different baryon-virtd builds |
-| `REBOOT` | `network-health.sh` only: `1` runs the reboot case, which reboots the node of the first VM |
+| `REBOOT` | `network-health.sh` and `anchor-authority.sh`: `1` runs the reboot case, which reboots the node of the test VM (the first VM in `network-health.sh`) |
 | `SCAN_IMAGE` | `import-integrity.sh` only: image with `python3` for the root pods that fill and scan the device (default: `python:3.13-alpine`) |
+| `GUEST_SHELL` | `guest-policy.sh` only: command that runs a shell command in the guest, invoked as `$GUEST_SHELL <guest-address> sh -c <command>`. When unset, the guest checks and the throughput floor are skipped. The default Debian image has no login, so `IMAGE_URL` must name an image the wrapper can log in to |
+| `MIN_MBPS` | `guest-policy.sh` only: throughput floor in Mbit/s from a pod on the VM's node to the guest (best of three iperf3 runs); needs `GUEST_SHELL` and iperf3 in the guest; skipped when unset. Choose it well below a known-good baseline of the same environment |
+| `IPERF_IMAGE` | `guest-policy.sh` only: iperf3 client image (default: `alpine:3.22`, which installs iperf3 with `apk` and needs a package mirror) |
+| `EXPECT_CH_VERSION` | `guest-policy.sh` only: expected Cloud Hypervisor version (default: the pin in `packaging/versions.env`) |
 
 `NODE_SHELL` is supplied by the user; Baryon ships no node access tool.
 Any mechanism that runs a command as root on the named node works. An
@@ -637,6 +644,18 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | Kairos Operator reboot (`nsenter -i -m -t 1 -- reboot`) with a VM running, no drain | working tree | manual | kubelet's logind delay inhibitor held; the guest powered off cleanly; the VM came back |
 | Kairos Operator v0.2.2 rolling `NodeOpUpgrade` of all three nodes (`nodeSelector` `virtualization.baryon.io/host=true`, concurrency 1, `force`, image preloaded on every node), one VM on ceph-rbd (node1) and one on lvm-local on each of node2 and node3 | working tree | manual | Completed; every node booted the new image (baryon-virtd hash equal to the image's). Concurrency 1 did not serialize the node outages: the drains of the three nodes started one after another without waiting for the previous node to return, because v0.2.2 counts a reboot as complete before the node is back, which frees the concurrency slot, so the node outages overlapped. Guests shut down cleanly at each drain. The lvm-local VMs came back on their own nodes once those returned. The ceph-rbd VM was down longest: no node was schedulable while all were cordoned or rebooting, and its restart was then delayed until the Ceph CSI attacher, whose controller had restarted with the control-plane node, regained its leader lease after the in-cluster API path returned; until then the volume stayed attached to the old node. Once the attacher led, detach and attach completed and the VM was Ready. All VMs recovered without intervention. VMs whose claims carried an older import record (no digest) got an import Pod after their drain; on filesystem claims the importer found the marker and left the disk unchanged |
 
+### v0.1.0-rc2 release qualification
+
+Release qualification of v0.1.0-rc2 runs on the tagged commit itself:
+images, the host image, and the release files are built from a clean
+checkout of that commit, and nothing changes between qualification and
+the tag. Its results therefore cannot be part of the tagged commit; they
+are recorded here on `main` after the tag. Planned scope: the upgrade
+from the published v0.1.0-rc1 artifacts with VMs running, host upgrades
+from Cloud Hypervisor v53.0 to v54.0 with one `NodeOpUpgrade` per node, the
+E2E suites with ceph-rbd and lvm-local, `tests/e2e/guest-policy.sh`,
+`tests/e2e/repeat.sh`, and a smoke test of the published artifacts.
+
 ### v0.1.0-rc1 release validation
 
 Run on 2026-10-05 on the k0s cluster (node1 is the controller node and
@@ -805,7 +824,7 @@ the SIGTERM log limit, and the kill of an unadoptable recovered VMM.
 | Check | Result |
 |---|---|
 | Unit tests (`cargo test --workspace --locked`) | pass, local run |
-| CI API server checks, including the ADR 0015 admission checks | pass on a local k0s API server; not yet run in CI |
+| CI API server checks, including the ADR 0015 admission checks | pass in CI (the `crds` job, which starts a single-node k0s API server in a container) |
 | E2E anchor authority on the k0s cluster, before the second gate | lvm-local Filesystem with `NODE_SHELL` and `REBOOT=1`: 37 of 37; ceph-rbd Block with `NODE_SHELL`: 34 of 34. No refused attach or stop in any step, the container restart included. A first run failed both at "the new anchor is attached": the script waited for a log line that baryon-virtd writes only when an anchor reattaches to a running VM; it now requires the new pod's Attach, no refusal for it, and a VMM in its cgroup. The same run skipped the exec'd importer check because the script ran it before the import Pod was scheduled; it now waits for the importer to run |
 | Yama on the k0s cluster after the upgrade to this host image | `/usr/lib/sysctl.d/50-baryon.conf` present and `kernel.yama.ptrace_scope` 1 on all three nodes (manual read, 2026-10-28) |
 | E2E anchor authority on the k0s cluster after the second gate, a new host image and cluster release built from the anchor authority change with the second gate fixes | lvm-local Filesystem with `NODE_SHELL` and `REBOOT=1`: 41 of 41; ceph-rbd Block with `NODE_SHELL`: 38 of 38. The added checks passed: an exec'd importer refused to run while the import Pod was running; `kubectl set image` was denied by `baryon-pod-immutable` for the import Pod and the Anchor Pod, and the anchor container did not restart; Yama `ptrace_scope` was 1 on the anchor's node; on replacement the anchor logged that it shut the VM down for the runtime's SIGTERM |
