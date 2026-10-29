@@ -116,7 +116,13 @@ fi
 
 # Throughput floor from a pod on the same node.
 if [ -n "${GUEST_SHELL:-}" ] && [ -n "${MIN_MBPS:-}" ]; then
-  guest 'pkill iperf3 || true; iperf3 -s -D' >/dev/null
+  # The guest may still be installing iperf3 at first boot.
+  if ! wait_for "iperf3 in the guest" guest 'command -v iperf3' ||
+    ! guest 'pkill iperf3 || true; iperf3 -s -D' >/dev/null; then
+    bad "throughput: no iperf3 server in the guest"
+    summary
+    exit 1
+  fi
   "${k[@]}" run "$iperf_pod" --image="${IPERF_IMAGE:-alpine:3.22}" --restart=Never \
     --overrides="{\"spec\":{\"nodeName\":\"$node\"}}" -- \
     sh -c 'command -v iperf3 >/dev/null || apk add -q --no-cache iperf3 >/dev/null; sleep 3600' >/dev/null

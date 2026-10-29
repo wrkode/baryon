@@ -83,9 +83,10 @@ if [ -n "${NODE_SHELL:-}" ]; then
   # thread_filters <node> <pod-uid> <process>: "<tid> <seccomp mode>
   # <filters>" for every thread of the VM's process (cloud-hypervisor or
   # baryon-dhcp), leader first. The name has a bracketed first letter so the
-  # pattern does not match this scan itself.
+  # pattern does not match this scan itself. A thread that exits between the
+  # task listing and the status read is skipped.
   thread_filters() {
-    host "$1" "for c in /proc/[0-9]*/cmdline; do l=\$(tr '\\0' ' ' < \$c 2>/dev/null); case \"\$l\" in *$3*$2*) p=\${c%/cmdline}; p=\${p#/proc/}; for t in \$p \$(ls /proc/\$p/task | grep -vx \$p); do echo \$t \$(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/\$p/task/\$t/status) \$(sed -n 's/^Seccomp_filters:[[:space:]]*//p' /proc/\$p/task/\$t/status); done; break;; esac; done"
+    host "$1" "for c in /proc/[0-9]*/cmdline; do l=\$(tr '\\0' ' ' < \$c 2>/dev/null); case \"\$l\" in *$3*$2*) p=\${c%/cmdline}; p=\${p#/proc/}; for t in \$p \$(ls /proc/\$p/task | grep -vx \$p); do s=\$(cat /proc/\$p/task/\$t/status 2>/dev/null) || continue; [ -n \"\$s\" ] || continue; echo \$t \$(echo \"\$s\" | sed -n 's/^Seccomp:[[:space:]]*//p') \$(echo \"\$s\" | sed -n 's/^Seccomp_filters:[[:space:]]*//p'); done; break;; esac; done"
   }
   # Baryon's filter is the floor on every thread; Cloud Hypervisor adds its
   # own on every thread, on the main one once it has started the others
