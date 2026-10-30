@@ -64,10 +64,14 @@ for i in "${images[@]}"; do
     "docker-archive:_oci/archive/$name.tar" "oci:_oci/$name:$tag"
   digest="sha256:$("${skopeo[@]}" inspect --raw "oci:_oci/$name:$tag" | sha256sum | cut -d' ' -f1)"
   # The identity checks below inspect the Docker image; the layout must hold
-  # that image (the same config, so the same labels and layers' content).
-  config="$("${skopeo[@]}" inspect --raw "oci:_oci/$name:$tag" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')"
-  [ "$config" = "$(docker inspect -f '{{.Id}}' "$registry/$i")" ] \
-    || fail "the OCI layout of $name does not hold the checked image ($config)"
+  # that image: the same layer content (the uncompressed layer digests) and
+  # the same labels. The config digest itself differs, because the
+  # conversion writes the config in the OCI format.
+  norm='import json, sys; c = json.load(sys.stdin); print(json.dumps([c["rootfs"]["diff_ids"], c.get("config", {}).get("Labels")], sort_keys=True))'
+  layout_id="$("${skopeo[@]}" inspect --config "oci:_oci/$name:$tag" | python3 -c "$norm")"
+  docker_id="$(docker inspect "$registry/$i" | python3 -c 'import json, sys; c = json.load(sys.stdin)[0]; print(json.dumps([c["RootFS"]["Layers"], c["Config"].get("Labels")], sort_keys=True))')"
+  [ "$layout_id" = "$docker_id" ] \
+    || fail "the OCI layout of $name does not hold the checked image"
   echo "$name $digest" >> _oci/digests
 done
 rm -rf _oci/archive

@@ -1283,7 +1283,7 @@ of the public release work:
 | rc3 L1: syft was pinned by version, not by hash | Low | Fixed: downloaded by URL and checked against the SHA-256 in `packaging/versions.env` |
 | rc3 L2: the artifact handoff between release jobs had no binding independent of the artifacts | Low | Fixed: build job outputs bind the release files, image list, notes, and digests |
 | rc3 L3: the gate accepted any GitHub-verified signer and any user's qualification status, and treated an API error as "no release" | Low | Fixed: `RELEASE_ALLOWED_SIGNERS`, `RELEASE_QUALIFIERS`, and only a not-found answer passes |
-| rc3 L4: the identity checks inspected the Docker images, not the published OCI layouts | Low | Fixed: each layout's config digest must equal the checked image's |
+| rc3 L4: the identity checks inspected the Docker images, not the published OCI layouts | Low | Fixed: each layout must hold the checked image's layers (uncompressed layer digests) and labels; its config digest differs because the conversion writes the OCI config format |
 | rc3 L5: release verification commands not yet exercised on a release; no self-hosted runner check | Low | `--deny-self-hosted-runners` added; first exercised by the v0.1.0-rc3 smoke test |
 | rc3 L6: the importer package was private while the documentation says the images are public | Low | The publish job checks that every image can be pulled anonymously; the package is made public before the tag |
 | rc3 L7: the identity conflict recovery is tested for a newly created Anchor Pod, not for an anchor container that restarts after running its VM | Low | Open: documented as tested for a new Anchor Pod; a test of the restart path is Planned |
