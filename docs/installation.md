@@ -2,9 +2,11 @@
 
 This guide takes a cluster from bare machines to a running VM with the
 release artifacts of Baryon, and covers uninstalling and upgrading. It is
-written for v0.1.0-rc2. The release URLs and image tags below resolve
-only after the release workflow has published v0.1.0-rc2; before that, the
-[from a checkout](#from-a-checkout) path is the only one available.
+written for v0.1.0-rc2, whose release files and images the release
+workflow has published. While the repository is private, they need GitHub
+access ([Private repository](#private-repository)); the
+[from a checkout](#from-a-checkout) path uses images you build and push
+yourself instead.
 
 Status labels follow [architecture.md](architecture.md). "Tested" names the
 environment, described in [testing.md](testing.md#results); the k0s
@@ -390,11 +392,13 @@ Status: the release workflow (`.github/workflows/release.yaml`) and the
 manifest renderer (`hack/release-manifests.sh`) are Implemented. An
 installation from release files rendered by the same procedure, applied as
 files, is Tested on the k0s cluster in the v0.1.0-rc1 release validation
-([testing.md](testing.md#v010-rc1-release-validation)). The published
-release files and images of v0.1.0-rc1, rebuilt by the release workflow
-from the tag, passed a smoke test on the k0s cluster after the tag
-([testing.md](testing.md#published-artifacts-smoke-test)); the smoke test
-of v0.1.0-rc2 follows its tag.
+([testing.md](testing.md#v010-rc1-release-validation)) and the v0.1.0-rc2
+release qualification ([testing.md](testing.md#v010-rc2-release-qualification)).
+The published release files and images of v0.1.0-rc1 and of v0.1.0-rc2,
+rebuilt by the release workflow from their tags, passed a smoke test on
+the k0s cluster after each tag
+([v0.1.0-rc1](testing.md#published-artifacts-smoke-test),
+[v0.1.0-rc2](testing.md#published-v010-rc2-artifacts-smoke-test)).
 
 ### Private repository
 
@@ -407,7 +411,9 @@ Pods in the VM's namespace without them, so every node's container
 runtime needs its own credentials for `ghcr.io`, or the images must be
 loaded onto the nodes. Status: pulling the images with node credentials
 is Not tested. Loading the published images onto the nodes is Tested
-(the smoke test of v0.1.0-rc1).
+(the smoke tests of v0.1.0-rc1 and v0.1.0-rc2; in the v0.1.0-rc2 smoke
+test, the procedure below was run as written for the importer image on
+one node).
 
 `baryon.yaml` refers to the images by digest, so a loaded image must keep
 the manifest digest of the registry, and containerd must know it under

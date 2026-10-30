@@ -121,9 +121,8 @@ kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/downloa
 kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon-classes.yaml
 ```
 
-These URLs resolve once the release workflow has published v0.1.0-rc2,
-and only while the repository is public. A release from the private
-repository needs GitHub access for its files and images
+While the repository is private, these URLs and the images need GitHub
+access
 ([installation.md, Private repository](docs/installation.md#private-repository)).
 
 ## First VM

@@ -22,7 +22,7 @@ far. Other documents state a status label and link to
 | E2E node agent outage | `tests/e2e/node-agent-outage.sh` | a baryon-controller restart while the node agent of one node is down, and a node agent outage right after a controller restart: the outage VM reports `NetworkReady` Unknown (`RuntimeUnreachable`) and never True from the stale report, while an unrelated VM on another node is unaffected. Status: Tested on the k0s cluster ([Results](#k0s-cluster)) | at least two Baryon nodes, a cluster no other test uses at the same time | no |
 | E2E hostile disk | `tests/e2e/hostile-disk.sh` | a claim whose `disk.img` is a block device node made by a pod is refused (`StorageFailed`) and no VMM starts | a cluster of Baryon nodes and a namespace that admits a root pod with the runtime's default capabilities | no |
 | E2E anchor authority | `tests/e2e/anchor-authority.sh` | ADR 0015 through Kubernetes paths: the import Pod runs the importer image, not the anchor image; an exec'd importer refuses to run while the import Pod runs (the check fails if the import ends first); the import Pod's image cannot be changed; no import command, no importer binary, and no shell in the Anchor container; an exec'd `baryon-anchor run` refuses to run and the VM, the Anchor Pod's readiness, and its restart count are unchanged; ephemeral containers and an image change refused on the Anchor Pod, and its container does not restart; Anchor Pod replacement does not import again and leaves the import record unchanged; on replacement and VM deletion the anchor logs that it acted on the runtime's SIGTERM, never that it ignored one. With `NODE_SHELL`: the anchor is not dumpable and Yama `ptrace_scope` is 1 or higher on its node; after a baryon-virtd restart the same anchor attaches again with the same VMM and no refusals; after its container is killed the restarted anchor holds the VM with a new VMM; replacement and deletion end with the anchor's final `Stop` and no refused attach or stop; the new anchor is attached. With `REBOOT=1`: the new Anchor Pod after a node reboot holds the VM. baryon-virtd's refusal of other callers is covered by its unit tests only. Status: Tested on the k0s cluster ([Results](#anchor-authority-change)) | a cluster of Baryon nodes, `NODE_SHELL` for the host checks, `STORAGE_CLASS` and `VOLUME_MODE` | no |
-| E2E guest policy | `tests/e2e/guest-policy.sh` | the Cloud Hypervisor options Baryon writes explicitly: with `NODE_SHELL`, the VMM version and `nested=off`, `offload_csum=on`, and `offload_tso=on` on its command line; with `GUEST_SHELL`, no `vmx` or `svm` flag in the guest and the negotiated virtio-net checksum and TSO features; with `GUEST_SHELL` and `MIN_MBPS`, a broad throughput floor from a pod on the VM's node, to catch a lost offload. Each part is skipped (logged, not counted) when its variable is unset. Status: Implemented; no recorded result yet | a cluster of Baryon nodes, `NODE_SHELL` for the host checks; for the guest checks, a guest image with a login (`IMAGE_URL`) and a `GUEST_SHELL` wrapper; for the floor, iperf3 in the guest and an iperf3 client image (`IPERF_IMAGE`, default `alpine:3.22`, which needs a package mirror) | no |
+| E2E guest policy | `tests/e2e/guest-policy.sh` | the Cloud Hypervisor options Baryon writes explicitly: with `NODE_SHELL`, the VMM version and `nested=off`, `offload_csum=on`, and `offload_tso=on` on its command line; with `GUEST_SHELL`, no `vmx` or `svm` flag in the guest and the negotiated virtio-net checksum and TSO features; with `GUEST_SHELL` and `MIN_MBPS`, a broad throughput floor from a pod on the VM's node, to catch a lost offload. Each part is skipped (logged, not counted) when its variable is unset. Status: Tested on the k0s cluster ([v0.1.0-rc2 release qualification](#v010-rc2-release-qualification)) | a cluster of Baryon nodes, `NODE_SHELL` for the host checks; for the guest checks, a guest image with a login (`IMAGE_URL`) and a `GUEST_SHELL` wrapper; for the floor, iperf3 in the guest and an iperf3 client image (`IPERF_IMAGE`, default `alpine:3.22`, which needs a package mirror) | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
 | Identity conflict suite | Planned | the `IdentityConflict` replacement path across nodes | a multi-node cluster of Baryon nodes | no |
@@ -548,7 +548,8 @@ Results come from three environments:
   graceful node shutdown 150 s and 30 s through a k0s worker profile, the
   k0s default CNI (kube-router; no network provider set in the k0s
   configuration), Cloud Hypervisor v53.0 (v54.0 for the run in
-  [Cloud Hypervisor v54.0](#cloud-hypervisor-v540)). Storage: OpenEBS LVM LocalPV
+  [Cloud Hypervisor v54.0](#cloud-hypervisor-v540) and after the host
+  upgrades of the [v0.1.0-rc2 release qualification](#v010-rc2-release-qualification)). Storage: OpenEBS LVM LocalPV
   (`openebs/lvm-driver:1.10.1`, `WaitForFirstConsumer`, "lvm-local") and
   Rook v1.20.8 (`rook/ceph:v1.20.8`) with Ceph 19.2.3
   (`quay.io/ceph/ceph:v19.2.3`) RBD ("ceph-rbd") through the
@@ -571,7 +572,9 @@ Results come from three environments:
 Results from the kind host are not results for a Baryon host; they are
 listed because some behavior was observed only there. The runs recorded
 here were made from 2026-10-03 to 2026-10-05, except the Cloud Hypervisor
-v54.0 run of 2026-10-27 and the anchor authority change runs.
+v54.0 run of 2026-10-27, the anchor authority change runs, and the
+v0.1.0-rc2 release qualification and smoke test of 2026-10-29 and
+2026-10-30.
 
 ### k0s cluster
 
@@ -607,6 +610,7 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|
+| Release qualification of v0.1.0-rc2: upgrade from the published v0.1.0-rc1 artifacts, host upgrades from Cloud Hypervisor v53.0 to v54.0, the E2E suites, guest policy, `tests/e2e/repeat.sh`, and a smoke test of the published artifacts | df7de3b (tagged v0.1.0-rc2) | E2E and manual procedures | passed: see [v0.1.0-rc2 release qualification](#v010-rc2-release-qualification) |
 | VM lifecycle with host cleanup checks (lvm-local) | 410aa30; working tree | E2E lifecycle | 33 of 33 on each |
 | Deletion in every phase before Ready | 410aa30; working tree | E2E deletion | 410aa30: 16 of 16; working tree: 19 of 19, with the import case checking that no Anchor Pod exists while importing, that the import Pod requests only the placement slot, and that the importer has neither /dev/kvm nor the anchor socket. An earlier working-tree run failed the pending case because an unschedulable import Pod was not reported as `Unschedulable`; fixed before the 19 of 19 run |
 | Multi-node cases (lvm-local) | 410aa30; working tree | E2E multi-node | 69 of 69 on each |
@@ -628,7 +632,7 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | API review change: E2E suites and the `NodeAgentStopped` transition | API review change | E2E | The k0s cluster was upgraded in place to this change (CRDs, then classes reapplied with `cpu.vcpus`, then the deployment; the running VM kept running). Then: lifecycle 35 of 35, node agent outage 32 of 32 (including the stopping agent marking its node Ready Unknown `NodeAgentStopped`), deletion 19 of 19, placement 65 of 65, storage ceph-rbd Block 47 of 47 and lvm-local Filesystem 36 of 36, import integrity lvm-local 52 of 52 and ceph-rbd 52 of 52, multi-node 69 of 69, skew (all hosts on one build) 33 of 33, hostile disk 4 of 4. The API server checks pass against the k0s API server container that CI uses (run locally; see [API server checks](#api-server-checks)) |
 | Node failure: power loss of the node of a running VM (ceph-rbd, VM pinned to the node) | on top of 66f2cba (`NodeUnreachable` reporting) | manual | `Running`, `Ready`, and `NetworkReady` Unknown (`NodeUnreachable`) once Kubernetes marked the pod not ready; no new Anchor Pod while the node was off, also after taint eviction marked the pod Terminating; after power-on the old pod was removed and the VM was Ready again on its node |
 | API review change: the Kairos runbook check of step 5 and a release-like upgrade from an earlier release | release B of the release validation | manual procedure | done: see [v0.1.0-rc1 release validation](#v010-rc1-release-validation) |
-| Release validation of v0.1.0-rc1: upgrade from a release-like build of 8db33bb, host upgrades, rollback, the E2E suites, uninstall and reinstall from release files | c3a3735 (the code of v0.1.0-rc1) | E2E and manual procedures | passed: see [v0.1.0-rc1 release validation](#v010-rc1-release-validation). Smoke test of the published artifacts: pending |
+| Release validation of v0.1.0-rc1: upgrade from a release-like build of 8db33bb, host upgrades, rollback, the E2E suites, uninstall and reinstall from release files | c3a3735 (the code of v0.1.0-rc1) | E2E and manual procedures | passed: see [v0.1.0-rc1 release validation](#v010-rc1-release-validation). Smoke test of the published artifacts: passed, see [Published artifacts smoke test](#published-artifacts-smoke-test) |
 | Uninstall from a checkout: VMs deleted first, then `kubectl delete -k deploy/base` ([installation.md](installation.md#9-uninstall)) | on top of 66f2cba (the changes of 743166a) | manual procedure | the `baryon-system` namespace and the CRDs were gone and no runtime directories were left on the nodes; each Node kept the `virtualization.baryon.io/vm` and `virtualization.baryon.io/import` extended resources at 0 after the device plugin unregistered |
 | Kernel settings behind the seccomp layer's rationale ([security.md](security.md#baryon-seccomp-layer)), read on 2026-10-05 on a Hadron v0.5.3 node of the k0s cluster | host image (Hadron v0.5.3 default kernel) | observation | `vm.unprivileged_userfaultfd` 0; `/dev/userfaultfd` owned by root, mode 0600; `kernel.yama.ptrace_scope` 1; `kernel.io_uring_disabled` 0 |
 | Version skew, 1.0 cluster release (c8e6c08) with mixed 1.0 and 1.1 hosts | c8e6c08 and 597b637 | E2E skew | 31 of 31 |
@@ -646,15 +650,87 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 
 ### v0.1.0-rc2 release qualification
 
-Release qualification of v0.1.0-rc2 runs on the tagged commit itself:
-images, the host image, and the release files are built from a clean
-checkout of that commit, and nothing changes between qualification and
-the tag. Its results therefore cannot be part of the tagged commit; they
-are recorded here on `main` after the tag. Planned scope: the upgrade
-from the published v0.1.0-rc1 artifacts with VMs running, host upgrades
-from Cloud Hypervisor v53.0 to v54.0 with one `NodeOpUpgrade` per node, the
-E2E suites with ceph-rbd and lvm-local, `tests/e2e/guest-policy.sh`,
-`tests/e2e/repeat.sh`, and a smoke test of the published artifacts.
+Run on 2026-10-29 on the k0s cluster, on df7de3b, the commit tagged
+v0.1.0-rc2. Images, the host image (Cloud Hypervisor v54.0, k0s
+v1.36.4+k0s.1), and the release files were built from a clean clone of
+that commit, by the procedure of the release workflow, with no reuse of
+earlier build output. Nothing changed between qualification and the tag.
+The results cannot be part of the tagged commit, so they are recorded
+here on `main` after the tag.
+
+An earlier candidate, bab297a, was not tagged: two suites failed on test
+defects, not on Baryon. The lifecycle seccomp check read the status of a
+Cloud Hypervisor thread that had just exited and failed on the empty row,
+and the guest policy check started its throughput server before the
+guest had finished installing iperf3 at first boot. df7de3b fixes only
+those two scripts (`tests/e2e/lifecycle.sh`, `tests/e2e/guest-policy.sh`)
+and was qualified again from the start.
+
+| Step | Result |
+|---|---|
+| CI on df7de3b | format, clippy, tests, CRD drift, the API server checks against a k0s API server, dependency advisories and licenses, DCO, image builds: passed |
+| Clean build identity | 14 of 14: the host image records v0.1.0-rc2 and df7de3bd0f15 without `-dirty` and ships Cloud Hypervisor v54.0; its baryon-virtd equals the release build; every component binary reports 0.1.0-rc2 and the commit; the Anchor image holds only `baryon-anchor` (no import subcommand, no importer code path); the importer image holds only `baryon-importer` |
+| Starting point | the development installation removed (no CRDs or admission policies left); all three hosts on the published v0.1.0-rc1 host image (commit caff22834c4b, checked per node); the published v0.1.0-rc1 release files installed, with the published v0.1.0-rc1 component images loaded on the nodes by digest |
+| VMs on v0.1.0-rc1 | three VMs: ceph-rbd Filesystem (node1), ceph-rbd Block (node2), lvm-local Filesystem (node3), each with a data marker; inside each guest the CPU flags listed `vmx` (the Cloud Hypervisor v53.0 default exposes nested virtualization), and virtio-net negotiated TSO and checksum offload |
+| Cluster release to the candidate over v0.1.0-rc1 hosts ([installation.md](installation.md#10-upgrading): `baryon-crds.yaml`, then `baryon.yaml`) | every VirtualizationNode Ready; the new admission policies installed; the three VMs kept their Anchor Pods and VMM processes, stayed Ready and `NetworkReady`, and kept their data; a new VM on a v0.1.0-rc1 host, created by the candidate controller and Anchor, was Ready and `NetworkReady`, and its import Pod ran the candidate importer image |
+| Host upgrades, one `NodeOpUpgrade` per node in the order node3, node2, node1, with the [runbook](kairos-integration.md#runbook-upgrade-one-node-with-kairos-operator) (`kubectl drain`, `vmCount` 0, upgrade, reboot, step 5 check, uncordon) and the candidate host image preloaded | on every node: drain succeeded, the step 5 check passed, and the node booted the candidate host image; the VMs were Ready again after each node. After the first node: version skew suite with mixed hosts (`EXPECT_MIXED` unset), 33 of 33 |
+| After all hosts | inside every guest no `vmx` or `svm` flag; virtio-net negotiated TSO and checksum offload; data written on v0.1.0-rc1 intact; every VM Ready and `NetworkReady`; every VirtualizationNode reports the candidate baryon-virtd. Upgrade checks: 42 of 42 |
+
+The E2E suites, run on the same cluster after the upgrade, with all
+hosts on the candidate:
+
+| Suite | Result |
+|---|---|
+| Anchor authority, lvm-local Filesystem with node reboot (`REBOOT=1`); ceph-rbd Block | 41 of 41; 38 of 38 |
+| Lifecycle | 35 of 35 |
+| Node agent outage | 32 of 32 |
+| Storage: ceph-rbd Block; ceph-rbd Filesystem; lvm-local Filesystem; lvm-local Block | 47 of 47; 47 of 47; 36 of 36; 36 of 36 |
+| Import integrity: lvm-local; ceph-rbd | 52 of 52; 52 of 52 |
+| Hostile disk | 4 of 4 |
+| Deletion | 19 of 19 |
+| Multi-node | 69 of 69 |
+| Placement | 65 of 65 |
+| Version skew (all hosts on one build) | 33 of 33 |
+| Network health with node reboot (`REBOOT=1`): ceph-rbd; lvm-local | 46 of 46; 46 of 46 |
+| Guest policy (`tests/e2e/guest-policy.sh` with `NODE_SHELL`, `GUEST_SHELL`, and a throughput floor) | 16 of 16: the VMM is Cloud Hypervisor v54.0 with `nested=off`, `offload_csum=on`, and `offload_tso=on`; no `vmx` or `svm` flag in the guest; the guest negotiated the checksum and TSO feature bits; pod-to-guest TCP throughput on the same node above a floor set well below a baseline measured with the offloads on, and well above what the offloads-off default gives on this cluster |
+| `tests/e2e/repeat.sh` with the lifecycle suite | 10 of 10 runs passed |
+
+Not run: rollback of a host from Cloud Hypervisor v54.0 to v53.0 (Kairos
+fallback boot) or of the cluster release, and the identity conflict path
+of a v0.1.0-rc1 Anchor (stated in the release notes as a limitation, not
+tested).
+
+#### Published v0.1.0-rc2 artifacts smoke test
+
+Run on 2026-10-29 and 2026-10-30 after the release workflow published
+v0.1.0-rc2 from the tag, on the cluster of the qualification above:
+
+| Step | Result |
+|---|---|
+| Release files from `gh release download` | `sha256sum --check SHA256SUMS`: every file OK, and `SHA256SUMS` lists every file; the six SPDX SBOMs parse |
+| Images | every component tag v0.1.0-rc2 and the host tag v0.1.0-rc2-k0s resolve to the digests in `images.txt`; every component binary reports 0.1.0-rc2 and df7de3bd0f15 without `-dirty`; the Anchor image holds only `baryon-anchor`, with no import subcommand and no importer code path; the importer image holds only `baryon-importer`; `baryon.yaml` references all four component images by those digests |
+| Host image | `components.json` records v0.1.0-rc2 and df7de3bd0f15 without `-dirty` and Cloud Hypervisor v54.0; the image's `cloud-hypervisor` reports v54.0; the released `baryon-virtd` binary is identical (SHA-256) to the one in the host image |
+| Published component images loaded on the nodes by digest ([installation.md](installation.md#private-repository)), then the published `baryon-crds.yaml`, `baryon.yaml`, and `baryon-classes.yaml` applied | the controller and node agent pods, restarted, run the published images (image IDs equal to `images.txt`); the controller creates Anchor Pods and import Pods from the published digests |
+| Host upgrades of node3, node2, node1 to the published host image (runbook with `kubectl drain`, the image preloaded under its tag) | each node booted the published image; its `/usr/bin/baryon-virtd` is identical to the released binary; every VirtualizationNode reports df7de3bd0f15 |
+| VMs on the published artifacts | an lvm-local Filesystem VM Ready and `NetworkReady` True, its Anchor Pod on the published Anchor image; E2E storage lvm-local Filesystem 36 of 36 and ceph-rbd Block 47 of 47; placement 65 of 65; Anchor authority lvm-local Filesystem with node reboot 41 of 41 and ceph-rbd Block 38 of 38; lifecycle 35 of 35; guest policy 16 of 16 |
+| The documented procedure for a private repository ([installation.md](installation.md#private-repository)), run as written for the importer image on node3 | containerd named the image by its registry name, with the tag and with the digest, and by no unqualified name; an import Pod on node3 started from it and the VM was Ready |
+
+Before these results, the smoke test's own image loading failed twice,
+in the test harness, not in Baryon. First, a copy step did not run, so
+the nodes had no published images and the anonymous pulls from the
+private registry were refused. Second, the harness imported images
+without `--base-name`, which gives each image a temporary unqualified
+name, and then removed that name with `ctr`. containerd's CRI plugin had
+recorded the name in its normalized form (`docker.io/library/...`) and
+kept a stale reference to it, so kubelet could not create containers
+from those images until the harness also removed the normalized name. The
+documented procedure names images by their registry name and creates no
+unqualified name.
+
+Not covered: the images carry no OCI `revision` or `version` labels, so
+their commit is shown only by the binaries' build stamps. SBOMs of the
+component images list the image only, not the Rust crates inside the
+static binaries; the Rust dependencies are in the source tree SBOM.
 
 ### v0.1.0-rc1 release validation
 
