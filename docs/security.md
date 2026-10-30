@@ -399,9 +399,10 @@ Pods that are not Baryon workloads, in other namespaces, are subject to
 the cluster's own Pod Security configuration; Baryon grants them nothing,
 and they cannot request the Baryon resources.
 
-Status: Implemented. The CI API server checks cover every rule; the E2E
-suites on the k0s cluster create Anchor and import Pods under the
-policies.
+Status: Implemented. The CI API server checks cover every rule. The E2E
+suites of the v0.1.0-rc3 release qualification run with these policies
+installed; their results are recorded in
+[testing.md](testing.md#v010-rc3-release-qualification) after the tag.
 
 ### VM placement
 
@@ -1201,7 +1202,7 @@ Findings of the 2026-10-05 v0.1.0-rc1 release gate review:
 
 | Finding | Severity | State |
 |---|---|---|
-| H1: GitHub artifact attestations need a public repository on the current plan; wrkode/baryon is private, so a release has no provenance attestations and its images and files need GitHub access | High | Resolved for v0.1.0-rc1 by disclosure: no attestations are created or claimed for a release from the private repository; the workflow attests only when the repository is public, and the docs say what a private release carries ([Release and supply chain](#release-and-supply-chain)). Making the repository public is the owner's decision |
+| H1: GitHub artifact attestations need a public repository on the current plan; wrkode/baryon is private, so a release has no provenance attestations and its images and files need GitHub access | High | Resolved for v0.1.0-rc1 by disclosure: no attestations are created or claimed for a release from the private repository; the workflow attests only when the repository is public, and the docs say what a private release carries ([Release and supply chain](#release-and-supply-chain)). Making the repository public is the owner's decision. Superseded in v0.1.0-rc3: the repository is public, and the release workflow attests every release file and image ([Release and supply chain](#release-and-supply-chain)) |
 | M1: base and builder images were pinned by tag | Medium | Fixed: pinned by digest in `packaging/versions.env` |
 | M2: baryon-node-agent is node root through the device plugin: its `Allocate` answer decides which host devices and paths a container gets | Medium | Documented ([Trust boundaries](#trust-boundaries)); a separate minimal device plugin process is Planned |
 | L1: the release workflow does not check CI results or `main` ancestry, and tags are not protected | Low | Accepted for v0.1.0-rc1; Planned |

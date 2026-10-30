@@ -666,8 +666,9 @@ for `pods/exec` on Anchor Pods.
 ### Status and implementation order
 
 Status of every part: Designed. Nothing in this ADR is implemented in
-v0.1. The parts are planned after v0.1 stabilization, in this order:
-guest configuration (the refusing form of `baryon-vm-guest-config` is
+v0.1 except the refusing form of `baryon-vm-guest-config`. The parts are
+planned after v0.1 stabilization, in this order: guest configuration (the
+refusing form of `baryon-vm-guest-config` is
 Implemented since v0.1.0-rc3, so the release that adds the field replaces
 it with the authorizing form); the console through `kubectl exec`, with
 one interactive writer and takeover; then baryonctl and, if wanted,

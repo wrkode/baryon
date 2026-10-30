@@ -38,7 +38,7 @@ with these files, built by `.github/workflows/release.yaml` from the tag:
 | `baryon-virtd-v<version>-x86_64-linux-musl` | The static baryon-virtd binary, identical to the one in the host image |
 | `baryon-v<version>-source.tar.gz` | The source tree of the tag |
 | `images.txt` | The image references with their digests |
-| `baryon-<image>-v<version>.spdx.json` | An SPDX SBOM of each image, generated from the image as published and naming its manifest digest; it lists the Rust crates compiled into the Baryon binaries |
+| `baryon-<image>-v<version>.spdx.json` | An SPDX SBOM of each image (`<image>` is `controller`, `node-agent`, `anchor`, `importer`, or `hadron-k0s`), generated from the image as published and naming its manifest digest; it lists the Rust crates compiled into the Baryon binaries |
 | `baryon-virtd-v<version>-x86_64-linux-musl.spdx.json` | An SPDX SBOM of the baryon-virtd binary with its Rust crates |
 | `baryon-v<version>-source.spdx.json` | An SPDX SBOM of the source tree (`Cargo.lock`) |
 | `SHA256SUMS` | SHA-256 checksums of the files above |
@@ -190,10 +190,13 @@ here.
 Everything below works without GitHub credentials unless it says
 otherwise. `<version>` is the release, for example `v0.1.0-rc3`.
 
-Checksums of the downloaded release files:
+Checksums of the downloaded release files (`gh release download <version>
+--repo wrkode/baryon` also downloads them, but needs a GitHub login):
 
 ```bash
-gh release download <version> --repo wrkode/baryon   # or download each file from the release page
+base=https://github.com/wrkode/baryon/releases/download/<version>
+curl -fsSLO "$base/SHA256SUMS"
+for f in $(awk '{print $2}' SHA256SUMS); do curl -fsSLO "$base/$f"; done
 sha256sum --check SHA256SUMS
 ```
 
@@ -237,8 +240,9 @@ gh attestation verify baryon.yaml --bundle baryon.yaml.bundle.json --repo wrkode
 
 Image identity: `images.txt` names every image by digest, and
 `baryon.yaml` uses the same digests. Each image SBOM names its image by
-repository and manifest digest; the digest in the SBOM must equal the one
-in `images.txt`:
+repository and manifest digest in a package URL, which encodes `/` as
+`%2F` and `:` as `%3A`; the digest in the SBOM must equal the one in
+`images.txt`:
 
 ```bash
 grep -o 'pkg:oci/[^"]*' baryon-controller-<version>.spdx.json | head -1
@@ -281,10 +285,10 @@ carries `-dirty`; release builds come from the clean tag and never do.
 2. The workspace version in `Cargo.toml` is the release version, and
    `docs/release-notes/v<version>.md` exists.
 3. A dry run of the release workflow on `main` (`workflow_dispatch`)
-   passes: the gate (all checks but the qualification status) and the
-   complete build with its identity checks. A dry run's artifacts can be
-   downloaded from the public workflow run; they are not attested and not
-   a release.
+   passes: the gate (all checks but those of the tag and the qualification
+   status) and the complete build with its identity checks. A dry run's
+   artifacts can be downloaded from the public workflow run; they are not
+   attested and not a release.
 4. Release qualification on a real cluster passes (see
    [testing.md](testing.md)); hardware E2E does not run in GitHub-hosted
    CI, which has no KVM. Qualification proves the commit and the build

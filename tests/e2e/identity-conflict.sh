@@ -6,7 +6,8 @@
 # can arrange, so the script injects one as a cluster administrator: it
 # pauses baryon-controller, replaces the Anchor Pod of VM B with a copy that
 # claims another VM UID whose identity equals that of a running VM A on the
-# same node (found by search, about 10^9 SHA-256 operations), and resumes
+# same node (found by search; the script mirrors the internal identity
+# function of crates/runtime-api, which may change), and resumes
 # baryon-controller. The pod is created as baryon-controller
 # (impersonation), as the admission policies require. VM B's root disk is a
 # raw block device, so the copy's fsGroup changes nothing on it.
@@ -30,7 +31,7 @@
 #   OLD_ANCHOR_IMAGE  optional anchor image of an earlier release, by digest
 #   COLLIDE           optional command that prints a UUID with the identity
 #                     given as its argument; the default is a python3
-#                     search, which takes several minutes even on many cores
+#                     search, which can take several minutes
 # Needs python3, and permission to scale baryon-controller and to
 # impersonate its service account (a cluster administrator).
 set -euo pipefail
@@ -83,7 +84,7 @@ cond() { # cond <vm> <type>: "<status>/<reason>"
 ready() { [ "$(cond "$1" Ready)" = True/GuestBooted ]; }
 pod_uid() { "${k[@]}" get pod "$1-anchor" -o jsonpath='{.metadata.uid}' 2>/dev/null; }
 conflict_nodes() { "${k[@]}" get virtualmachine "$b" -o jsonpath='{.status.identityConflictNodes}' 2>/dev/null; }
-identity() { # identity <vm-uid>: the VM's host identity (crates/runtime-api)
+identity() { # identity <vm-uid>: the VM's host identity; mirrors VmIdentity::for_vm in crates/runtime-api/src/identity.rs, change both together
   python3 -c 'import hashlib, sys; d = hashlib.sha256(sys.argv[1].encode()).digest(); print(1000000000 + int.from_bytes(d[:4], "big") % 1000000000)' "$1"
 }
 collide() { # collide <identity>: a UUID string with that identity

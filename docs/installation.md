@@ -96,7 +96,7 @@ image in the local Docker daemon, with the cloud-config and the output in
 docker run --rm --privileged -v /var/run/docker.sock:/var/run/docker.sock -v "<work-dir>:/work" \
   quay.io/kairos/auroraboot:v0.27.1 \
   --set disable_http_server=true --set disable_netboot=true \
-  --set disk.efi=true --set container_image=docker:ghcr.io/wrkode/baryon-hadron:v0.1.0-rc2-k0s \
+  --set disk.efi=true --set container_image=docker:ghcr.io/wrkode/baryon-hadron:v0.1.0-rc3-k0s \
   --set state_dir=/work/aurora --cloud-config /work/cloud-config.yaml
 ```
 
@@ -356,7 +356,7 @@ and image has a GitHub artifact attestation that ties its digest to the
 release workflow, the tag, and the commit of `wrkode/baryon`. Verify the
 files and the images (the commit is the one the tag points to; the
 commands are in [release.md](release.md#verifying-a-release), including a
-way without a GitHub login):
+way without a GitHub login).
 
 First check the tag: its signature against the maintainer's key pinned
 in [release.md](release.md#tags-and-releases), and that its commit is on
@@ -394,6 +394,9 @@ rebuilt by the release workflow from their tags, passed a smoke test on
 the k0s cluster after each tag
 ([v0.1.0-rc1](testing.md#published-artifacts-smoke-test),
 [v0.1.0-rc2](testing.md#published-v010-rc2-artifacts-smoke-test)).
+The tag signature and attestation commands are first run on a published
+release in the smoke test of v0.1.0-rc3
+([release.md](release.md#verifying-a-release)).
 
 ### Restricted registries and mirrors
 
@@ -484,13 +487,14 @@ Each Baryon node has a VirtualizationNode that is `Ready` with reason
 ```
 $ kubectl get virtualizationnodes
 NAME    READY   REASON         VMS   RUNTIME     HYPERVISOR   HEARTBEAT   AGE
-node1   True    RuntimeReady   0     0.1.0-rc2   v54.0        12s         12m
-node2   True    RuntimeReady   0     0.1.0-rc2   v54.0        9s          12m
-node3   True    RuntimeReady   0     0.1.0-rc2   v54.0        21s         12m
+node1   True    RuntimeReady   0     0.1.0-rc3   v54.0        12s         12m
+node2   True    RuntimeReady   0     0.1.0-rc3   v54.0        9s          12m
+node3   True    RuntimeReady   0     0.1.0-rc3   v54.0        21s         12m
 ```
 
-The v0.1.0-rc2 host image ships Cloud Hypervisor v54.0 (v0.1.0-rc1:
-v53.0).
+The v0.1.0-rc3 and v0.1.0-rc2 host images ship Cloud Hypervisor v54.0
+(v0.1.0-rc1: v53.0); a node on the v0.1.0-rc2 host image shows
+`0.1.0-rc2`.
 
 Each Baryon node advertises VM and import slots:
 
@@ -677,6 +681,13 @@ Status:
   checkout, and in the v0.1.0-rc1 release validation with release files,
   from a release-like build of 8db33bb to one of c3a3735; running VMs kept
   running ([testing.md](testing.md#v010-rc1-release-validation)).
+- From the published v0.1.0-rc1 release to 0.1.0-rc2, the cluster release
+  and then the hosts, with VMs running: Tested in the
+  [v0.1.0-rc2 release qualification](testing.md#v010-rc2-release-qualification).
+  From the published v0.1.0-rc2 release to 0.1.0-rc3, the cluster release
+  over v0.1.0-rc2 hosts and then the hosts: part of the v0.1.0-rc3 release
+  qualification, whose results are recorded in
+  [testing.md](testing.md#v010-rc3-release-qualification) after the tag.
 - Host images with Kairos Operator v0.2.2, one `NodeOpUpgrade` per node and
   the runbook including its step 5 check: Tested on all three nodes of the
   k0s cluster in the release validation, with the upgrade image preloaded
@@ -702,6 +713,14 @@ Status:
   imports with the anchor image, and the policies of 0.1.0-rc2 that the
   0.1.0-rc1 `baryon.yaml` does not contain stay installed until they are
   deleted.
+- Rolling the cluster release back from 0.1.0-rc3 to 0.1.0-rc2: Not
+  tested. The CRDs and classes are the same, and the 0.1.0-rc2 controller
+  and node agent create the same pods as 0.1.0-rc3 (their manifests and
+  the Anchor and import Pod builder are unchanged), so the policies of
+  0.1.0-rc3, which the 0.1.0-rc2 `baryon.yaml` does not remove, admit
+  them; they stay installed until they are deleted. Keep the refusing
+  `baryon-vm-guest-config` installed if the cluster will later take the
+  release that adds guest configuration (ADR 0014).
 - Rolling a host image back through Kairos A/B within the same runtime
   protocol major version: any 1.x host image works with any 1.x cluster
   release (ADR 0012); the older image lacks the host-side safety fixes of

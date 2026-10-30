@@ -607,9 +607,10 @@ Results come from three environments:
 Results from the kind host are not results for a Baryon host; they are
 listed because some behavior was observed only there. The runs recorded
 here were made from 2026-10-03 to 2026-10-05, except the Cloud Hypervisor
-v54.0 run of 2026-10-27, the anchor authority change runs, and the
+v54.0 run of 2026-10-27, the anchor authority change runs, the
 v0.1.0-rc2 release qualification and smoke test of 2026-10-29 and
-2026-10-30.
+2026-10-30, and the identity conflict run and the v0.1.0-rc3 release
+qualification from 2026-10-30.
 
 ### k0s cluster
 
