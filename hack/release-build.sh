@@ -63,6 +63,11 @@ for i in "${images[@]}"; do
   "${skopeo[@]}" copy --quiet --dest-compress-format gzip \
     "docker-archive:_oci/archive/$name.tar" "oci:_oci/$name:$tag"
   digest="sha256:$("${skopeo[@]}" inspect --raw "oci:_oci/$name:$tag" | sha256sum | cut -d' ' -f1)"
+  # The identity checks below inspect the Docker image; the layout must hold
+  # that image (the same config, so the same labels and layers' content).
+  config="$("${skopeo[@]}" inspect --raw "oci:_oci/$name:$tag" | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')"
+  [ "$config" = "$(docker inspect -f '{{.Id}}' "$registry/$i")" ] \
+    || fail "the OCI layout of $name does not hold the checked image ($config)"
   echo "$name $digest" >> _oci/digests
 done
 rm -rf _oci/archive

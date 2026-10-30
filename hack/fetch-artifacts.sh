@@ -27,4 +27,6 @@ if [ ! -f "$out/virtiofsd" ] || ! echo "$VIRTIOFSD_SHA256  $out/virtiofsd" | sha
 fi
 echo "$VIRTIOFSD_SHA256  $out/virtiofsd" | sha256sum -c --quiet -
 chmod 0755 "$out/virtiofsd"
+# The SBOM tool of the release workflow.
+fetch "$SYFT_URL" "$out/syft.tar.gz" "$SYFT_SHA256"
 echo "artifacts verified in $out"

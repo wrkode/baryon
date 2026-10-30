@@ -91,11 +91,20 @@ no pull request runs it.
 | gate | `contents: read`, `actions: read`, `statuses: read` | `hack/release-gate.sh`: the release gate below |
 | build | `contents: read` | `hack/release-build.sh`: builds every file and image, converts each image once into an OCI image layout whose manifest digest is the published digest, renders the manifests with those digests, generates the SBOMs from the layouts, checks the release identity, and writes `SHA256SUMS` |
 | attest | `contents: read`, `id-token: write`, `attestations: write` | GitHub artifact attestations (SLSA build provenance) for every release file and every image digest |
-| publish | `contents: write`, `packages: write` | Copies each OCI layout to ghcr.io unchanged (`skopeo copy --preserve-digests`), checks that the registry digest and the tag are the built digest, and creates the GitHub release (a prerelease for a version with a prerelease part) |
+| publish | `contents: write`, `packages: write` | Copies each OCI layout to ghcr.io unchanged (`skopeo copy --preserve-digests`), refuses to move a tag that exists with another digest, checks that the registry digest and the tag are the built digest, checks that every image can be pulled without credentials, and creates the GitHub release (a prerelease for a version with a prerelease part) |
 
 The publish job checks out no repository code, and the attest job runs
 before it, so nothing is published without its attestations. The build
-job holds no write permission.
+job holds no write permission. The attest and publish jobs run in the
+GitHub environment `release`, which only `v*` tags may use. The build
+job's outputs (the SHA-256 of `SHA256SUMS`, of the image list, and of the
+release notes, and each image digest), which GitHub keeps apart from the
+workflow artifacts, bind what attest and publish receive to what the
+build checked: both jobs compare the artifacts with them, and require the
+release files to be exactly those listed in `SHA256SUMS`. The attest job
+takes the image digests from those outputs. syft, which writes the SBOMs,
+is downloaded by URL and checked against the SHA-256 pinned in
+`packaging/versions.env`.
 
 ### Release gate
 
@@ -103,17 +112,30 @@ The gate fails closed: any check it cannot make fails the release.
 
 - The tag equals `v` and the workspace version in `Cargo.toml`, and
   `docs/release-notes/v<version>.md` exists.
-- The tag is annotated, points to the workflow's commit, and carries a
-  signature that GitHub verifies (`verification.verified` of the tag
-  object), and no release of that tag exists yet.
+- The tag is annotated, points to the workflow's commit, and is signed
+  by a key listed in the repository variable `RELEASE_ALLOWED_SIGNERS`
+  (`git verify-tag`), and GitHub verifies that signature; no release of
+  that tag exists yet (any other answer than not found fails the gate).
 - The commit is reachable from `main` as fetched from GitHub, not from a
   local branch.
 - The latest run of the CI workflow (`.github/workflows/ci.yaml`) on the
   push of that exact commit to `main` completed successfully.
 - Release qualification passed on that exact commit: the commit has a
   `success` status with context `baryon/release-qualification`, set by a
-  maintainer (a user account, not a workflow) after the qualification
-  below. A dry run reports a missing status and continues.
+  user account listed in the repository variable `RELEASE_QUALIFIERS`
+  (today only the maintainer) after the qualification below. A dry run
+  reports a missing status and continues.
+
+The gate is code in the tagged commit, so it is a process control against
+releasing a wrong or unqualified commit, not a security boundary: a
+principal with write access to the repository could tag a commit whose
+workflow omits it, and the result would still carry attestations for that
+tag. What such a principal cannot produce is the tag signature, made with
+a key on the maintainer's machine. Consumers therefore check the tag
+signature against the pinned key and the commit's ancestry on `main`, as
+well as the attestations ([Verifying a release](#verifying-a-release)).
+The repository settings narrow it further: only administrators may create
+`v*` tags, and only `v*` tags may use the `release` environment.
 
 The build job then checks the identity of every artifact against the tag
 and the commit: each component binary reports the version and is stamped
@@ -129,23 +151,39 @@ crates. Any mismatch fails the build.
 ### Tags and releases
 
 Release tags are annotated tags signed with the maintainer's SSH signing
-key that GitHub verifies (`git tag -s`; the key is the one registered for
-signing on the maintainer's GitHub account). The signature shows who
-created the tag; artifact attestations (below) are the means of verifying
-release artifacts.
+key (`git tag -s`). The key, pinned here and in the repository variable
+`RELEASE_ALLOWED_SIGNERS`:
+
+```text
+william.rizzo@gmail.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ53Xu8rRSofCQqb91XUgZqQam+5Q2e7tOwr0egG/W5x
+```
+
+Fingerprint `SHA256:ALS0VrMI2tXe5rUJX6PSHkkl432pIt1shD8+axLi/Zs`. The
+signature shows that the maintainer created the tag; together with the
+commit's ancestry on `main` it is the consumer's check that a release was
+made by the maintainer, and the artifact attestations (below) tie each
+file and image to the release workflow run of that tag. Releases before
+v0.1.0-rc3 have unsigned tags.
 
 Repository rules, configured on GitHub:
 
-- `refs/tags/v*` (ruleset "release tags"): a tag can be created, but not
-  deleted, moved, or force-updated, by anyone, including administrators.
-  A mistaken tag is replaced by a new release candidate, never reused.
+- `refs/tags/v*` (ruleset "release tags"): a tag cannot be deleted,
+  moved, or force-updated, by anyone, including administrators. A
+  mistaken tag is replaced by a new release candidate, never reused.
+- `refs/tags/v*` (ruleset "release tag creation"): only repository
+  administrators may create a release tag.
+- The environment `release`, used by the attest and publish jobs, accepts
+  only `v*` tags.
 - `refs/heads/main` (ruleset "main history"): no deletion and no force
   push, so the history that the gate checks against cannot be rewritten.
 - Immutable releases are enabled: once published, a release's tag and
   files cannot be changed or deleted; its title and notes can be edited.
 
-A change to these rules is made by the repository owner in the repository
-settings and recorded here.
+Image tags on ghcr.io can be changed by anyone with package write
+access; the digests in `baryon.yaml` and `images.txt` are what the
+attestations cover and what an installation uses. A change to these rules
+is made by the repository owner in the repository settings and recorded
+here.
 
 ## Verifying a release
 
@@ -159,6 +197,17 @@ gh release download <version> --repo wrkode/baryon   # or download each file fro
 sha256sum --check SHA256SUMS
 ```
 
+The tag: check its signature against the pinned key above, and that its
+commit is on `main`:
+
+```bash
+git clone https://github.com/wrkode/baryon.git && cd baryon
+echo 'william.rizzo@gmail.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ53Xu8rRSofCQqb91XUgZqQam+5Q2e7tOwr0egG/W5x' > ../allowed_signers
+git -c gpg.ssh.allowedSignersFile=../allowed_signers verify-tag <version>
+git merge-base --is-ancestor "<version>^{commit}" origin/main && echo "on main"
+git rev-parse "<version>^{commit}"   # the <commit> for the commands below
+```
+
 Build provenance (GitHub artifact attestations, signed through Sigstore
 with the release workflow's identity). Each attestation binds the
 artifact's SHA-256 digest to the repository, the workflow file, the tag,
@@ -168,10 +217,10 @@ command:
 ```bash
 gh attestation verify baryon.yaml --repo wrkode/baryon \
   --signer-workflow wrkode/baryon/.github/workflows/release.yaml \
-  --source-ref refs/tags/<version> --source-digest <commit>
+  --source-ref refs/tags/<version> --source-digest <commit> --deny-self-hosted-runners
 gh attestation verify oci://ghcr.io/wrkode/baryon-controller@<digest> --repo wrkode/baryon \
   --signer-workflow wrkode/baryon/.github/workflows/release.yaml \
-  --source-ref refs/tags/<version> --source-digest <commit>
+  --source-ref refs/tags/<version> --source-digest <commit> --deny-self-hosted-runners
 ```
 
 Without a login, fetch the attestation bundle from the public API and
@@ -183,7 +232,7 @@ curl -s "https://api.github.com/repos/wrkode/baryon/attestations/$digest" \
   | jq '.attestations[0].bundle' > baryon.yaml.bundle.json
 gh attestation verify baryon.yaml --bundle baryon.yaml.bundle.json --repo wrkode/baryon \
   --signer-workflow wrkode/baryon/.github/workflows/release.yaml \
-  --source-ref refs/tags/<version> --source-digest <commit>
+  --source-ref refs/tags/<version> --source-digest <commit> --deny-self-hosted-runners
 ```
 
 Image identity: `images.txt` names every image by digest, and
@@ -204,16 +253,10 @@ syft scan file:baryon-virtd-<version>-x86_64-linux-musl
 syft scan registry:ghcr.io/wrkode/baryon-controller@<digest>
 ```
 
-The tag signature: the release page shows the tag as Verified, and so does
-`gh api repos/wrkode/baryon/git/tags/<tag-object-sha> --jq .verification`.
-To check it with Git, list the maintainer's signing keys as allowed
-signers:
-
-```bash
-curl -s https://api.github.com/users/wrkode/ssh_signing_keys \
-  | jq -r '.[] | "william.rizzo@gmail.com " + .key' > allowed_signers
-git -c gpg.ssh.allowedSignersFile=allowed_signers verify-tag <version>
-```
+Status: these commands are first exercised on a published release by
+the smoke test of v0.1.0-rc3, without a GitHub login for everything but
+the online `gh attestation verify` form; its result is recorded in
+[testing.md](testing.md).
 
 Releases before v0.1.0-rc3 (v0.1.0-rc1, v0.1.0-rc2) were published from
 the private repository: they have checksums and SBOMs but no
@@ -239,10 +282,15 @@ carries `-dirty`; release builds come from the clean tag and never do.
    `docs/release-notes/v<version>.md` exists.
 3. A dry run of the release workflow on `main` (`workflow_dispatch`)
    passes: the gate (all checks but the qualification status) and the
-   complete build with its identity checks.
+   complete build with its identity checks. A dry run's artifacts can be
+   downloaded from the public workflow run; they are not attested and not
+   a release.
 4. Release qualification on a real cluster passes (see
    [testing.md](testing.md)); hardware E2E does not run in GitHub-hosted
-   CI, which has no KVM. It runs on the exact candidate commit: images,
+   CI, which has no KVM. Qualification proves the commit and the build
+   procedure, not the published bytes: the release workflow builds again,
+   with different digests, and only the smoke test of step 8 checks the
+   published artifacts. It runs on the exact candidate commit: images,
    the host image, and the release files are built from a clean checkout
    of that commit, and the tag is placed on that commit. Any change after
    qualification, documentation included, makes a new candidate that is
@@ -270,11 +318,14 @@ retried by re-running the workflow run; the tag stays where it is. A
 failure that needs a change to the repository is fixed forward: correct
 the problem on `main` and release a new release candidate with a new tag
 (with its own workspace version and release notes), qualified again. The
-tag ruleset prevents deleting or moving a pushed tag, and a tag name is
+tag rulesets prevent deleting or moving a pushed tag, and a tag name is
 never reused: images and files that carry its name may already have been
 pulled.
 
-The publish job pushes the images before it creates the GitHub release.
-If it fails after pushing images, re-run it: the pushes are of the same
-OCI layouts, so the digests are the same. Images left from a run that is
-abandoned stay under that tag's name; they are not part of any release.
+Once the publish job has started, use "Re-run failed jobs" only, which
+reuses the build of the same run: the pushes are of the same OCI layouts,
+so the digests are the same. Re-running all jobs would build again with
+different digests; the publish job then refuses to move a tag that exists
+with another digest, and the release has to be fixed forward. Images left
+from a run that is abandoned stay under that tag's name; they are not part
+of any release.

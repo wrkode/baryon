@@ -358,11 +358,17 @@ files and the images (the commit is the one the tag points to; the
 commands are in [release.md](release.md#verifying-a-release), including a
 way without a GitHub login):
 
+First check the tag: its signature against the maintainer's key pinned
+in [release.md](release.md#tags-and-releases), and that its commit is on
+`main` (the commands are in
+[release.md](release.md#verifying-a-release)). Then, with the commit of
+the tag:
+
 ```bash
 v=v0.1.0-rc3
-c=$(git ls-remote https://github.com/wrkode/baryon "refs/tags/$v^{}" | cut -f1)
+c=<commit of the tag, from the check above>
 opts=(--repo wrkode/baryon --signer-workflow wrkode/baryon/.github/workflows/release.yaml
-      --source-ref "refs/tags/$v" --source-digest "$c")
+      --source-ref "refs/tags/$v" --source-digest "$c" --deny-self-hosted-runners)
 gh attestation verify SHA256SUMS "${opts[@]}"
 gh attestation verify baryon.yaml "${opts[@]}"
 for ref in $(sed 's/^[^:]*: //' images.txt); do
@@ -630,9 +636,10 @@ Baryon has two parts that are upgraded separately
 
 Read the release notes and the
 [API change log](api-stability.md#change-log-per-release) first. The
-upgrade from 0.1.0-rc1 to 0.1.0-rc2 is the procedure below; the CRDs and
-classes do not change. For the upgrade from an earlier commit to
-0.1.0-rc1, follow
+upgrade from 0.1.0-rc2 to 0.1.0-rc3, and from 0.1.0-rc1 to 0.1.0-rc2, is
+the procedure below; the CRDs and classes do not change. From 0.1.0-rc1 to
+0.1.0-rc3, go through 0.1.0-rc2; the direct upgrade is Not tested. For the
+upgrade from an earlier commit to 0.1.0-rc1, follow
 [Upgrade to 0.1.0-rc1](compatibility.md#upgrade-to-010-rc1).
 
 Cluster release, in this order and close together:
@@ -656,9 +663,13 @@ migration is not supported.
 
 Order between the two: within a runtime protocol major version, either part
 can go first, and mixed host versions are allowed during the rollout
-([upgrade order](compatibility.md#upgrade-order)). Finish the host rollout,
-so that every node runs a host image of the cluster release or later: older
-host images lack its host-side safety fixes.
+([upgrade order](compatibility.md#upgrade-order)). The minimum host image of
+each cluster release is in
+[compatibility.md](compatibility.md#which-combinations-work); a host older
+than that lacks host-side safety fixes, so finish the host rollout up to
+it. For the 0.1.0-rc3 cluster release the minimum is the 0.1.0-rc2 host
+image; moving hosts to the 0.1.0-rc3 host image is optional (it changes
+only the build) and stops the VMs of each node in turn.
 
 Status:
 

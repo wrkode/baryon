@@ -11,6 +11,12 @@
 #                 run: the tag checks are skipped and a missing release
 #                 qualification is reported, not fatal)
 #   GITHUB_SHA    the commit the workflow runs on
+#   ALLOWED_SIGNERS  Git allowed signers file content (SSH keys allowed to
+#                 sign release tags), from the repository variable
+#                 RELEASE_ALLOWED_SIGNERS; required for a tag push
+#   QUALIFIERS    space-separated GitHub logins allowed to record release
+#                 qualification, from the repository variable
+#                 RELEASE_QUALIFIERS; required for a tag push
 #   GITHUB_REF_NAME, GITHUB_OUTPUT  as set by GitHub Actions
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
@@ -36,14 +42,21 @@ if [ "$EVENT" = push ]; then
   [ "$tag" = "$version" ] || fail "tag $tag does not match the workspace version $version"
   [ "$(git cat-file -t "refs/tags/$tag")" = tag ] || fail "tag $tag is not an annotated tag"
   [ "$(git rev-parse "refs/tags/$tag^{commit}")" = "$sha" ] || fail "tag $tag does not point to $sha"
-  # The tag must be signed with a key GitHub verifies for the tagger.
-  verified="$(gh api "repos/$REPO/git/tags/$(git rev-parse "refs/tags/$tag")" --jq '.verification.verified')"
-  [ "$verified" = true ] || fail "tag $tag has no signature that GitHub verifies"
+  # The tag must be signed with a key pinned in the repository settings, and
+  # GitHub must verify the signature for the tagger.
+  [ -n "${ALLOWED_SIGNERS:-}" ] || fail "RELEASE_ALLOWED_SIGNERS is not set"
+  signers="$(mktemp)"
+  printf '%s\n' "$ALLOWED_SIGNERS" > "$signers"
+  git -c gpg.ssh.allowedSignersFile="$signers" verify-tag "$tag" \
+    || fail "tag $tag is not signed by an allowed signer"
+  verification="$(gh api "repos/$REPO/git/tags/$(git rev-parse "refs/tags/$tag")" --jq '"\(.verification.verified) \(.verification.reason)"')"
+  [ "$verification" = "true valid" ] || fail "GitHub does not verify the signature of $tag ($verification)"
   # The tag name must not have been used for a published release already.
-  if gh api "repos/$REPO/releases/tags/$tag" >/dev/null 2>&1; then
+  if out="$(gh api "repos/$REPO/releases/tags/$tag" 2>&1)"; then
     fail "a release for $tag exists already"
   fi
-  note "tag $tag: annotated, signed and verified, points to the commit"
+  grep -q 'HTTP 404' <<< "$out" || fail "cannot check for an existing release of $tag: $out"
+  note "tag $tag: annotated, signed by an allowed signer and verified, points to the commit"
 fi
 
 # The commit must be on main as GitHub has it, not only in this checkout.
@@ -67,8 +80,15 @@ esac
 # sets on the exact qualified commit (docs/release.md).
 qual="$(gh api "repos/$REPO/commits/$sha/statuses?per_page=100" \
   --jq '[.[] | select(.context == "baryon/release-qualification")] | first | "\(.state) \(.creator.type) \(.creator.login)"')"
+qualifier="${qual##* }"
+case " ${QUALIFIERS:-} " in
+  *" $qualifier "*) allowed=yes ;;
+  *) allowed=no ;;
+esac
 case "$qual" in
-  "success User "*) note "release qualification recorded on $sha by ${qual##* }" ;;
+  "success User "*) [ "$allowed" = yes ] || [ "$EVENT" != push ] \
+      || fail "release qualification on $sha was recorded by $qualifier, who is not in RELEASE_QUALIFIERS"
+    note "release qualification recorded on $sha by $qualifier (allowed: $allowed)" ;;
   *)
     if [ "$EVENT" = push ]; then
       fail "no successful baryon/release-qualification status on $sha (${qual:-none})"

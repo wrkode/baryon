@@ -15,7 +15,11 @@ name: release
 #   publish  package and release write only: copies the OCI layouts to
 #            ghcr.io unchanged, checks the digests, creates the release
 # No job runs code from a pull request: the workflow has no pull request
-# trigger.
+# trigger. attest and publish run in the GitHub environment "release",
+# which only v* tags may use (a repository setting, docs/release.md). The
+# build job's outputs (the digests of SHA256SUMS, of the image list, and
+# of each image), which GitHub keeps apart from the artifacts, bind the
+# artifacts that attest and publish receive to what the build checked.
 
 on:
   push:
@@ -23,6 +27,10 @@ on:
   workflow_dispatch:
 
 permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,6 +57,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT: ${{ github.event_name }}
+          ALLOWED_SIGNERS: ${{ vars.RELEASE_ALLOWED_SIGNERS }}
+          QUALIFIERS: ${{ vars.RELEASE_QUALIFIERS }}
         run: hack/release-gate.sh
 
   build:
@@ -59,21 +69,42 @@ jobs:
     env:
       VERSION: ${{ needs.gate.outputs.version }}
       REGISTRY: ghcr.io/${{ github.repository_owner }}
+    outputs:
+      sums: ${{ steps.bind.outputs.sums }}
+      digests: ${{ steps.bind.outputs.digests }}
+      notes: ${{ steps.bind.outputs.notes }}
+      baryon_anchor: ${{ steps.bind.outputs.baryon_anchor }}
+      baryon_importer: ${{ steps.bind.outputs.baryon_importer }}
+      baryon_node_agent: ${{ steps.bind.outputs.baryon_node_agent }}
+      baryon_controller: ${{ steps.bind.outputs.baryon_controller }}
+      baryon_hadron: ${{ steps.bind.outputs.baryon_hadron }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Commit is the gated commit
         run: test "$(git rev-parse HEAD)" = "${{ needs.gate.outputs.sha }}"
-      - name: syft
-        id: syft
-        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - name: syft, pinned by SHA-256
+        run: |
+          . packaging/versions.env
+          mkdir -p "$RUNNER_TEMP/syft"
+          curl -fsSL -o "$RUNNER_TEMP/syft.tar.gz" "$SYFT_URL"
+          echo "$SYFT_SHA256  $RUNNER_TEMP/syft.tar.gz" | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$RUNNER_TEMP/syft" syft
+          "$RUNNER_TEMP/syft/syft" version | grep -q "${SYFT_VERSION#v}"
       - name: Build and check the release
-        env:
-          SYFT: ${{ steps.syft.outputs.cmd }}
-        run: hack/release-build.sh "$VERSION"
+        run: SYFT="$RUNNER_TEMP/syft/syft" hack/release-build.sh "$VERSION"
       - name: Release notes
         run: cp "docs/release-notes/$VERSION.md" _oci/release-notes.md
+      - name: Bind the artifacts
+        id: bind
+        run: |
+          {
+            echo "sums=$(sha256sum _release/SHA256SUMS | cut -d' ' -f1)"
+            echo "digests=$(sha256sum _oci/digests | cut -d' ' -f1)"
+            echo "notes=$(sha256sum _oci/release-notes.md | cut -d' ' -f1)"
+            while read -r name digest; do echo "${name//-/_}=$digest"; done < _oci/digests
+          } >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release
@@ -89,6 +120,7 @@ jobs:
     needs: [gate, build]
     if: needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: read
       id-token: write # Sigstore signing identity of this workflow run
@@ -98,17 +130,19 @@ jobs:
         with:
           name: release
           path: _release
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: oci
-          path: _oci
-      - name: Image digests
-        id: digests
+      - name: The release files are the built files
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+          IMAGES: >-
+            ${{ needs.build.outputs.baryon_anchor }} ${{ needs.build.outputs.baryon_importer }}
+            ${{ needs.build.outputs.baryon_node_agent }} ${{ needs.build.outputs.baryon_controller }}
+            ${{ needs.build.outputs.baryon_hadron }}
         run: |
+          set -euo pipefail
+          test "$(sha256sum _release/SHA256SUMS | cut -d' ' -f1)" = "$SUMS"
           (cd _release && sha256sum --check --strict SHA256SUMS)
-          while read -r name digest; do
-            echo "${name//-/_}=$digest" >> "$GITHUB_OUTPUT"
-          done < _oci/digests
+          test "$(find _release -maxdepth 1 -type f -printf '%f\n' | sort)" = "$( (awk '{print $2}' _release/SHA256SUMS; echo SHA256SUMS) | sort)"
+          for d in $IMAGES; do grep -qF "@$d" _release/images.txt; done
       - name: Provenance of the release files
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
@@ -117,32 +151,33 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/baryon-anchor
-          subject-digest: ${{ steps.digests.outputs.baryon_anchor }}
+          subject-digest: ${{ needs.build.outputs.baryon_anchor }}
       - name: Provenance of the importer image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/baryon-importer
-          subject-digest: ${{ steps.digests.outputs.baryon_importer }}
+          subject-digest: ${{ needs.build.outputs.baryon_importer }}
       - name: Provenance of the node agent image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/baryon-node-agent
-          subject-digest: ${{ steps.digests.outputs.baryon_node_agent }}
+          subject-digest: ${{ needs.build.outputs.baryon_node_agent }}
       - name: Provenance of the controller image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/baryon-controller
-          subject-digest: ${{ steps.digests.outputs.baryon_controller }}
+          subject-digest: ${{ needs.build.outputs.baryon_controller }}
       - name: Provenance of the host image
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ghcr.io/${{ github.repository_owner }}/baryon-hadron
-          subject-digest: ${{ steps.digests.outputs.baryon_hadron }}
+          subject-digest: ${{ needs.build.outputs.baryon_hadron }}
 
   publish:
     needs: [gate, build, attest]
     if: needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-24.04
+    environment: release
     permissions:
       contents: write # create the GitHub release
       packages: write # push the images to ghcr.io
@@ -159,23 +194,49 @@ jobs:
         with:
           name: oci
           path: _oci
+      - name: The artifacts are the built artifacts
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+          DIGESTS: ${{ needs.build.outputs.digests }}
+          NOTES: ${{ needs.build.outputs.notes }}
+        run: |
+          set -euo pipefail
+          test "$(sha256sum _release/SHA256SUMS | cut -d' ' -f1)" = "$SUMS"
+          (cd _release && sha256sum --check --strict SHA256SUMS)
+          test "$(find _release -maxdepth 1 -type f -printf '%f\n' | sort)" = "$( (awk '{print $2}' _release/SHA256SUMS; echo SHA256SUMS) | sort)"
+          test "$(sha256sum _oci/digests | cut -d' ' -f1)" = "$DIGESTS"
+          test "$(sha256sum _oci/release-notes.md | cut -d' ' -f1)" = "$NOTES"
+          while read -r name digest; do grep -qF "$name@$digest" _release/images.txt; done < _oci/digests
       - name: Push the images unchanged and check their digests
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          (cd _release && sha256sum --check --strict SHA256SUMS)
           echo "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           while read -r name digest; do
             tag="$VERSION"
             [ "$name" = baryon-hadron ] && tag="$VERSION-k0s"
             test "sha256:$(skopeo inspect --raw "oci:_oci/$name:$tag" | sha256sum | cut -d' ' -f1)" = "$digest"
+            # A release tag never moves: a tag that exists with another
+            # digest (from an earlier run of this release) stops the publish.
+            existing="$(skopeo inspect --format '{{.Digest}}' "docker://$REGISTRY/$name:$tag" 2>/dev/null || true)"
+            if [ -n "$existing" ] && [ "$existing" != "$digest" ]; then
+              echo "$REGISTRY/$name:$tag exists with $existing, not the built $digest" >&2
+              exit 1
+            fi
             skopeo copy --preserve-digests "oci:_oci/$name:$tag" "docker://$REGISTRY/$name:$tag"
             test "sha256:$(skopeo inspect --raw "docker://$REGISTRY/$name@$digest" | sha256sum | cut -d' ' -f1)" = "$digest"
             test "$(skopeo inspect --format '{{.Digest}}' "docker://$REGISTRY/$name:$tag")" = "$digest"
             echo "$REGISTRY/$name:$tag $digest"
           done < _oci/digests
           skopeo logout ghcr.io
+      - name: Every image can be pulled without credentials
+        run: |
+          set -euo pipefail
+          while read -r name digest; do
+            skopeo inspect --no-creds --raw "docker://$REGISTRY/$name@$digest" >/dev/null \
+              || { echo "$REGISTRY/$name@$digest cannot be pulled anonymously; make the package public" >&2; exit 1; }
+          done < _oci/digests
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -188,4 +249,4 @@ jobs:
           want=false
           [ "${#prerelease[@]}" -eq 0 ] || want=true
           test "$(gh api "repos/$REPO/releases/tags/$VERSION" --jq .prerelease)" = "$want"
-          test "$(gh api "repos/$REPO/releases/tags/$VERSION" --jq '.assets | length')" = "$(ls _release | wc -l)"
+          test "$(gh api "repos/$REPO/releases/tags/$VERSION" --jq '.assets | length')" = "$(find _release -maxdepth 1 -type f | wc -l)"
