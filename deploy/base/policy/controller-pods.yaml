@@ -1,0 +1,49 @@
+# baryon-controller may create only Anchor Pods and import Pods.
+#
+# Its RBAC allows creating pods in any namespace (deploy/base/controller/
+# rbac.yaml), because VMs live in any namespace. This policy narrows that to
+# the two kinds of pods it builds: every pod it creates must request
+# virtualization.baryon.io/vm or virtualization.baryon.io/import, so
+# baryon-vm-resource applies to it in full (one container, no capabilities,
+# no host namespaces or ports, only a claim and downward API volumes). A
+# compromised or defective controller can then not create a pod with host
+# access, for example one with the node agent's service account and its
+# host paths in baryon-system.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1). The
+# service account name must match deploy/base/controller/rbac.yaml.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-controller-pods
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  matchConditions:
+    - name: created-by-baryon-controller
+      expression: "request.userInfo.username == 'system:serviceaccount:baryon-system:baryon-controller'"
+  validations:
+    - expression: >-
+        object.spec.containers.exists(c, has(c.resources) &&
+          ['virtualization.baryon.io/vm', 'virtualization.baryon.io/import'].exists(r,
+            (has(c.resources.limits) && r in c.resources.limits) ||
+            (has(c.resources.requests) && r in c.resources.requests)))
+      message: "baryon-controller may create only pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-controller-pods
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-controller-pods
+  validationActions: [Deny]

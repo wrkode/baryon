@@ -223,6 +223,8 @@ kind: Pod
 metadata: {name: vm-pod, namespace: default}
 spec:
   automountServiceAccountToken: false
+  securityContext:
+    seccompProfile: {type: RuntimeDefault}
   containers:
     - name: c
       image: busybox:1.36
@@ -274,6 +276,7 @@ done
 # No other host access than the claim, even from baryon-controller: no host
 # network or IPC namespace, no host ports, and only claim and downward API
 # volumes (so no hostPath and no service account token).
+printf 'apiVersion: node.k8s.io/v1\nkind: RuntimeClass\nmetadata: {name: ci-other}\nhandler: ci-other\n' | k apply -f - >/dev/null
 withvols="$(printf '%s\n' "$vmpod" | sed 's/^spec:$/spec:\n  volumes: [{name: d, persistentVolumeClaim: {claimName: x}}, {name: a, downwardAPI: {items: [{path: p, fieldRef: {fieldPath: metadata.name}}]}}]/')"
 printf '%s\n' "$withvols" | k "${as_ctl[@]}" apply --dry-run=server -f - >/dev/null \
   || { echo "baryon-controller could not create a vm resource pod with claim and downward API volumes" >&2; exit 1; }
@@ -282,7 +285,11 @@ for edit in 's/^spec:$/spec:\n  hostNetwork: true/' 's/^spec:$/spec:\n  hostIPC:
     's/automountServiceAccountToken: false/automountServiceAccountToken: true/' \
     's/^spec:$/spec:\n  volumes: [{name: h, hostPath: {path: \/var\/lib}}]/' \
     's/^spec:$/spec:\n  volumes: [{name: e, emptyDir: {}}]/' \
-    's/^      image: busybox:1.36$/      image: busybox:1.36\n      ports: [{containerPort: 80, hostPort: 8080}]/'; do
+    's/^      image: busybox:1.36$/      image: busybox:1.36\n      ports: [{containerPort: 80, hostPort: 8080}]/' \
+    's/seccompProfile: {type: RuntimeDefault}/seccompProfile: {type: Unconfined}/' \
+    's/^        allowPrivilegeEscalation: false$/        allowPrivilegeEscalation: false\n        seccompProfile: {type: Unconfined}/' \
+    's/^        allowPrivilegeEscalation: false$/        allowPrivilegeEscalation: false\n        appArmorProfile: {type: Unconfined}/' \
+    's/^spec:$/spec:\n  runtimeClassName: ci-other/'; do
   out="$(printf '%s\n' "$vmpod" | sed "$edit" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
   echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with edit '$edit' was not denied: $out" >&2; exit 1; }
   echo "vm resource pod with edit '$edit' denied as expected"
@@ -302,7 +309,7 @@ echo "vm resource pod with two containers denied as expected"
 # baryon-controller.
 for sc in 's/drop: \[ALL\]/drop: [NET_RAW]/' 's/allowPrivilegeEscalation: false/allowPrivilegeEscalation: true/' \
     's/capabilities: {drop: \[ALL\]}/capabilities: {drop: [ALL], add: [NET_ADMIN]}/' 's/allowPrivilegeEscalation: false/privileged: true/' \
-    '/securityContext:/,/capabilities:/d'; do
+    '/^      securityContext:/,/capabilities:/d'; do
   out="$(printf '%s\n' "$vmpod" | sed "$sc" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
   echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with security context edit '$sc' was not denied: $out" >&2; exit 1; }
   echo "vm resource pod with security context edit '$sc' denied as expected"
@@ -468,6 +475,42 @@ sys_denied "node agent with an extra host path" "$na" 'p["spec"]["volumes"].appe
 sys_denied "node agent mounting the node socket directory read-write" "$na" '[m.update(readOnly=False) for m in c["volumeMounts"] if m["mountPath"] == "/run/baryon/node"]'
 sys_denied "the node agent host paths in a pod of another service account" "$na" 'p["spec"]["serviceAccountName"] = "baryon-controller"'
 sys_denied "controller with a host path" "$ctl" 'p["spec"]["volumes"] = [{"name": "h", "hostPath": {"path": "/run/baryon/node"}}]'
+for w in "$na" "$ctl"; do
+  sys_denied "$w adding a capability" "$w" 'c["securityContext"]["capabilities"]["add"] = ["SYS_MODULE"]'
+  sys_denied "$w with an unconfined container seccomp profile" "$w" 'c["securityContext"]["seccompProfile"] = {"type": "Unconfined"}'
+  sys_denied "$w without any seccomp profile" "$w" 'c["securityContext"].pop("seccompProfile", None); p["spec"].setdefault("securityContext", {}).pop("seccompProfile", None)'
+  sys_denied "$w AppArmor-unconfined" "$w" 'c["securityContext"]["appArmorProfile"] = {"type": "Unconfined"}'
+  sys_denied "$w with a sysctl" "$w" 'p["spec"].setdefault("securityContext", {})["sysctls"] = [{"name": "net.ipv4.ip_unprivileged_port_start", "value": "0"}]'
+  sys_denied "$w with an NFS volume" "$w" 'p["spec"].setdefault("volumes", []).append({"name": "n", "nfs": {"server": "example.org", "path": "/x"}})'
+done
+# Ephemeral containers: added to a real pod in baryon-system.
+sys_pod "$ctl" 'p["metadata"]["name"] = "ci-sys-real"' | k apply -f - >/dev/null
+out="$(k debug -n baryon-system ci-sys-real --image=busybox:1.36 -c dbg 2>&1 || true)"
+echo "$out" | grep -q baryon-system-pods || { echo "ephemeral container in baryon-system was not denied: $out" >&2; exit 1; }
+echo "baryon-system pod denied as expected: an ephemeral container"
+k delete pod ci-sys-real -n baryon-system --wait=false >/dev/null
+
+# baryon-controller may create only pods that request a Baryon resource
+# (policy/controller-pods.yaml), so it cannot create a pod with host access.
+ctl_denied() {
+  local what="$1"; shift
+  out="$("$@" 2>&1 || true)"
+  echo "$out" | grep -q baryon-controller-pods || { echo "not denied by baryon-controller-pods: $what: $out" >&2; exit 1; }
+  echo "denied as expected: $what"
+}
+for i in $(seq 1 30); do
+  out="$(k run ci-ctl-plain --image=busybox:1.36 --dry-run=server "${as_ctl[@]}" 2>&1 || true)"
+  echo "$out" | grep -q baryon-controller-pods && break
+  sleep 2
+done
+ctl_denied "controller creates a pod without a Baryon resource" k run ci-ctl-plain --image=busybox:1.36 --dry-run=server "${as_ctl[@]}"
+out="$(sys_pod "$na" pass | k apply --dry-run=server "${as_ctl[@]}" -f - 2>&1 || true)"
+echo "$out" | grep -q baryon-controller-pods \
+  || { echo "not denied by baryon-controller-pods: the node agent pod template in baryon-system: $out" >&2; exit 1; }
+echo "denied as expected: controller creates the node agent pod template in baryon-system"
+printf '%s\n' "$vmpod" | k "${as_ctl[@]}" apply --dry-run=server -f - >/dev/null \
+  || { echo "baryon-controller could not create a vm resource pod" >&2; exit 1; }
+echo "allowed as expected: controller creates a pod that requests the vm resource"
 
 # The refusing form of baryon-vm-guest-config (policy/guest-config.yaml)
 # admits every VirtualMachine of this release, and refuses spec.guestConfig

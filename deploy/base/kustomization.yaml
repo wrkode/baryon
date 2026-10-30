@@ -17,4 +17,5 @@ resources:
   - policy/import-approval.yaml
   - policy/system-pods.yaml
   - policy/guest-config.yaml
+  - policy/controller-pods.yaml
   - tenant/roles.yaml

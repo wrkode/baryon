@@ -203,10 +203,15 @@ The admission policies of the installation changed
 ([security.md](security.md#admission-policies)):
 
 - Baryon pods (Anchor Pods and import Pods) are also refused when they use
-  the host network or IPC namespace or host ports, or a volume other than
-  a PersistentVolumeClaim or the downward API.
-- New: `baryon-system-pods` limits the host access of pods in the
-  `baryon-system` namespace to the node agent's two host directories.
+  the host network or IPC namespace or host ports, a volume other than a
+  PersistentVolumeClaim or the downward API, a seccomp profile other than
+  `RuntimeDefault` or `Localhost`, an unconfined AppArmor profile, or a
+  `runtimeClassName`.
+- New: `baryon-system-pods` holds pods in the `baryon-system` namespace to
+  at least the baseline Pod Security level, allows `hostPath` only to the
+  node agent's two directories, and refuses ephemeral containers there.
+- New: `baryon-controller-pods` lets baryon-controller create only pods
+  that request a Baryon resource.
 - New: `baryon-vm-guest-config`, the refusing form of the ADR 0014 policy;
   it admits every VirtualMachine of this release.
 

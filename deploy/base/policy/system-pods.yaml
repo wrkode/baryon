@@ -4,20 +4,33 @@
 # The namespace enforces the privileged Pod Security level because
 # baryon-node-agent mounts two host paths (namespace.yaml), so Pod Security
 # admission does not limit what else a pod there may request. This policy
-# does, as an allowlist:
+# does, as an allowlist that is at least as strict as the baseline Pod
+# Security level, plus the node agent's host paths:
 #
 # - No pod uses the host network, PID, or IPC namespace, host ports, or a
 #   privileged container. Neither baryon-controller nor baryon-node-agent
 #   needs any of them.
-# - hostPath volumes are allowed only in pods of the baryon-node-agent
-#   service account, and only for its two directories: the kubelet device
-#   plugin directory (read-write: the device plugin creates its socket
-#   there) and /run/baryon/node (read-only: the baryon-virtd node socket).
-#   Every mount of the latter must be read-only.
+# - Every container and init container adds no capability, runs with the
+#   RuntimeDefault or a Localhost seccomp profile (its own or the pod's),
+#   is not AppArmor-unconfined, has the default /proc mount, and is not a
+#   Windows host process; the pod sets no sysctls.
+# - Volumes are configMap, secret, projected, downwardAPI, emptyDir, and,
+#   only in pods of the baryon-node-agent service account, hostPath for its
+#   two directories: the kubelet device plugin directory (read-write: the
+#   device plugin creates its socket there) and /run/baryon/node
+#   (read-only: the baryon-virtd node socket). Every mount of the latter
+#   must be read-only. The service account check is a shape check: anyone
+#   who can create pods in baryon-system can name that service account.
+# - No ephemeral container may be added to a pod in baryon-system: an
+#   ephemeral container may set its own security context and mount the
+#   pod's volumes.
 #
-# Only CREATE is checked: these fields cannot be changed on an existing pod.
-# The service account name must match deploy/base/node-agent/rbac.yaml and
-# the paths deploy/base/node-agent/daemonset.yaml. Kubernetes 1.30 or later
+# Pod creation is checked once (the fields cannot change afterwards), and
+# every update of pods/ephemeralcontainers is refused. The policy selects
+# the namespace by name: an installation that renames it must change it
+# here too. The service account name must match
+# deploy/base/node-agent/rbac.yaml and the paths
+# deploy/base/node-agent/daemonset.yaml. Kubernetes 1.30 or later
 # (ValidatingAdmissionPolicy).
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -36,6 +49,10 @@ spec:
         apiVersions: ["v1"]
         operations: ["CREATE"]
         resources: ["pods"]
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["pods/ephemeralcontainers"]
   variables:
     - name: nodeAgent
       expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'baryon-node-agent'"
@@ -44,7 +61,14 @@ spec:
     - name: allContainers
       expression: >-
         object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+    - name: podSeccompConfined
+      expression: >-
+        has(object.spec.securityContext) && has(object.spec.securityContext.seccompProfile) &&
+        object.spec.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost']
   validations:
+    - expression: "!has(request.subResource) || request.subResource != 'ephemeralcontainers'"
+      message: "ephemeral containers may not be added to pods in baryon-system"
+      reason: Forbidden
     - expression: >-
         (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
         (!has(object.spec.hostPID) || !object.spec.hostPID) &&
@@ -56,6 +80,39 @@ spec:
           (!has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged) &&
           (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))
       message: "containers in baryon-system must not be privileged or use host ports"
+      reason: Forbidden
+    - expression: >-
+        variables.allContainers.all(c, !has(c.securityContext) || (
+          (!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) ||
+            size(c.securityContext.capabilities.add) == 0) &&
+          (!has(c.securityContext.procMount) || c.securityContext.procMount == 'Default') &&
+          (!has(c.securityContext.appArmorProfile) || c.securityContext.appArmorProfile.type != 'Unconfined') &&
+          (!has(c.securityContext.windowsOptions) || !has(c.securityContext.windowsOptions.hostProcess) ||
+            !c.securityContext.windowsOptions.hostProcess)))
+      message: "containers in baryon-system must add no capability, keep the default /proc mount, not be AppArmor-unconfined, and not be host processes"
+      reason: Forbidden
+    - expression: >-
+        variables.allContainers.all(c,
+          (has(c.securityContext) && has(c.securityContext.seccompProfile)) ?
+            c.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost'] :
+            variables.podSeccompConfined)
+      message: "containers in baryon-system must run with the RuntimeDefault or a Localhost seccomp profile"
+      reason: Forbidden
+    - expression: >-
+        (!has(object.spec.securityContext) || (
+          (!has(object.spec.securityContext.sysctls) || size(object.spec.securityContext.sysctls) == 0) &&
+          (!has(object.spec.securityContext.appArmorProfile) ||
+            object.spec.securityContext.appArmorProfile.type != 'Unconfined'))) &&
+        (!has(object.metadata.annotations) || !object.metadata.annotations.exists(k,
+          k.startsWith('container.apparmor.security.beta.kubernetes.io/') &&
+          object.metadata.annotations[k] == 'unconfined'))
+      message: "pods in baryon-system must set no sysctls and must not be AppArmor-unconfined"
+      reason: Forbidden
+    - expression: >-
+        !has(object.spec.volumes) || object.spec.volumes.all(v,
+          has(v.configMap) || has(v.secret) || has(v.projected) || has(v.downwardAPI) ||
+          has(v.emptyDir) || has(v.hostPath))
+      message: "pods in baryon-system may use only configMap, secret, projected, downwardAPI, emptyDir, and the node agent's hostPath volumes"
       reason: Forbidden
     - expression: >-
         size(variables.hostPaths) == 0 || (variables.nodeAgent &&

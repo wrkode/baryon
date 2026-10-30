@@ -5,9 +5,10 @@
 # The device plugin hands /dev/kvm and the baryon-virtd anchor socket to every
 # container allocated the vm resource, so that resource is the gate to the
 # node runtime. The import resource grants nothing; it is restricted so that
-# other pods cannot use up the slots that place import Pods. baryon-virtd additionally requires each anchor to run as the uid
-# derived from its VM (see docs/security.md); this policy keeps arbitrary pods
-# from reaching the socket at all.
+# other pods cannot use up the slots that place import Pods. baryon-virtd
+# additionally requires each anchor to run as the uid derived from its VM
+# (see docs/security.md); this policy keeps arbitrary pods from reaching the
+# socket at all.
 #
 # Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1,
 # Kubernetes 1.30 or later). The service account name must match
@@ -26,15 +27,18 @@
 # CAP_SYS_ADMIN no process in the container can create a PID namespace of
 # its own in the initial user namespace and be its init.
 #
-#
 # Such a pod also gets no other host access than its claim gives it: no
 # host network namespace (baryon-virtd would hand the VM's network to the
 # pod's network namespace, the host's), no host IPC namespace, no host
 # ports, and only the volume types baryon-controller uses (the root disk
 # claim and, for an import Pod, the downward API approval file), so no
-# hostPath. baryon-controller sets none of these; the validations refuse a
-# mutating webhook or a controller defect that does (docs/security.md,
-# host integration policy).
+# hostPath. They run with the RuntimeDefault (or a Localhost) seccomp
+# profile, are not AppArmor-unconfined, and use the cluster's default
+# container runtime (no runtimeClassName): ADR 0015 relies on the PID and
+# user namespace behavior of a runc-like runtime. baryon-controller sets
+# the seccomp profile and none of the others; the validations refuse a
+# mutating webhook or a controller defect that changes them
+# (docs/security.md, host integration policy).
 #
 # Only CREATE is checked: container resources and these fields cannot be
 # changed on an existing pod (in-place resize covers CPU and memory only).
@@ -96,6 +100,27 @@ spec:
       reason: Forbidden
     - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.persistentVolumeClaim) || has(v.downwardAPI))"
       message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import may use only persistentVolumeClaim and downwardAPI volumes (no hostPath, no service account token)"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(c,
+          (has(c.securityContext) && has(c.securityContext.seccompProfile)) ?
+            c.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost'] :
+            (has(object.spec.securityContext) && has(object.spec.securityContext.seccompProfile) &&
+              object.spec.securityContext.seccompProfile.type in ['RuntimeDefault', 'Localhost']))
+      message: "containers of pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must run with the RuntimeDefault or a Localhost seccomp profile"
+      reason: Forbidden
+    - expression: >-
+        object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.appArmorProfile) ||
+          c.securityContext.appArmorProfile.type != 'Unconfined') &&
+        (!has(object.spec.securityContext) || !has(object.spec.securityContext.appArmorProfile) ||
+          object.spec.securityContext.appArmorProfile.type != 'Unconfined') &&
+        (!has(object.metadata.annotations) || !object.metadata.annotations.exists(k,
+          k.startsWith('container.apparmor.security.beta.kubernetes.io/') &&
+          object.metadata.annotations[k] == 'unconfined'))
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must not be AppArmor-unconfined"
+      reason: Forbidden
+    - expression: "!has(object.spec.runtimeClassName) || object.spec.runtimeClassName == ''"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must use the default container runtime (no runtimeClassName)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

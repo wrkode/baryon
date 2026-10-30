@@ -360,7 +360,7 @@ VirtualizationNode Ready=True, device plugin slots healthy again
 ## Cooperation with upgrades
 
 Baryon has no upgrade controller and does not move running VMs. Live
-migration is currently unsupported. Baryon's network handoff model
+migration is currently unsupported because Baryon's network handoff model
 requires destination-side file descriptor injection during Cloud
 Hypervisor migration, which is not available in the currently supported
 Cloud Hypervisor release. See [ADR 0013](adr/0013-live-migration.md). A

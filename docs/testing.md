@@ -103,9 +103,10 @@ to confirm that:
   capability, adds one, is privileged, allows privilege escalation, or has
   no security context is denied by `baryon-vm-resource` (ADR 0015); so
   is the same pod with `hostNetwork: true`, `hostIPC: true`, a host port,
-  a `hostPath` or `emptyDir` volume, or an automatically mounted service
-  account token, while one with a claim and a downward API volume is
-  admitted
+  a `hostPath` or `emptyDir` volume, an automatically mounted service
+  account token, an unconfined seccomp profile (pod or container), an
+  unconfined AppArmor profile, or a `runtimeClassName`, while one with a
+  claim and a downward API volume is admitted
 - `baryon-no-ephemeral-containers` denies `kubectl debug` on such a pod and
   admits it on a plain pod; `baryon-pod-immutable` denies `kubectl set
   image` on such a pod, admits a label change on it, and admits an image
@@ -137,10 +138,18 @@ into a pod in `baryon-system`:
 
 - both templates are admitted
 - each with the host network, PID, or IPC namespace, a privileged
-  container, or a host port is denied
+  container, a host port, an added capability, an unconfined or missing
+  seccomp profile, an unconfined AppArmor profile, a sysctl, or an NFS
+  volume is denied
 - the node agent with another or an extra host path, with
   `/run/baryon/node` mounted read-write, or under the controller's service
   account is denied, and so is the controller with a host path
+- an ephemeral container added to a pod in `baryon-system` is denied
+
+Then `baryon-controller-pods`, impersonating baryon-controller: a pod
+without a Baryon resource and the node agent's pod template in
+`baryon-system` are denied, and a pod that requests the vm resource is
+admitted.
 
 And `baryon-vm-guest-config`, the refusing form of the ADR 0014 policy:
 
@@ -636,6 +645,7 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 
 | What was shown | Code | Kind | Result and notes |
 |---|---|---|---|
+| Host identity conflict, injected (`tests/e2e/identity-conflict.sh` with `OLD_ANCHOR_IMAGE` set to the published v0.1.0-rc1 anchor image, ceph-rbd Block for the moved VM), on the published v0.1.0-rc2 cluster | controller of 77287a6, built before the commit; v0.1.0-rc2 for the rest | E2E identity conflict | 36 of 36. The v0.1.0-rc1 anchor exited with code 1 and `IdentityConflict:`; the VM was not ready with that reason and `RestartRequired` (`AnchorImageChanged`), no node was recorded, nothing was started on the host, and deleting the Anchor Pod gave it a new one with the current anchor and made it Ready. The current anchor exited with code 3; the node was recorded, the Anchor Pod replaced with node affinity away from it, the VM Ready on another node, nothing left on the host, and the running VM undisturbed. With the v0.1.0-rc2 controller the same run showed the defect fixed in 77287a6: the Event and the replacement came at once, but `status.identityConflictNodes` was overwritten from a stale cached VirtualMachine and the node appeared only on a later periodic reconcile |
 | Release qualification of v0.1.0-rc2: upgrade from the published v0.1.0-rc1 artifacts, host upgrades from Cloud Hypervisor v53.0 to v54.0, the E2E suites, guest policy, `tests/e2e/repeat.sh`, and a smoke test of the published artifacts | df7de3b (tagged v0.1.0-rc2) | E2E and manual procedures | passed: see [v0.1.0-rc2 release qualification](#v010-rc2-release-qualification) |
 | VM lifecycle with host cleanup checks (lvm-local) | 410aa30; working tree | E2E lifecycle | 33 of 33 on each |
 | Deletion in every phase before Ready | 410aa30; working tree | E2E deletion | 410aa30: 16 of 16; working tree: 19 of 19, with the import case checking that no Anchor Pod exists while importing, that the import Pod requests only the placement slot, and that the importer has neither /dev/kvm nor the anchor socket. An earlier working-tree run failed the pending case because an unschedulable import Pod was not reported as `Unschedulable`; fixed before the 19 of 19 run |
@@ -680,12 +690,15 @@ Release qualification of v0.1.0-rc3 runs on the tagged commit itself:
 images, the host image, and the release files are built from a clean
 checkout of that commit with `hack/release-build.sh`, the script of the
 release workflow, and nothing changes between qualification and the tag.
-Its results are recorded here on `main` after the tag. Planned scope: the
-upgrade from the published v0.1.0-rc2 artifacts with VMs running, the E2E
-suites with ceph-rbd and lvm-local including the identity conflict suite,
-`tests/e2e/guest-policy.sh`, `tests/e2e/repeat.sh`, an installation from
-public locations without credentials, and a smoke test of the published
-artifacts.
+Its results are recorded here on `main` after the tag. Planned scope: an
+installation of the published v0.1.0-rc2 release from its public URLs and
+images without credentials, the upgrade from it to the candidate with VMs
+running (the candidate cluster release over v0.1.0-rc2 hosts, then the
+hosts one at a time), the E2E suites with ceph-rbd and lvm-local including
+the identity conflict suite, `tests/e2e/guest-policy.sh`, and
+`tests/e2e/repeat.sh`. After the tag: a smoke test of the published
+artifacts, including a fresh installation of v0.1.0-rc3 from its public
+URLs and images without credentials.
 
 ### v0.1.0-rc2 release qualification
 

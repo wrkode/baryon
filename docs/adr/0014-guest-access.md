@@ -390,7 +390,25 @@ rotation of user data is not part of this design.
   (create and update that set it denied). Upgrade gate for the release
   that adds the field: its upgrade notes require a cluster release that
   carries the refusing form (v0.1.0-rc3 or later) to be installed first;
-  from an earlier one, upgrade to such a release before.
+  from an earlier one, upgrade to such a release before. That release
+  also checks the condition itself, because a cluster can lack the policy
+  despite its version (the policy deleted, or the cluster release rolled
+  back below v0.1.0-rc3): its upgrade notes start with a preflight that
+  the refusing policy object and its `Deny` binding exist, and its
+  controller refuses to start a VM with the field without the policy
+  (`GuestConfigPolicyMissing`, above).
+- A fresh installation of the release that adds the field has no refusing
+  form to rely on: its `baryon.yaml` creates the CRD, the controller, and
+  the authorizing policy together, in an order kustomize decides. The
+  controller's check that the policy and its binding exist is what keeps
+  a VM with the field from starting before the policy is in place.
+- During the rollout of the release that adds the field, the earlier
+  controller can still be running for a short time. It does not know the
+  field and starts such a VM without its user data and without its
+  placement resource. The release that adds the field therefore keeps the
+  refusing form until its own controller runs, or its upgrade notes
+  require the earlier controller to be scaled to zero first; the choice is
+  part of that release's implementation.
 - Rolling the cluster release back below the release that adds the field
   while a VirtualMachine sets it is not supported: the earlier controller
   would start the VM without its user data and without its placement

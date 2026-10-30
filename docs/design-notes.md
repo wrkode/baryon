@@ -177,3 +177,16 @@ the experiment are in [ADR 0013](adr/0013-live-migration.md).
 - Exclusion between a VM's import Pod and its Anchor Pod with more than one
   controller replica (it relies on the single replica today).
 - An explicit flow for growing a root disk (`rootDisk` is immutable).
+- Status writes from a cached VirtualMachine (found 2026-10-30). The
+  controller writes the whole status by server-side apply, forced, and
+  derives it from the cached object; fields that accumulate across
+  reconciles depend on the cache having the last write. A stale cache
+  lost a node of `status.identityConflictNodes` on the k0s cluster (fixed
+  in v0.1.0-rc3 by reading that list from the API server). `rootDiskImport`
+  and the condition history follow the same pattern; `rootDiskImport` is
+  re-derived from the PersistentVolume record, which is read live, so it
+  is lost only if that record is also missing. Open for v0.1.0: put the
+  cached object's resource version into the status write as a
+  precondition and requeue on a conflict, which covers every field and
+  makes the live read unnecessary (whether server-side apply honors it is
+  to be verified), or keep the targeted reads and record the decision.

@@ -600,9 +600,13 @@ only Anchor Pod of the VM, and its anchor is the VM's Anchor supervisor
 replace every Anchor Pod that reports `RestartRequired` after the cluster
 upgrade: the Kairos host upgrades do, and so does a restart of the VM.
 
-Status: Tested on the k0s cluster by `tests/e2e/identity-conflict.sh`,
-which injects a conflict with the published v0.1.0-rc1 anchor image and
-with the current one.
+Status: Tested on the k0s cluster for a newly created Anchor Pod, by
+`tests/e2e/identity-conflict.sh`, which injects a conflict with the
+published v0.1.0-rc1 anchor image and with the current one
+([testing.md](testing.md#results)). The other case, an anchor container
+that restarts in a pod whose earlier container ran the VM, first stops
+that VM in baryon-virtd and then meets the same refusal; a test of it is
+Planned.
 
 ### NotAnchorSupervisor
 
