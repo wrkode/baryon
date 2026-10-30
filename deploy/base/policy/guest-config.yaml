@@ -1,0 +1,43 @@
+# Refusing form of baryon-vm-guest-config (ADR 0014): no VirtualMachine may
+# set spec.guestConfig.
+#
+# This release has no spec.guestConfig field, and the API server removes or
+# rejects unknown fields before admission, so this policy admits every
+# VirtualMachine of this release. It exists so that it is already installed
+# when a later release adds the field: that release's CRD then accepts the
+# field (the documented upgrade applies CRDs first), and until its
+# baryon.yaml replaces this policy, under the same name, with the form that
+# requires `get` on the referenced Secret, every VirtualMachine that sets
+# the field is refused. No earlier controller ever sees an unauthorized
+# reference. The expression is guarded by has(), so it does not fail on a
+# schema without the field.
+#
+# Requires ValidatingAdmissionPolicy (admissionregistration.k8s.io/v1).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-vm-guest-config
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["virtualization.baryon.io"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["virtualmachines"]
+  validations:
+    - expression: "!has(object.spec) || !has(object.spec.guestConfig)"
+      message: "spec.guestConfig is not supported by this release of Baryon"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-vm-guest-config
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-vm-guest-config
+  validationActions: [Deny]

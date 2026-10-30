@@ -1,7 +1,7 @@
 # 0014: Guest configuration from a Secret and a serial console through the Anchor Pod
 
 Status: Accepted
-Date: 2026-10-27, revised 2026-10-28
+Date: 2026-10-27, revised 2026-10-28 and 2026-10-30
 
 ## Context
 
@@ -377,6 +377,20 @@ rotation of user data is not part of this design.
   authorizing policy), every VM that sets the field is refused, so an
   earlier controller never sees one and no reference goes unauthorized.
   Upgrading across both releases in one step is not supported.
+- The refusing form ships in v0.1.0-rc3 and therefore in v0.1.0
+  (`deploy/base/policy/guest-config.yaml`), so every v0.1.x installation
+  already has it when a later release adds the field. It is harmless
+  before the field exists: the CRD of v0.1 has no `spec.guestConfig`, the
+  API server removes or rejects the unknown field before admission, and
+  the only expression, `!has(object.spec) || !has(object.spec.guestConfig)`,
+  is true for every VirtualMachine of v0.1. The CI API server checks
+  confirm this with the policy installed (create, spec update, and
+  metadata update allowed; the API server reports no type checking
+  warning) and confirm the refusal with a CRD that declares the field
+  (create and update that set it denied). Upgrade gate for the release
+  that adds the field: its upgrade notes require a cluster release that
+  carries the refusing form (v0.1.0-rc3 or later) to be installed first;
+  from an earlier one, upgrade to such a release before.
 - Rolling the cluster release back below the release that adds the field
   while a VirtualMachine sets it is not supported: the earlier controller
   would start the VM without its user data and without its placement
@@ -635,8 +649,9 @@ for `pods/exec` on Anchor Pods.
 
 Status of every part: Designed. Nothing in this ADR is implemented in
 v0.1. The parts are planned after v0.1 stabilization, in this order:
-guest configuration (with the refusing form of `baryon-vm-guest-config`
-in an earlier cluster release); the console through `kubectl exec`, with
+guest configuration (the refusing form of `baryon-vm-guest-config` is
+Implemented since v0.1.0-rc3, so the release that adds the field replaces
+it with the authorizing form); the console through `kubectl exec`, with
 one interactive writer and takeover; then baryonctl and, if wanted,
 read-only sessions. Each part is its own change, with unit tests, an E2E
 suite on the k0s cluster, the security review, and the dependency review
@@ -772,3 +787,10 @@ brings in.
 - 2026-10-28: Accepted as a design after the architecture, security, and
   technical writing reviews. Nothing in it is implemented; each part
   needs its own implementation, tests, and reviews.
+- 2026-10-30, for v0.1.0-rc3, still Accepted: the refusing form of
+  `baryon-vm-guest-config` is implemented and ships in v0.1.0-rc3 and
+  v0.1.0, ahead of the field, with CI API server checks that it admits
+  every VirtualMachine of v0.1 and refuses the field once a CRD declares
+  it. The upgrade gate for the release that adds the field is a cluster
+  release that carries the refusing form. Nothing else in this ADR is
+  implemented; `spec.guestConfig` does not exist in v0.1.

@@ -26,6 +26,16 @@
 # CAP_SYS_ADMIN no process in the container can create a PID namespace of
 # its own in the initial user namespace and be its init.
 #
+#
+# Such a pod also gets no other host access than its claim gives it: no
+# host network namespace (baryon-virtd would hand the VM's network to the
+# pod's network namespace, the host's), no host IPC namespace, no host
+# ports, and only the volume types baryon-controller uses (the root disk
+# claim and, for an import Pod, the downward API approval file), so no
+# hostPath. baryon-controller sets none of these; the validations refuse a
+# mutating webhook or a controller defect that does (docs/security.md,
+# host integration policy).
+#
 # Only CREATE is checked: container resources and these fields cannot be
 # changed on an existing pod (in-place resize covers CPU and memory only).
 # Container images can be; policy/pod-immutable.yaml refuses that.
@@ -77,6 +87,15 @@ spec:
           'ALL' in c.securityContext.capabilities.drop &&
           (!has(c.securityContext.capabilities.add) || size(c.securityContext.capabilities.add) == 0))
       message: "containers of pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must drop all capabilities, add none, and not be privileged or allow privilege escalation"
+      reason: Forbidden
+    - expression: "(!has(object.spec.hostNetwork) || !object.spec.hostNetwork) && (!has(object.spec.hostIPC) || !object.spec.hostIPC)"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must not use the host network or IPC namespace (hostNetwork, hostIPC)"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))"
+      message: "containers of pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import must not use host ports"
+      reason: Forbidden
+    - expression: "!has(object.spec.volumes) || object.spec.volumes.all(v, has(v.persistentVolumeClaim) || has(v.downwardAPI))"
+      message: "pods that request virtualization.baryon.io/vm or virtualization.baryon.io/import may use only persistentVolumeClaim and downwardAPI volumes (no hostPath, no service account token)"
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

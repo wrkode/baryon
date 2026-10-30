@@ -1,0 +1,80 @@
+# Pods in the baryon-system namespace get only the host access that the
+# Baryon components in it need.
+#
+# The namespace enforces the privileged Pod Security level because
+# baryon-node-agent mounts two host paths (namespace.yaml), so Pod Security
+# admission does not limit what else a pod there may request. This policy
+# does, as an allowlist:
+#
+# - No pod uses the host network, PID, or IPC namespace, host ports, or a
+#   privileged container. Neither baryon-controller nor baryon-node-agent
+#   needs any of them.
+# - hostPath volumes are allowed only in pods of the baryon-node-agent
+#   service account, and only for its two directories: the kubelet device
+#   plugin directory (read-write: the device plugin creates its socket
+#   there) and /run/baryon/node (read-only: the baryon-virtd node socket).
+#   Every mount of the latter must be read-only.
+#
+# Only CREATE is checked: these fields cannot be changed on an existing pod.
+# The service account name must match deploy/base/node-agent/rbac.yaml and
+# the paths deploy/base/node-agent/daemonset.yaml. Kubernetes 1.30 or later
+# (ValidatingAdmissionPolicy).
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: baryon-system-pods
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: baryon-system
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE"]
+        resources: ["pods"]
+  variables:
+    - name: nodeAgent
+      expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == 'baryon-node-agent'"
+    - name: hostPaths
+      expression: "has(object.spec.volumes) ? object.spec.volumes.filter(v, has(v.hostPath)) : []"
+    - name: allContainers
+      expression: >-
+        object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])
+  validations:
+    - expression: >-
+        (!has(object.spec.hostNetwork) || !object.spec.hostNetwork) &&
+        (!has(object.spec.hostPID) || !object.spec.hostPID) &&
+        (!has(object.spec.hostIPC) || !object.spec.hostIPC)
+      message: "pods in baryon-system must not use the host network, PID, or IPC namespace"
+      reason: Forbidden
+    - expression: >-
+        variables.allContainers.all(c,
+          (!has(c.securityContext) || !has(c.securityContext.privileged) || !c.securityContext.privileged) &&
+          (!has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0)))
+      message: "containers in baryon-system must not be privileged or use host ports"
+      reason: Forbidden
+    - expression: >-
+        size(variables.hostPaths) == 0 || (variables.nodeAgent &&
+          variables.hostPaths.all(v, v.hostPath.path in ['/var/lib/kubelet/device-plugins', '/run/baryon/node']))
+      message: "in baryon-system, only baryon-node-agent pods may use hostPath volumes, and only /var/lib/kubelet/device-plugins and /run/baryon/node"
+      reason: Forbidden
+    - expression: >-
+        variables.hostPaths.filter(v, v.hostPath.path == '/run/baryon/node').all(v,
+          variables.allContainers.all(c, !has(c.volumeMounts) ||
+            c.volumeMounts.all(m, m.name != v.name || (has(m.readOnly) && m.readOnly))))
+      message: "in baryon-system, /run/baryon/node must be mounted read-only"
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: baryon-system-pods
+  labels:
+    app.kubernetes.io/part-of: baryon
+spec:
+  policyName: baryon-system-pods
+  validationActions: [Deny]

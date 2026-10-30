@@ -281,7 +281,7 @@ is best effort: on a reboot the pod network may already be gone.
 
 ### Admission policies
 
-`deploy/base/policy/` holds six ValidatingAdmissionPolicies. They need
+`deploy/base/policy/` holds eight ValidatingAdmissionPolicies. They need
 Kubernetes 1.30 or later, and 1.32 or later for the node name in service
 account identities. `baryon-vm-resource` and `baryon-node-agent-own-node`
 are Implemented and were Tested earlier on the retired kind host
@@ -301,11 +301,13 @@ container refusals on the k0s cluster.
 
 | Policy | Rule |
 |---|---|
-| `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. Such pods may not set `shareProcessNamespace`, `hostPID`, or `hostUsers: false`, have exactly one container and no init containers, and every container drops all capabilities, adds none, and is neither privileged nor allowed to escalate privileges (ADR 0015). CI checks: each is denied even for baryon-controller; these checks pass in CI. Designed (ADR 0014): the same restriction for the placement-only feature resource of guest configuration, and `hostIPC` is refused. |
+| `baryon-vm-resource` | A pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import` in any container or init container may be created only by `system:serviceaccount:baryon-system:baryon-controller`. Other users, including cluster administrators and workload controllers, are denied. The import resource grants nothing; it is restricted so that other pods cannot use up the slots that place import Pods. Such pods may not set `shareProcessNamespace`, `hostPID`, or `hostUsers: false`, have exactly one container and no init containers, and every container drops all capabilities, adds none, and is neither privileged nor allowed to escalate privileges (ADR 0015). Such pods also get no other host access: no `hostNetwork`, no `hostIPC`, no host ports, and only `persistentVolumeClaim` and `downwardAPI` volumes (so no `hostPath` and no service account token); see [Host integration policy](#host-integration-policy). CI checks: each is denied even for baryon-controller, and a pod with a claim and a downward API volume is allowed; these checks pass in CI. Designed (ADR 0014): the same restriction for the placement-only feature resource of guest configuration. |
 | `baryon-pod-immutable` | Nobody may change the container images of a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015, finding M7). kubelet restarts a container whose image changed regardless of the restart policy, so without this policy a namespace user who can update pods would run an image of their choice as the Anchor supervisor, or as the importer with the approval and the claim mounted. CI checks: changing the image of a pod that requests the vm resource is denied, a label change on it is allowed, and changing the image of another pod is allowed. Status: Implemented; the CI API server checks pass in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod and import Pod) |
 | `baryon-no-ephemeral-containers` | Nobody may add ephemeral containers to a pod that requests `virtualization.baryon.io/vm` or `virtualization.baryon.io/import`, cluster administrators included (ADR 0015). An ephemeral container is never allocated the vm resource and gets no anchor socket; the policy keeps an image of the requester's choice from running as the VM's identity with the pod's volumes and network namespace. CI checks: adding an ephemeral container to a pod that requests the vm resource is denied; to another pod it is allowed. Status: Implemented; the CI API server checks pass in CI; Tested on the k0s cluster by `tests/e2e/anchor-authority.sh` (Anchor Pod) |
 | `baryon-node-agent-own-node` | baryon-node-agent may create or update only the VirtualizationNode named after the node in its token (`userInfo.extra["authentication.kubernetes.io/node-name"]`). Requests without that information are denied. |
 | `baryon-controller-writes` | Updates of PersistentVolumes and pods by baryon-controller. A PersistentVolume may only gain the annotation `virtualization.baryon.io/disk-import` when it has none, with spec, labels, finalizers, owner references, and every other annotation unchanged; the volume must be Bound, and the record must have the form `{"vmUID":"<uuid>","claimUID":"<claimRef.uid>","source":"sha256:<64 hex>"}` with the volume's own `claimRef.uid`. A pod update may change only the annotations `virtualization.baryon.io/import-approved` and `virtualization.baryon.io/vm-label-keys` and labels whose key is not reserved, with spec, finalizers, owner references, and every other annotation unchanged, and only on pods labeled `app.kubernetes.io/managed-by=baryon`. Reserved keys: `app.kubernetes.io/managed-by`, and keys whose prefix is `baryon.io`, `kubernetes.io`, `k8s.io`, or a subdomain of them other than `app.kubernetes.io` (the same rule as `reserved_label` in `crates/controller/src/anchor.rs`). CI checks: a PV spec change, another PV annotation, a record for another claim, rewriting and removing the record, and annotating an unmanaged pod are denied; adding the record for the bound claim and approving a Baryon pod are allowed. Copying `app` and `app.kubernetes.io/name` and recording their keys is allowed; adding `node.kubernetes.io/x`, changing `app.kubernetes.io/managed-by`, adding `virtualization.baryon.io/vm-name`, and relabeling an unmanaged pod are denied. |
+| `baryon-system-pods` | Pods in the `baryon-system` namespace may not use the host network, PID, or IPC namespace, privileged containers, or host ports. `hostPath` volumes are allowed only in pods of the `baryon-node-agent` service account, only for `/var/lib/kubelet/device-plugins` and `/run/baryon/node`, and every mount of `/run/baryon/node` is read-only. The namespace enforces the privileged Pod Security level for the node agent's host paths, so Pod Security admission does not limit the rest; this policy does. CI checks: the shipped pod templates of baryon-controller and baryon-node-agent are allowed; each of them with the host network, PID, or IPC namespace, a privileged container, or a host port is denied; the node agent with another or an extra host path or a read-write node socket mount is denied, and so are its host paths under another service account and a host path in the controller. Status: Implemented; the CI API server checks pass |
+| `baryon-vm-guest-config` | The refusing form of the ADR 0014 policy: no VirtualMachine may set `spec.guestConfig`. This release's CRD has no such field and the API server removes or rejects unknown fields before admission, so the policy admits every VirtualMachine of this release; it is installed now so that it is present when a later release's CRD accepts the field (ADR 0014, release order). CI checks: with the policy installed, a VirtualMachine create, spec update, and metadata update are allowed; with a CRD that declares the field, a create and an update that set it are denied and a VirtualMachine without it is allowed. Status: Implemented; the CI API server checks pass |
 | `baryon-import-approval` | Nobody but baryon-controller may set, change, or remove the annotation `virtualization.baryon.io/import-approved` on any pod, at creation or by update. Namespace users can patch pods, so without this policy they could approve an import into a volume the controller would refuse. CI checks: another user changing, removing, or setting the approval is denied; another user changing other annotations of a pod with an approval is allowed. |
 
 The policies are part of the supported installation. Without them:
@@ -332,6 +334,14 @@ The policies are part of the supported installation. Without them:
   a volume baryon-controller would refuse.
 - `baryon-controller-writes`: baryon-controller's PersistentVolume and pod
   `patch` rights are unrestricted.
+- The host access rules of `baryon-vm-resource` and `baryon-system-pods`:
+  a mutating webhook or a defect could give an Anchor Pod the host network
+  namespace (baryon-virtd would then hand the host's network to the VM),
+  or a pod in `baryon-system` host paths or namespaces that the Baryon
+  components do not use.
+- `baryon-vm-guest-config`: a later release's CRD could accept
+  `spec.guestConfig` before the policy that authorizes the Secret
+  reference is installed (ADR 0014).
 
 They are an API server control. They do not constrain static pods, which
 the kubelet runs from a manifest directory on the node without admission
@@ -346,6 +356,35 @@ check already ties to the VM. Extended resources
 cannot be requested by ephemeral containers or through pod-level resources
 today, so neither is a current bypass; the policy checks containers and
 init containers.
+
+### Host integration policy
+
+Each Baryon workload gets the minimum host access its role needs, and a
+user cannot gain more by creating or changing a Baryon-managed workload:
+the VirtualMachine API has no field that requests host access, only
+baryon-controller can create pods that request the Baryon resources
+(`baryon-vm-resource`), their images cannot be changed and no ephemeral
+containers can be added (`baryon-pod-immutable`,
+`baryon-no-ephemeral-containers`), and the other host access fields of a
+pod cannot be changed after creation. The policies below also refuse host
+access that a mutating webhook or a defect would add at creation.
+
+| Component | Host network | Host IPC | Host PID | hostPath | Enforced by |
+|---|---|---|---|---|---|
+| Anchor Pod | Not required; forbidden. The VM's network is the pod's network namespace, which baryon-virtd hands to Cloud Hypervisor; in the host's namespace the VM would get the host's network | Not required; forbidden | Forbidden (ADR 0015) | Not required; forbidden. The only volume is the root disk claim | `baryon-vm-resource` |
+| Import Pod | Not required; forbidden | Not required; forbidden | Forbidden (ADR 0015) | Not required; forbidden. The volumes are the root disk claim and the downward API approval file | `baryon-vm-resource` |
+| baryon-controller | Not required; forbidden | Not required; forbidden | Not required; forbidden | Not required; forbidden | `baryon-system-pods` |
+| baryon-node-agent, with the device plugin | Not required; forbidden | Not required; forbidden | Not required; forbidden | Required, exactly two directories: `/var/lib/kubelet/device-plugins` read-write (the plugin's socket and kubelet's registration socket) and `/run/baryon/node` read-only (baryon-virtd's node socket). Allowed only for its service account | `baryon-system-pods` |
+| baryon-virtd | A host service in the Baryon-enabled Hadron image, not a pod: it runs as root in the host namespaces and enters each Anchor Pod's network namespace to hand it to the VM ([Processes and privileges](#processes-and-privileges)) | | | | The immutable host image |
+
+All Baryon pods run with `RuntimeDefault` seccomp and no capabilities.
+Pods that are not Baryon workloads, in other namespaces, are subject to
+the cluster's own Pod Security configuration; Baryon grants them nothing,
+and they cannot request the Baryon resources.
+
+Status: Implemented. The CI API server checks cover every rule; the E2E
+suites on the k0s cluster create Anchor and import Pods under the
+policies.
 
 ### VM placement
 
@@ -962,24 +1001,30 @@ security property.
 ## Release and supply chain
 
 How a release is built and published ([release.md](release.md)), and what
-protects it. Reviewed in the v0.1.0-rc1 release gate review of 2026-10-05.
+protects it. Reviewed in the v0.1.0-rc1 release gate review of 2026-10-05;
+the release workflow was split and gated for v0.1.0-rc3.
 
 | Item | State |
 |---|---|
 | GitHub Actions | Every action in `.github/workflows/` is pinned by commit SHA, with the version in a comment |
-| Workflow token permissions | `contents: read` by default. Only the release job has write permissions: `contents: write` (the GitHub release), `packages: write` (ghcr.io), `id-token: write` and `attestations: write` (provenance). The job holds them also for a `workflow_dispatch` dry run, which publishes nothing, and `id-token` and `attestations` are unused while the repository is private. The pinned `anchore/sbom-action` steps receive the job token through the action's default `github-token` input. Checkouts do not persist credentials. Split jobs: Planned |
+| Workflow token permissions | No permission by default in the release workflow, `contents: read` in CI. The release workflow runs four jobs with their own permissions: gate (`contents`, `actions`, `statuses` read), build (`contents: read`), attest (`contents: read`, `id-token: write`, `attestations: write`), publish (`contents: write`, `packages: write`). Attest and publish run only for a tag push, the publish job checks out no repository code, and checkouts do not persist credentials. Implemented |
+| Untrusted code | CI runs pull requests with `contents: read` and no secrets; runs from fork pull requests need a maintainer's approval (repository setting, all external contributors). The release workflow has no pull request trigger. Implemented |
+| Release gate | `hack/release-gate.sh`, the first job of the release workflow, fails closed unless the tag matches the workspace version, is annotated, signed, and verified by GitHub, and points to the commit; the commit is reachable from `main` on GitHub; the latest CI run on that commit's push to `main` succeeded; and a maintainer recorded release qualification on that commit (status `baryon/release-qualification`). Implemented |
+| Tag and branch protection | Repository rulesets: `refs/tags/v*` cannot be deleted, moved, or force-updated by anyone; `main` cannot be deleted or force-pushed. Immutable releases are enabled. Implemented (configured 2026-10-30) |
+| Release identity | The build job checks that every binary, image label, the host image's `components.json`, and `baryon.yaml` name the tag's version and commit, and that the published images and binaries are the checked ones; the publish job checks that each registry digest equals the built digest. Implemented |
 | Dependency gate | CI runs `cargo deny check advisories licenses sources bans` on every change. Implemented |
 | DCO | CI checks the `Signed-off-by` trailer of every commit in a push or pull request (`hack/check-dco.sh`). Implemented |
 | Host component downloads | Cloud Hypervisor, its firmware, and virtiofsd are downloaded by URL and checked against the SHA-256 in `packaging/versions.env`; CI checks that the pinned artifacts are fetchable and match (`hack/fetch-artifacts.sh`). Implemented |
 | Base and builder images | Hadron, kairos-init, the Rust builder image, and Alpine are pinned by digest in `packaging/versions.env` (tag kept for people, digest decides); `components.json` in the host image records the Hadron and kairos-init references with their digests. Implemented |
+| Build tools | cargo-auditable is installed by version (`CARGO_AUDITABLE_VERSION`) from crates.io with its own lock file (`cargo install --locked`); syft is the version pinned by the pinned `anchore/sbom-action/download-syft`, which checks its SHA-256. skopeo is the runner's. Implemented |
 | Kubernetes distribution binary | k0s is installed into the host image by kairos-init (pinned by digest) at the version in `packaging/versions.env`. Its download verification is kairos-init's and is not verified by Baryon; `components.json` records the version only. Upstream dependency |
 | Build context | `.dockerignore` excludes build outputs and `.git` only; the Dockerfiles copy explicit paths. An allowlist `.dockerignore`: Planned |
 | Component images | `FROM scratch` with one static binary; no base image, no package manager. Implemented |
-| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files and SPDX SBOMs of the source tree and of each image. Implemented; Tested by the release workflow dry run on 2026-10-05 and by the published v0.1.0-rc1 release (smoke test, [testing.md](testing.md#published-artifacts-smoke-test)) |
-| Provenance | GitHub artifact attestations for every release file and image, created only when the repository is public; a release from a private repository has none. Implemented; not yet exercised |
-| Signing | None. No file, image, or tag is signed with a project key |
-| Release gate | The release procedure requires CI to pass on `main` before tagging, but the release workflow does not check CI results or that the tag is on `main`, and tags and `main` are not protected (no rulesets, checked 2026-10-28). Accepted for v0.1.0-rc1 and v0.1.0-rc2; enforcement Planned |
-| Build isolation | One job builds and publishes, so the build steps run with the write tokens available. Accepted for v0.1.0-rc1 and v0.1.0-rc2; split jobs Planned |
+| Binary dependency data | Every Baryon binary embeds its Rust crate list (cargo-auditable, `.dep-v0`); CI checks every binary, and the release build fails if an image SBOM lists no crates. Implemented |
+| Checksums and SBOMs | Every release carries `SHA256SUMS` of its files, SPDX SBOMs of the source tree, of the baryon-virtd binary, and of each image. Image SBOMs are generated from the OCI layout that is published and name the image by repository and manifest digest; the build fails if an SBOM does not record its image's digest. Implemented |
+| Provenance | GitHub artifact attestations (SLSA build provenance) for every release file and every image digest, made by the attest job before anything is published, and verifiable with `gh attestation verify` or offline from the public attestation bundle ([release.md](release.md#verifying-a-release)). Implemented |
+| Signing | Release tags are signed with the maintainer's SSH signing key registered on GitHub, and the gate requires GitHub to verify the signature. No file or image is signed with a long-lived project key; the attestations are Sigstore signatures of the workflow identity |
+| Earlier releases | v0.1.0-rc1 and v0.1.0-rc2 were published from the private repository with one combined job, without attestations, signed tags, digest-bound SBOMs, or binary dependency data. They stay as they are; a published tag or release is never changed |
 
 ## Review findings
 

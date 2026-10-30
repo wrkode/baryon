@@ -15,4 +15,6 @@ resources:
   - policy/node-agent.yaml
   - policy/controller-writes.yaml
   - policy/import-approval.yaml
+  - policy/system-pods.yaml
+  - policy/guest-config.yaml
   - tenant/roles.yaml

@@ -222,6 +222,7 @@ vmpod='apiVersion: v1
 kind: Pod
 metadata: {name: vm-pod, namespace: default}
 spec:
+  automountServiceAccountToken: false
   containers:
     - name: c
       image: busybox:1.36
@@ -268,6 +269,23 @@ for field in 'shareProcessNamespace: true' 'hostPID: true' 'hostUsers: false'; d
   out="$(printf '%s\n' "$vmpod" | sed "s/^spec:$/spec:\n  $field/" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
   echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with $field was not denied: $out" >&2; exit 1; }
   echo "vm resource pod with $field denied as expected"
+done
+
+# No other host access than the claim, even from baryon-controller: no host
+# network or IPC namespace, no host ports, and only claim and downward API
+# volumes (so no hostPath and no service account token).
+withvols="$(printf '%s\n' "$vmpod" | sed 's/^spec:$/spec:\n  volumes: [{name: d, persistentVolumeClaim: {claimName: x}}, {name: a, downwardAPI: {items: [{path: p, fieldRef: {fieldPath: metadata.name}}]}}]/')"
+printf '%s\n' "$withvols" | k "${as_ctl[@]}" apply --dry-run=server -f - >/dev/null \
+  || { echo "baryon-controller could not create a vm resource pod with claim and downward API volumes" >&2; exit 1; }
+echo "vm resource pod with claim and downward API volumes accepted as expected"
+for edit in 's/^spec:$/spec:\n  hostNetwork: true/' 's/^spec:$/spec:\n  hostIPC: true/' \
+    's/automountServiceAccountToken: false/automountServiceAccountToken: true/' \
+    's/^spec:$/spec:\n  volumes: [{name: h, hostPath: {path: \/var\/lib}}]/' \
+    's/^spec:$/spec:\n  volumes: [{name: e, emptyDir: {}}]/' \
+    's/^      image: busybox:1.36$/      image: busybox:1.36\n      ports: [{containerPort: 80, hostPort: 8080}]/'; do
+  out="$(printf '%s\n' "$vmpod" | sed "$edit" | k "${as_ctl[@]}" apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-vm-resource || { echo "vm resource pod with edit '$edit' was not denied: $out" >&2; exit 1; }
+  echo "vm resource pod with edit '$edit' denied as expected"
 done
 
 # Exactly one container and no init containers, even from baryon-controller.
@@ -404,4 +422,97 @@ echo "allowed as expected: another user changes other annotations of a pod with 
 k delete pod ci-managed ci-unmanaged -n default --wait=false >/dev/null
 k delete pvc ci-claim -n default --wait=false >/dev/null
 k delete pv ci-import-pv --wait=false >/dev/null
+# Pods in baryon-system get only the host access of the Baryon components
+# (policy/system-pods.yaml): the pod templates of the shipped manifests are
+# accepted, and each extra host access is denied.
+k apply -f - < deploy/base/node-agent/rbac.yaml >/dev/null
+sys_pod() {
+  # sys_pod <workload manifest> <python statement on the pod p>: print the
+  # workload's pod template as a Pod in baryon-system, edited.
+  k apply --dry-run=client -o json -f - < "$1" | python3 -c '
+import json, sys
+w = json.load(sys.stdin)
+if w.get("kind") == "List":
+    w = [i for i in w["items"] if i["kind"] in ("DaemonSet", "Deployment")][0]
+t = w["spec"]["template"]
+p = {"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "ci-sys-pod", "namespace": "baryon-system"}, "spec": t["spec"]}
+c = p["spec"]["containers"][0]
+exec(sys.argv[1])
+print(json.dumps(p))' "$2"
+}
+sys_denied() {
+  local what="$1"; shift
+  out="$(sys_pod "$@" | k apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-system-pods || { echo "baryon-system pod was not denied: $what: $out" >&2; exit 1; }
+  echo "baryon-system pod denied as expected: $what"
+}
+na=deploy/base/node-agent/daemonset.yaml
+ctl=deploy/base/controller/deployment.yaml
+for i in $(seq 1 30); do
+  out="$(sys_pod "$ctl" 'p["spec"]["hostNetwork"] = True' | k apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-system-pods && break
+  sleep 2
+done
+for w in "$na" "$ctl"; do
+  sys_pod "$w" 'pass' | k apply --dry-run=server -f - >/dev/null \
+    || { echo "the shipped pod template of $w was denied" >&2; exit 1; }
+  echo "shipped pod template of $w accepted as expected"
+  sys_denied "$w with hostNetwork" "$w" 'p["spec"]["hostNetwork"] = True'
+  sys_denied "$w with hostPID" "$w" 'p["spec"]["hostPID"] = True'
+  sys_denied "$w with hostIPC" "$w" 'p["spec"]["hostIPC"] = True'
+  sys_denied "$w with a privileged container" "$w" 'c.setdefault("securityContext", {}).pop("allowPrivilegeEscalation", None); c["securityContext"]["privileged"] = True'
+  sys_denied "$w with a host port" "$w" 'c["ports"] = [{"containerPort": 80, "hostPort": 8080}]'
+done
+sys_denied "node agent with another host path" "$na" 'p["spec"]["volumes"][0]["hostPath"]["path"] = "/var/lib/kubelet"'
+sys_denied "node agent with an extra host path" "$na" 'p["spec"]["volumes"].append({"name": "x", "hostPath": {"path": "/"}})'
+sys_denied "node agent mounting the node socket directory read-write" "$na" '[m.update(readOnly=False) for m in c["volumeMounts"] if m["mountPath"] == "/run/baryon/node"]'
+sys_denied "the node agent host paths in a pod of another service account" "$na" 'p["spec"]["serviceAccountName"] = "baryon-controller"'
+sys_denied "controller with a host path" "$ctl" 'p["spec"]["volumes"] = [{"name": "h", "hostPath": {"path": "/run/baryon/node"}}]'
+
+# The refusing form of baryon-vm-guest-config (policy/guest-config.yaml)
+# admits every VirtualMachine of this release, and refuses spec.guestConfig
+# once a CRD declares the field.
+gc_denied() {
+  local what="$1"
+  out="$(k apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-vm-guest-config || { echo "not denied by baryon-vm-guest-config: $what: $out" >&2; exit 1; }
+  echo "denied as expected: $what"
+}
+gc_vm() { # gc_vm <name> [guestConfig as flow YAML]
+  printf 'apiVersion: virtualization.baryon.io/v1alpha1\nkind: VirtualMachine\nmetadata: {name: %s, namespace: default}\nspec:\n  className: general-small\n  runPolicy: Stopped\n  rootDisk: {size: 4Gi, source: {http: {url: "https://example.org/d.raw"}}}\n' "$1"
+  [ -z "${2:-}" ] || printf '  guestConfig: %s\n' "$2"
+}
+echo "baryon-vm-guest-config type checking: $(k get validatingadmissionpolicy baryon-vm-guest-config -o jsonpath='{.status.typeChecking}')"
+for i in $(seq 1 30); do
+  gc_vm ci-gc-plain | k apply -f - >/dev/null 2>&1 && break
+  sleep 2
+done
+k patch virtualmachine ci-gc-plain -n default --type merge -p '{"spec":{"runPolicy":"Running"}}' >/dev/null
+k annotate virtualmachine ci-gc-plain -n default ci.example/x=1 >/dev/null
+echo "accepted as expected: VirtualMachine create, spec update, and metadata update with baryon-vm-guest-config installed"
+if gc_vm ci-gc-strict '{userDataSecretRef: {name: s}}' | k apply --dry-run=server -f - >/dev/null 2>&1; then
+  echo "spec.guestConfig accepted by this release's CRD with strict field validation" >&2; exit 1
+fi
+echo "rejected as expected: spec.guestConfig on this release's CRD (unknown field)"
+k get crd virtualmachines.virtualization.baryon.io -o json | python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+for f in ("resourceVersion", "uid", "creationTimestamp", "managedFields", "generation"):
+    c["metadata"].pop(f, None)
+c.pop("status", None)
+for v in c["spec"]["versions"]:
+    v["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["guestConfig"] = {"type": "object", "x-kubernetes-preserve-unknown-fields": True}
+print(json.dumps(c))' | k replace -f - >/dev/null
+for i in $(seq 1 30); do
+  out="$(gc_vm ci-gc-field '{userDataSecretRef: {name: s}}' | k apply --dry-run=server -f - 2>&1 || true)"
+  echo "$out" | grep -q baryon-vm-guest-config && break
+  sleep 2
+done
+gc_vm ci-gc-field '{userDataSecretRef: {name: s}}' | gc_denied "create with spec.guestConfig once the CRD declares it"
+gc_vm ci-gc-plain '{userDataSecretRef: {name: s}}' | gc_denied "update that sets spec.guestConfig once the CRD declares it"
+gc_vm ci-gc-other | k apply --dry-run=server -f - >/dev/null
+echo "accepted as expected: VirtualMachine without spec.guestConfig once the CRD declares it"
+k apply --server-side --force-conflicts -f - < deploy/base/crds/virtualization.baryon.io.yaml >/dev/null
+k delete virtualmachine ci-gc-plain -n default --wait=false >/dev/null
+
 echo "all API server checks passed"
