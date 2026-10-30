@@ -2155,10 +2155,23 @@ mod tests {
             ),
             (valid, "/elsewhere/x".to_owned()),
         ] {
-            let mut vmm = std::process::Command::new(dir.join("cloud-hypervisor"))
-                .arg("60")
-                .spawn()
-                .unwrap();
+            // Another test thread that forks while the copy above is still
+            // open for writing makes the exec fail with ETXTBSY until that
+            // child execs or exits; retry briefly.
+            let mut tries = 0;
+            let mut vmm = loop {
+                match std::process::Command::new(dir.join("cloud-hypervisor"))
+                    .arg("60")
+                    .spawn()
+                {
+                    Ok(child) => break child,
+                    Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 100 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("spawn: {e}"),
+                }
+            };
             let pid = i32::try_from(vmm.id()).unwrap();
             // Under load the child can still show the test binary for a
             // moment; adopt() would then refuse it for the wrong reason.
