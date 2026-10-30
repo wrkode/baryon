@@ -1,225 +1,191 @@
 name: release
 
-# Builds and publishes a release when a version tag is pushed (a manual
-# run builds the same artifacts without publishing anything): the
-# component images and the Baryon-enabled Hadron host image (k0s) on
-# ghcr.io, the installation manifests, the static baryon-virtd binary,
-# SHA-256 checksums, SPDX SBOMs, and, only while the repository is
-# public, build provenance attestations. The release notes come from
-# docs/release-notes/<tag>.md. Nothing is signed with a key of the
-# project; see docs/release.md.
+# Builds, attests, and publishes a release when a version tag is pushed. A
+# manual run is a dry run: it runs the gate and the build of the selected
+# branch and publishes nothing. See docs/release.md.
+#
+# Jobs and their privileges:
+#   gate     read-only: tag, version, main ancestry, CI on the exact commit,
+#            release qualification status (hack/release-gate.sh)
+#   build    read-only: every release file and image as an OCI layout whose
+#            digest is the published digest, SBOMs, checksums, identity
+#            checks (hack/release-build.sh)
+#   attest   OIDC identity and attestation write only: build provenance
+#            for the release files and the image digests
+#   publish  package and release write only: copies the OCI layouts to
+#            ghcr.io unchanged, checks the digests, creates the release
+# No job runs code from a pull request: the workflow has no pull request
+# trigger.
 
 on:
   push:
     tags: ["v*"]
-  # Dry run: builds every artifact from the selected branch without pushing
-  # images or creating a release.
   workflow_dispatch:
 
-permissions:
-  contents: read
+permissions: {}
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  gate:
     runs-on: ubuntu-24.04
     permissions:
-      contents: write # create the GitHub release
-      packages: write # push images to ghcr.io
-      id-token: write # sign provenance attestations
-      attestations: write
+      contents: read
+      actions: read # CI runs of the commit
+      statuses: read # release qualification status of the commit
+    outputs:
+      version: ${{ steps.gate.outputs.version }}
+      sha: ${{ steps.gate.outputs.sha }}
+      publish: ${{ steps.gate.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Release gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+        run: hack/release-gate.sh
+
+  build:
+    needs: gate
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
+      VERSION: ${{ needs.gate.outputs.version }}
       REGISTRY: ghcr.io/${{ github.repository_owner }}
-      PUBLISH: ${{ github.event_name == 'push' }}
-      # GitHub artifact attestations need a public repository on the
-      # current plan; a release from a private repository has checksums and
-      # SBOMs only (docs/release.md).
-      ATTEST: ${{ github.event_name == 'push' && !github.event.repository.private }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-
-      - name: Version
-        run: |
-          version="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
-          if [ "$PUBLISH" = true ]; then
-            test "$GITHUB_REF_NAME" = "$version"
-          fi
-          test -s "docs/release-notes/$version.md"
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-          # The SBOM action does not create the directory of its output file.
-          mkdir -p _sbom _release
-
-      # Before anything is built, so it covers the source tree only.
-      - name: SBOM of the source tree
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          path: .
-          format: spdx-json
-          output-file: _sbom/baryon-source.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
-      - name: Static binaries
-        run: hack/build-static.sh
-
-      - name: Log in to ghcr.io
-        if: env.PUBLISH == 'true'
-        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Commit is the gated commit
+        run: test "$(git rev-parse HEAD)" = "${{ needs.gate.outputs.sha }}"
+      - name: syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - name: Build and check the release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SYFT: ${{ steps.syft.outputs.cmd }}
+        run: hack/release-build.sh "$VERSION"
+      - name: Release notes
+        run: cp "docs/release-notes/$VERSION.md" _oci/release-notes.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: _release/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: oci
+          path: _oci/
+          if-no-files-found: error
 
-      - name: Component images
-        id: images
+  attest:
+    needs: [gate, build]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write # Sigstore signing identity of this workflow run
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: _release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: oci
+          path: _oci
+      - name: Image digests
+        id: digests
         run: |
-          for c in anchor importer node-agent controller; do
-            ref="$REGISTRY/baryon-$c:$VERSION"
-            docker build -f "packaging/images/$c.Dockerfile" -t "$ref" .
-            if [ "$PUBLISH" != true ]; then
-              echo "${c//-/_}=$ref" >> "$GITHUB_OUTPUT"
-              continue
-            fi
-            docker push "$ref"
-            digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")"
-            echo "${c//-/_}=$digest" >> "$GITHUB_OUTPUT"
-            echo "${c//-/_}_digest=${digest#*@}" >> "$GITHUB_OUTPUT"
-          done
-
-      - name: Host image (Baryon-enabled Hadron, k0s)
-        id: host
-        run: |
-          ref="$REGISTRY/baryon-hadron:$VERSION-k0s"
-          hack/build-hadron-image.sh "$ref"
-          # The release's baryon-virtd is the one in the host image.
-          cid="$(docker create "$ref")"
-          docker cp "$cid:/usr/bin/baryon-virtd" baryon-virtd
-          docker rm "$cid" >/dev/null
-          if [ "$PUBLISH" != true ]; then
-            echo "ref=$ref" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          docker push "$ref"
-          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "$ref")"
-          echo "ref=$digest" >> "$GITHUB_OUTPUT"
-          echo "digest=${digest#*@}" >> "$GITHUB_OUTPUT"
-
-      - name: Release files
-        env:
-          CONTROLLER_IMAGE: ${{ steps.images.outputs.controller }}
-          NODE_AGENT_IMAGE: ${{ steps.images.outputs.node_agent }}
-          ANCHOR_IMAGE: ${{ steps.images.outputs.anchor }}
-          IMPORTER_IMAGE: ${{ steps.images.outputs.importer }}
-          HOST_IMAGE: ${{ steps.host.outputs.ref }}
-        run: |
-          mkdir -p _release
-          hack/release-manifests.sh _release
-          install -m 0755 baryon-virtd "_release/baryon-virtd-$VERSION-x86_64-linux-musl"
-          mv _sbom/baryon-source.spdx.json "_release/baryon-$VERSION-source.spdx.json"
-          git archive --format=tar.gz --prefix="baryon-$VERSION/" -o "_release/baryon-$VERSION-source.tar.gz" HEAD
-          {
-            echo "controller: $CONTROLLER_IMAGE"
-            echo "node-agent: $NODE_AGENT_IMAGE"
-            echo "anchor: $ANCHOR_IMAGE"
-            echo "importer: $IMPORTER_IMAGE"
-            echo "host (k0s $(sed -n 's/^K0S_VERSION=//p' packaging/versions.env)): $HOST_IMAGE"
-          } > _release/images.txt
-
-      - name: SBOM anchor image
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/baryon-anchor:${{ env.VERSION }}
-          format: spdx-json
-          output-file: _release/baryon-anchor-${{ env.VERSION }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-      - name: SBOM importer image
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/baryon-importer:${{ env.VERSION }}
-          format: spdx-json
-          output-file: _release/baryon-importer-${{ env.VERSION }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-      - name: SBOM node agent image
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/baryon-node-agent:${{ env.VERSION }}
-          format: spdx-json
-          output-file: _release/baryon-node-agent-${{ env.VERSION }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-      - name: SBOM controller image
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/baryon-controller:${{ env.VERSION }}
-          format: spdx-json
-          output-file: _release/baryon-controller-${{ env.VERSION }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-      - name: SBOM host image
-        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          image: ${{ env.REGISTRY }}/baryon-hadron:${{ env.VERSION }}-k0s
-          format: spdx-json
-          output-file: _release/baryon-hadron-k0s-${{ env.VERSION }}.spdx.json
-          upload-artifact: false
-          upload-release-assets: false
-
-      - name: Checksums
-        run: cd _release && sha256sum * > SHA256SUMS
-
+          (cd _release && sha256sum --check --strict SHA256SUMS)
+          while read -r name digest; do
+            echo "${name//-/_}=$digest" >> "$GITHUB_OUTPUT"
+          done < _oci/digests
       - name: Provenance of the release files
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: "_release/*"
       - name: Provenance of the anchor image
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/baryon-anchor
-          subject-digest: ${{ steps.images.outputs.anchor_digest }}
-          push-to-registry: true
+          subject-name: ghcr.io/${{ github.repository_owner }}/baryon-anchor
+          subject-digest: ${{ steps.digests.outputs.baryon_anchor }}
       - name: Provenance of the importer image
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/baryon-importer
-          subject-digest: ${{ steps.images.outputs.importer_digest }}
-          push-to-registry: true
+          subject-name: ghcr.io/${{ github.repository_owner }}/baryon-importer
+          subject-digest: ${{ steps.digests.outputs.baryon_importer }}
       - name: Provenance of the node agent image
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/baryon-node-agent
-          subject-digest: ${{ steps.images.outputs.node_agent_digest }}
-          push-to-registry: true
+          subject-name: ghcr.io/${{ github.repository_owner }}/baryon-node-agent
+          subject-digest: ${{ steps.digests.outputs.baryon_node_agent }}
       - name: Provenance of the controller image
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/baryon-controller
-          subject-digest: ${{ steps.images.outputs.controller_digest }}
-          push-to-registry: true
+          subject-name: ghcr.io/${{ github.repository_owner }}/baryon-controller
+          subject-digest: ${{ steps.digests.outputs.baryon_controller }}
       - name: Provenance of the host image
-        if: env.ATTEST == 'true'
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-name: ${{ env.REGISTRY }}/baryon-hadron
-          subject-digest: ${{ steps.host.outputs.digest }}
-          push-to-registry: true
+          subject-name: ghcr.io/${{ github.repository_owner }}/baryon-hadron
+          subject-digest: ${{ steps.digests.outputs.baryon_hadron }}
 
-      - name: GitHub release
-        if: env.PUBLISH == 'true'
+  publish:
+    needs: [gate, build, attest]
+    if: needs.gate.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # create the GitHub release
+      packages: write # push the images to ghcr.io
+    env:
+      VERSION: ${{ needs.gate.outputs.version }}
+      REGISTRY: ghcr.io/${{ github.repository_owner }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: _release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: oci
+          path: _oci
+      - name: Push the images unchanged and check their digests
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          (cd _release && sha256sum --check --strict SHA256SUMS)
+          echo "$GH_TOKEN" | skopeo login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          while read -r name digest; do
+            tag="$VERSION"
+            [ "$name" = baryon-hadron ] && tag="$VERSION-k0s"
+            test "sha256:$(skopeo inspect --raw "oci:_oci/$name:$tag" | sha256sum | cut -d' ' -f1)" = "$digest"
+            skopeo copy --preserve-digests "oci:_oci/$name:$tag" "docker://$REGISTRY/$name:$tag"
+            test "sha256:$(skopeo inspect --raw "docker://$REGISTRY/$name@$digest" | sha256sum | cut -d' ' -f1)" = "$digest"
+            test "$(skopeo inspect --format '{{.Digest}}' "docker://$REGISTRY/$name:$tag")" = "$digest"
+            echo "$REGISTRY/$name:$tag $digest"
+          done < _oci/digests
+          skopeo logout ghcr.io
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
           prerelease=()
           case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
-          gh release create "$VERSION" --verify-tag "${prerelease[@]}" \
-            --title "Baryon $VERSION" \
-            --notes-file "docs/release-notes/$VERSION.md" \
-            _release/*
+          gh release create "$VERSION" --repo "$REPO" --verify-tag "${prerelease[@]}" \
+            --title "Baryon $VERSION" --notes-file _oci/release-notes.md _release/*
+          want=false
+          [ "${#prerelease[@]}" -eq 0 ] || want=true
+          test "$(gh api "repos/$REPO/releases/tags/$VERSION" --jq .prerelease)" = "$want"
+          test "$(gh api "repos/$REPO/releases/tags/$VERSION" --jq '.assets | length')" = "$(ls _release | wc -l)"

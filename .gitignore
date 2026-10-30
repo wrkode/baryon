@@ -3,6 +3,8 @@
 
 # Local test and lab artifacts
 /_output/
+/_release/
+/_oci/
 /hack/lab/.state/
 *.img
 *.raw
