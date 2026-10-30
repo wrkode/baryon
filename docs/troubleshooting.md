@@ -537,28 +537,72 @@ VirtualMachine. Placement can be changed and applies at the next start.
 
 ### IdentityConflict
 
-Symptom: `Running` and `Ready` False with reason `IdentityConflict`, an
-`IdentityConflict` Event on the VirtualMachine, and the node in
-`status.identityConflictNodes`. Another VM on that node runs with the same
-host identity, so baryon-virtd refused this one there.
+Symptom: `Running` and `Ready` False with reason `IdentityConflict`. Another
+VM on that node runs with the same host identity, so baryon-virtd refused
+this one there before starting anything for it: no VMM, no DHCP responder,
+no runtime directory, and the root disk was not opened.
 
-What happens: baryon-controller replaces the Anchor Pod and keeps the new
-one off the recorded nodes; no action is needed while another node fits.
-It does so only when the anchor exited with code 3 as well as the
-message, so an Anchor Pod with a v0.1.0-rc1 anchor (exit code 1) stays on
-the node; delete that pod to replace it with the current anchor image.
-On a cluster where every Baryon node is recorded, the VM stays not ready.
-Status: Implemented, unit tests; not exercised on a cluster.
+What happens with a current anchor: it exits with code 3, and
+baryon-controller records the node in `status.identityConflictNodes`,
+emits an `IdentityConflict` Event, and replaces the Anchor Pod with node
+affinity that keeps it off the recorded nodes. No action is needed while
+another node fits the VM and its storage. On a cluster where every
+fitting node is recorded (for example a VM on node-local storage), the VM
+stays not ready.
 
 Confirm:
 
 ```bash
 kubectl get virtualmachine <vm> -n <namespace> -o jsonpath='{.status.identityConflictNodes}{"\n"}'
+kubectl get events -n <namespace> --field-selector involvedObject.name=<vm>,reason=IdentityConflict
 ```
 
 Fix when no node is left: stop the VM (`runPolicy: Stopped`, which clears
 the list) and start it again after the conflicting VM is gone
 ([Host identity](api.md#host-identity)).
+
+#### An Anchor Pod with the v0.1.0-rc1 anchor image
+
+After a cluster upgrade from v0.1.0-rc1, Anchor Pods created by the
+v0.1.0-rc1 controller keep running with the v0.1.0-rc1 anchor image until
+they are replaced. Such an anchor exits with code 1, not 3, when it is
+refused for an identity conflict, and baryon-controller acts on the
+conflict only with code 3 (other processes of the container can write the
+message, ADR 0015). The conflict happens only when the anchor connects to
+baryon-virtd again, for example after the anchor container or baryon-virtd
+restarts, while another VM with the same identity runs on the node.
+
+Recognize it by all of these:
+
+- `Ready` and `Running` False with reason `IdentityConflict`, and
+  `RestartRequired` True with reason `AnchorImageChanged`;
+- `status.identityConflictNodes` does not list the node;
+- the Anchor Pod restarts with back-off, its last exit code is 1, and its
+  termination message starts with `IdentityConflict:`:
+
+```bash
+kubectl get pod <vm>-anchor -n <namespace> -o jsonpath='{.status.containerStatuses[0].lastState.terminated.exitCode} {.status.containerStatuses[0].lastState.terminated.message}{"\n"}'
+```
+
+Recover by deleting the Anchor Pod:
+
+```bash
+kubectl delete pod <vm>-anchor -n <namespace>
+```
+
+baryon-controller creates a new Anchor Pod with the current anchor image.
+It runs if its node has no conflict; otherwise it exits with code 3 and
+the VM is moved as described above. This is safe: baryon-virtd started
+nothing for the refused anchor, so deleting its pod stops no VMM, leaves
+nothing on the host, and does not touch the root disk; the new pod is the
+only Anchor Pod of the VM, and its anchor is the VM's Anchor supervisor
+(ADR 0015); import Pods are not involved. To avoid the case altogether,
+replace every Anchor Pod that reports `RestartRequired` after the cluster
+upgrade: the Kairos host upgrades do, and so does a restart of the VM.
+
+Status: Tested on the k0s cluster by `tests/e2e/identity-conflict.sh`,
+which injects a conflict with the published v0.1.0-rc1 anchor image and
+with the current one.
 
 ### NotAnchorSupervisor
 

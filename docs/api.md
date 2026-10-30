@@ -762,7 +762,12 @@ message (ADR 0015); a v0.1.0-rc1 anchor exits with 1, so its VM stays on
 the node until its pod is replaced. The list is cleared when the VM is
 stopped. On a cluster where every Baryon node is recorded, the VM stays not
 ready until it is stopped and started again after the conflicting VM is
-gone. Status: Implemented, with unit tests; not exercised on a cluster.
+gone. baryon-controller reads the recorded nodes from the API server on
+every reconcile, so a node it has just recorded is kept. Status:
+Implemented; unit tests, and Tested on the k0s cluster by
+`tests/e2e/identity-conflict.sh`, which injects a conflict with the
+current anchor and with a v0.1.0-rc1 anchor; recovery of the latter:
+[troubleshooting.md](troubleshooting.md#an-anchor-pod-with-the-v010-rc1-anchor-image).
 
 The guest MAC address is a separate, guest-visible identity, derived from
 the VirtualMachine UID (`02:` followed by the last 40 bits of the UID) and

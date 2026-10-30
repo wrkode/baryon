@@ -574,11 +574,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
             has_import: disk.as_ref().is_ok_and(|d| d.import.is_some()),
             restart_reason: None,
             mac_address: Some(resources::vm_mac(&vm_uid)),
-            identity_conflict_nodes: vm
-                .status
-                .as_ref()
-                .map(|s| s.identity_conflict_nodes.clone())
-                .unwrap_or_default(),
+            identity_conflict_nodes: recorded_conflict_nodes(vm, ctx, ns).await?,
             storage_blocked: None,
             disk_error: disk.as_ref().err().cloned(),
             root_disk_import: vm.status.as_ref().and_then(|s| s.root_disk_import.clone()),
@@ -627,10 +623,7 @@ async fn apply(vm: &VirtualMachine, ctx: &Context, ns: &str) -> Result<Action, E
     // Nodes where another VM has the same host identity. Kept while the VM
     // should run; a stopped VM starts over.
     let mut conflict_nodes: Vec<String> = if should_run {
-        vm.status
-            .as_ref()
-            .map(|s| s.identity_conflict_nodes.clone())
-            .unwrap_or_default()
+        recorded_conflict_nodes(vm, ctx, ns).await?
     } else {
         Vec::new()
     };
@@ -1183,6 +1176,29 @@ fn legacy_ready(vm: &VirtualMachine, claim: &PersistentVolumeClaim) -> bool {
 
 /// Upper bound of `identityConflictNodes`.
 const MAX_CONFLICT_NODES: usize = 16;
+
+/// The nodes in the VM's `status.identityConflictNodes`, read from the API
+/// server, not from the cache. The list accumulates across reconciles, and a
+/// reconcile that a pod event triggers can run on a cached VirtualMachine
+/// that does not have the last status write yet; deriving the status from
+/// that copy would drop a node recorded a moment earlier.
+async fn recorded_conflict_nodes(
+    vm: &VirtualMachine,
+    ctx: &Context,
+    ns: &str,
+) -> Result<Vec<String>, Error> {
+    let api: Api<VirtualMachine> = Api::namespaced(ctx.client.clone(), ns);
+    let current = api.get(&vm.name_any()).await?;
+    // A VirtualMachine deleted and created again under the same name starts
+    // over.
+    if current.metadata.uid != vm.metadata.uid {
+        return Ok(Vec::new());
+    }
+    Ok(current
+        .status
+        .map(|s| s.identity_conflict_nodes)
+        .unwrap_or_default())
+}
 
 /// The node of `pod` if its anchor ended because baryon-virtd refused the
 /// VM there for a host identity conflict: the anchor's exit code and its
