@@ -48,6 +48,7 @@ RUN set -eu; \
 
 FROM ${RUST_BUILDER_IMAGE} AS virtd
 ARG BARYON_GIT_COMMIT=unknown
+ARG CARGO_AUDITABLE_VERSION
 ENV BARYON_GIT_COMMIT=${BARYON_GIT_COMMIT}
 # Use the image's toolchain; rust-toolchain.toml would ask rustup to install
 # extra components.
@@ -60,10 +61,16 @@ COPY crates/ crates/
 # filled from other sources (another checkout or commit) with newer times
 # would be reused as is. Touch the workspace sources so that its crates are
 # always rebuilt; dependencies stay cached.
+# cargo-auditable embeds the crate dependency list in the binary
+# (packaging/versions.env).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
-    find crates -type f -exec touch {} + \
-    && cargo build --locked --release --target x86_64-unknown-linux-musl -p baryon-virtd \
+    --mount=type=cache,target=/tools \
+    test -n "${CARGO_AUDITABLE_VERSION}" \
+    && { /tools/bin/cargo-auditable --version 2>/dev/null | grep -qF " ${CARGO_AUDITABLE_VERSION}" \
+         || cargo install --locked --root /tools "cargo-auditable@${CARGO_AUDITABLE_VERSION}"; } \
+    && find crates -type f -exec touch {} + \
+    && PATH="/tools/bin:$PATH" cargo auditable build --locked --release --target x86_64-unknown-linux-musl -p baryon-virtd \
     && install -D -m 0755 target/x86_64-unknown-linux-musl/release/baryon-virtd /out/baryon-virtd
 
 FROM ${ALPINE_IMAGE} AS manifest
@@ -125,5 +132,17 @@ RUN --mount=type=bind,from=kairos-init,src=/kairos-init,dst=/kairos-init \
     fi; \
     /kairos-init -l info -s install -m generic -t false ${provider} --version "${BARYON_VERSION}"; \
     /kairos-init -l info -s init -m generic -t false ${provider} --version "${BARYON_VERSION}"
+# Baryon's identity replaces the labels inherited from the Hadron image;
+# the base is named by the base labels.
+ARG HADRON_IMAGE
+ARG BARYON_REVISION=unknown
+ARG BARYON_CREATED
 LABEL org.opencontainers.image.title="Baryon-enabled Hadron" \
-      org.opencontainers.image.source="https://github.com/wrkode/baryon"
+      org.opencontainers.image.description="Hadron with the Baryon host components (baryon-virtd, Cloud Hypervisor)" \
+      org.opencontainers.image.version="${BARYON_VERSION}" \
+      org.opencontainers.image.revision="${BARYON_REVISION}" \
+      org.opencontainers.image.created="${BARYON_CREATED}" \
+      org.opencontainers.image.source="https://github.com/wrkode/baryon" \
+      org.opencontainers.image.url="https://github.com/wrkode/baryon" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.base.name="${HADRON_IMAGE}"

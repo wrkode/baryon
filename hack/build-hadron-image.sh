@@ -29,8 +29,15 @@ if [ "$commit" != unknown ] && ! git diff --quiet HEAD -- 2>/dev/null; then
   commit="$commit-dirty"
 fi
 
+# The image labels name the full commit (with -dirty for an uncommitted
+# tree) and the commit time, which keeps them the same for every build of
+# a commit.
+revision="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+case "$commit" in *-dirty) revision="$revision-dirty" ;; esac
+created="$(git log -1 --format=%cI 2>/dev/null || echo unknown)"
+
 args=()
-for v in HADRON_IMAGE KAIROS_INIT_IMAGE RUST_BUILDER_IMAGE ALPINE_IMAGE \
+for v in HADRON_IMAGE KAIROS_INIT_IMAGE RUST_BUILDER_IMAGE ALPINE_IMAGE CARGO_AUDITABLE_VERSION \
          CLOUD_HYPERVISOR_VERSION CLOUD_HYPERVISOR_URL CLOUD_HYPERVISOR_SHA256 \
          CLOUDHV_FIRMWARE_RELEASE CLOUDHV_FIRMWARE_URL CLOUDHV_FIRMWARE_SHA256 \
          VIRTIOFSD_VERSION VIRTIOFSD_ZIP_URL VIRTIOFSD_ZIP_SHA256 VIRTIOFSD_SHA256; do
@@ -45,6 +52,8 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg "KUBERNETES_VERSION=$version" \
   --build-arg "BARYON_VERSION=$baryon_version" \
   --build-arg "BARYON_GIT_COMMIT=$commit" \
+  --build-arg "BARYON_REVISION=$revision" \
+  --build-arg "BARYON_CREATED=$created" \
   -t "$ref" \
   "$@" \
   .

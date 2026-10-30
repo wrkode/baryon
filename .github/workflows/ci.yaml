@@ -86,8 +86,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/baryon-build/tools
+          key: build-tools-${{ hashFiles('packaging/versions.env') }}
       - name: Static musl binaries
         run: hack/build-static.sh
+      - name: Every binary carries its dependency list (cargo-auditable)
+        run: |
+          for b in baryon-virtd baryon-anchor baryon-importer baryon-controller baryon-node-agent; do
+            objdump -h "target/static/x86_64-unknown-linux-musl/release/$b" | grep -q '\.dep-v0' \
+              || { echo "$b has no .dep-v0 section" >&2; exit 1; }
+          done
       - name: Images
         run: |
           for c in anchor importer node-agent controller; do

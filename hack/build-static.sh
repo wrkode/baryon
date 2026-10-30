@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build static musl binaries of the Baryon components in a rust:alpine
 # container, so no musl C toolchain is needed on the host. Hadron is
-# musl-only, so host components must be static.
+# musl-only, so host components must be static. The build goes through
+# cargo-auditable (CARGO_AUDITABLE_VERSION in packaging/versions.env), which
+# embeds the crate dependency list in each binary.
 #
 # Usage: hack/build-static.sh [package...]
 # Output: target/static/x86_64-unknown-linux-musl/release/<binary>
@@ -33,7 +35,7 @@ if [ "$commit" != unknown ] && ! git diff --quiet HEAD -- 2>/dev/null; then
   commit="$commit-dirty"
 fi
 cache="${BARYON_BUILD_CACHE:-${HOME}/.cache/baryon-build}"
-mkdir -p "$cache/registry" "$cache/git"
+mkdir -p "$cache/registry" "$cache/git" "$cache/tools"
 
 docker run --rm \
   -u "$(id -u):$(id -g)" \
@@ -43,7 +45,15 @@ docker run --rm \
   -e RUSTUP_TOOLCHAIN="$toolchain" \
   -v "$cache/registry:/cargo/registry" \
   -v "$cache/git:/cargo/git" \
+  -v "$cache/tools:/tools" \
   -v "$PWD:/src" \
   -w /src \
   "$image" \
-  cargo build --locked --release --target x86_64-unknown-linux-musl "${pkg_args[@]}"
+  sh -euc '
+    # cargo-auditable records the dependency tree in each binary.
+    if ! /tools/bin/cargo-auditable --version 2>/dev/null | grep -qF " $1"; then
+      cargo install --locked --root /tools "cargo-auditable@$1"
+    fi
+    shift
+    PATH="/tools/bin:$PATH" cargo auditable build --locked --release --target x86_64-unknown-linux-musl "$@"
+  ' sh "$CARGO_AUDITABLE_VERSION" "${pkg_args[@]}"
