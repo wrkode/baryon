@@ -35,7 +35,7 @@ and Not tested rows make no claim. States:
 
 | Component | Version | State |
 |---|---|---|
-| Baryon | 0.1.0-rc2 (workspace version 0.1.0-rc2, API `v1alpha1`, runtime protocol 1.2) | Tested on the k0s cluster in its [release qualification](testing.md#v010-rc2-release-qualification), with builds from a clean checkout of the tagged commit itself (df7de3b): upgrade from the published v0.1.0-rc1 artifacts with VMs running, host upgrades of all three nodes from Cloud Hypervisor v53.0 to v54.0 with Kairos Operator, the E2E suites with ceph-rbd and lvm-local, guest policy, and `tests/e2e/repeat.sh`. The published release artifacts, rebuilt by the release workflow from the tag, passed a smoke test after the tag ([testing.md](testing.md#published-v010-rc2-artifacts-smoke-test)). 0.1.0-rc1 (the same API and protocol, Cloud Hypervisor v53.0): Tested on the k0s cluster in the [v0.1.0-rc1 release validation](testing.md#v010-rc1-release-validation), with release-like builds of c3a3735, which differs from the release commit only in the release workflow and documentation: upgrade from a release-like build of 8db33bb, host upgrades of all three nodes with Kairos Operator, rollback cases, uninstall and reinstall from the release files, and the E2E suites lifecycle, node agent outage, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, placement, hostile disk, deletion, skew with all hosts on one build, and network health with node reboot (ceph-rbd and lvm-local): 536 of 536 checks. `tests/e2e/repeat.sh` was not run. The published release artifacts, rebuilt by the release workflow from the tag, passed a smoke test after the tag ([testing.md](testing.md#published-artifacts-smoke-test)) |
+| Baryon | 0.1.0-rc3 (workspace version 0.1.0-rc3, API `v1alpha1`, runtime protocol 1.2) | Release qualification on the k0s cluster from a clean checkout of the tagged commit itself, including an installation from public artifacts without credentials: [v0.1.0-rc3 release qualification](testing.md#v010-rc3-release-qualification). 0.1.0-rc2 (the same API, protocol, and host runtime): Tested on the k0s cluster in its [release qualification](testing.md#v010-rc2-release-qualification), with builds from a clean checkout of the tagged commit itself (df7de3b): upgrade from the published v0.1.0-rc1 artifacts with VMs running, host upgrades of all three nodes from Cloud Hypervisor v53.0 to v54.0 with Kairos Operator, the E2E suites with ceph-rbd and lvm-local, guest policy, and `tests/e2e/repeat.sh`. The published release artifacts, rebuilt by the release workflow from the tag, passed a smoke test after the tag ([testing.md](testing.md#published-v010-rc2-artifacts-smoke-test)). 0.1.0-rc1 (the same API and protocol, Cloud Hypervisor v53.0): Tested on the k0s cluster in the [v0.1.0-rc1 release validation](testing.md#v010-rc1-release-validation), with release-like builds of c3a3735, which differs from the release commit only in the release workflow and documentation: upgrade from a release-like build of 8db33bb, host upgrades of all three nodes with Kairos Operator, rollback cases, uninstall and reinstall from the release files, and the E2E suites lifecycle, node agent outage, storage (ceph-rbd Block, lvm-local Filesystem), import integrity (lvm-local and ceph-rbd), multi-node, placement, hostile disk, deletion, skew with all hosts on one build, and network health with node reboot (ceph-rbd and lvm-local): 536 of 536 checks. `tests/e2e/repeat.sh` was not run. The published release artifacts, rebuilt by the release workflow from the tag, passed a smoke test after the tag ([testing.md](testing.md#published-artifacts-smoke-test)) |
 | Hadron | v0.5.3 (`ghcr.io/kairos-io/hadron:v0.5.3`, pinned by digest in `packaging/versions.env`), default kernel variant | Tested. The `cloud` kernel variant: Not supported, it lacks VFIO, VHOST_NET, NET_SCHED, and Landlock ([hadron.md](hadron.md)). Other Hadron releases: Not tested |
 | Kairos | kairos-init v4.3.0 (`quay.io/kairos/kairos-init:v4.3.0`, pinned by digest in `packaging/versions.env`), image built with `hack/build-hadron-image.sh` from `packaging/hadron` | Tested. Other Kairos releases: Not tested |
 | Linux kernel | 7.2.6-hadron (the Hadron v0.5.3 default kernel) | Tested. Other kernels that meet the [host requirements](#host-requirements) (6.5 or later, Landlock ABI 3, cgroup v2): Not tested on a Baryon host |
@@ -310,6 +310,7 @@ image:
 
 | Cluster release | Protocol | Minimum host image |
 |---|---|---|
+| 0.1.0-rc3 | 1.2 | Protocol: any 1.x host. Host-side safety fixes and the lifecycle authority check (ADR 0015): a host image of 0.1.0-rc2 or later (0.1.0-rc3 changes nothing on the host but the build: the binaries carry their dependency list and the image its release labels). `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`) |
 | 0.1.0-rc2 | 1.2 | Protocol: any 1.x host. Host-side safety fixes and the lifecycle authority check (ADR 0015): a host image of 0.1.0-rc2 or later. `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`) |
 | 0.1.0-rc1 | 1.2 | Protocol: any 1.x host. Host-side safety fixes: a host image of 0.1.0-rc1 or later. `NetworkReady` needs a 1.2 host (earlier hosts give Unknown, `RuntimeDoesNotReport`) |
 
@@ -415,6 +416,23 @@ baryon-virtd is unreachable and when the node agent predates the field.
 | baryon-virtd refuses the attach for another reason | Unchanged | `Running` False and `Ready` False with reason `AttachRefused`, or the reason baryon-virtd gave (such as `IdentityConflict` or `NotAnchorSupervisor`); the message has the detail | As for `UnsupportedFeature`, except `IdentityConflict`, for which baryon-controller replaces the Anchor Pod away from the node only when the anchor also exited with the identity conflict exit code, 3 (ADR 0015). A v0.1.0-rc1 anchor exits with 1, so its VM stays on the node until the pod is replaced |
 
 ### Release-specific notes
+
+Host access policies across releases (0.1.0-rc3): the policies of
+0.1.0-rc3 check pods at creation only, so pods of an earlier release keep
+running. baryon-controller and baryon-node-agent of 0.1.0-rc3 create no pod
+that they refuse; a cluster that added host access to Baryon pods or to
+pods in `baryon-system` (for example through a mutating webhook) must stop
+doing so before the upgrade, or the new pods are refused. The refusing
+`baryon-vm-guest-config` admits every VirtualMachine of v0.1.
+
+Anchor Pods with the v0.1.0-rc1 anchor image after an upgrade to
+0.1.0-rc2 or later: such an anchor exits with code 1, not 3, when
+baryon-virtd refuses it for a host identity conflict, so baryon-controller
+does not move its VM away from the node. Recognize and recover it as in
+[troubleshooting.md](troubleshooting.md#identityconflict). Replacing every
+Anchor Pod after the cluster upgrade (the hosts' Kairos upgrades do this,
+and so does a restart of each VM, `RestartRequired` shows which ones)
+removes the case.
 
 Guest network health across releases: the cluster release of the network
 health change needs the updated CRD (VirtualizationNode `status.vms`) and

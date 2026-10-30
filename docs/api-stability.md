@@ -193,6 +193,28 @@ rules above apply.
 
 ## Change log per release
 
+### 0.1.0-rc3
+
+No API change: no field, default, validation rule, condition type, or
+reason of `v1alpha1` changed since 0.1.0-rc2, and the CRDs are the same.
+`spec.guestConfig` does not exist in this release.
+
+The admission policies of the installation changed
+([security.md](security.md#admission-policies)):
+
+- Baryon pods (Anchor Pods and import Pods) are also refused when they use
+  the host network or IPC namespace or host ports, or a volume other than
+  a PersistentVolumeClaim or the downward API.
+- New: `baryon-system-pods` limits the host access of pods in the
+  `baryon-system` namespace to the node agent's two host directories.
+- New: `baryon-vm-guest-config`, the refusing form of the ADR 0014 policy;
+  it admits every VirtualMachine of this release.
+
+baryon-controller creates no pod that these rules refuse. The recorded
+`status.identityConflictNodes` of a VM is no longer lost when the
+controller reconciles from a cached VirtualMachine that does not have its
+last status update yet.
+
 ### 0.1.0-rc2
 
 No breaking API change: no field, default, validation rule, or condition

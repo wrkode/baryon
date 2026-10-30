@@ -12,35 +12,40 @@ Support claims are made only in [compatibility.md](compatibility.md) and
 the release notes, after tests. A Planned or Designed item here is not
 supported.
 
-Last updated: 2026-10-28.
+Last updated: 2026-10-30.
 
 ## v0.1.0
 
-v0.1.0-rc1 is published
-([release notes](release-notes/v0.1.0-rc1.md)). v0.1.0-rc2 carries the
-items under "On main" below and no new user-facing feature
-([release notes](release-notes/v0.1.0-rc2.md)); v0.1.0 is planned as the
-same stabilized set. Before v0.1.0:
+v0.1.0-rc1 and v0.1.0-rc2 are published
+([v0.1.0-rc1](release-notes/v0.1.0-rc1.md),
+[v0.1.0-rc2](release-notes/v0.1.0-rc2.md)); v0.1.0-rc2 carries Cloud
+Hypervisor v54.0 and the fixes M1 and M2 (Implemented). v0.1.0-rc3
+carries the items under "On main" below and no new virtualization
+feature ([release notes](release-notes/v0.1.0-rc3.md)); v0.1.0 is planned
+as the same functional scope. Before v0.1.0:
 
 | Item | Status | Notes |
 |---|---|---|
-| Repository and package visibility | Planned (owner decision) | A public repository enables provenance attestations and anonymous image pulls ([release.md](release.md)) |
-| Installation from a private registry with node pull credentials | Planned | Not tested; [installation.md](installation.md#private-repository) documents the image import alternative |
-| Rust dependency data in the component image SBOMs | Planned | Today the component image SBOMs list the image only; the crates are in the source tree SBOM ([release.md](release.md)) |
+| Installation from a registry mirror or with node pull credentials | Planned | Not tested; the public installation needs neither, and [installation.md](installation.md#restricted-registries-and-mirrors) documents loading the images onto the nodes |
 
-## On main, for v0.1.0-rc2
+## On main, for v0.1.0-rc3
 
 | Item | Status | Notes |
 |---|---|---|
-| Cloud Hypervisor v54.0 | Implemented | Pinned in `packaging/versions.env`. Nested virtualization off and virtio-net offloads on, both written explicitly (ADR 0005, ADR 0007, [compatibility.md](compatibility.md)); E2E suites except version skew on the k0s cluster ([testing.md](testing.md#cloud-hypervisor-v540)); `tests/e2e/guest-policy.sh` checks the options |
-| M1: lifecycle control only by the Anchor supervisor | Implemented | [ADR 0015](adr/0015-anchor-authority.md); unit tests, CI API server checks, and E2E on the k0s cluster |
-| M2: disk import only in `baryon-importer` | Implemented | Finding M2 of 2026-10-27 in [security.md](security.md#review-findings); unit tests and E2E on the k0s cluster |
+| Public repository, releases, and images | Implemented | Anonymous installation from the public release ([installation.md](installation.md)) |
+| Release workflow with separated privileges and a fail-closed gate | Implemented | Gate, build, attest, publish jobs; tag, version, `main` ancestry, CI, and qualification checks ([release.md](release.md#release-workflow)) |
+| Build provenance attestations | Implemented | For every release file and image digest ([release.md](release.md#verifying-a-release)) |
+| Rust dependency data in every Baryon binary and image SBOM | Implemented | cargo-auditable; image SBOMs bound to the published digests |
+| Signed release tags, tag and branch rulesets, immutable releases | Implemented | [release.md](release.md#tags-and-releases) |
+| Host access policy for every Baryon workload | Implemented | `baryon-vm-resource` and `baryon-system-pods` ([security.md](security.md#host-integration-policy)) |
+| Refusing form of `baryon-vm-guest-config` | Implemented | ADR 0014; installed ahead of `spec.guestConfig`, admits every VirtualMachine of v0.1 |
+| Identity conflict E2E and recovery | Implemented | `tests/e2e/identity-conflict.sh`; recovery of a v0.1.0-rc1 anchor in [troubleshooting.md](troubleshooting.md#identityconflict) |
 
 ## Next, after v0.1 stabilization: guest access
 
 | Item | Status | Notes |
 |---|---|---|
-| Guest configuration from a Secret (`spec.guestConfig`, NoCloud seed disk) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted); needs the feature placement resource of ADR 0012 and the refusing form of `baryon-vm-guest-config` one cluster release earlier. v0.1.0 does not carry that policy (it is the same set as v0.1.0-rc2), so a cluster release after v0.1.0 ships it before the release that adds the field |
+| Guest configuration from a Secret (`spec.guestConfig`, NoCloud seed disk) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted); needs the feature placement resource of ADR 0012. The refusing form of `baryon-vm-guest-config` ships from v0.1.0-rc3, so the release that adds the field requires a cluster at v0.1.0-rc3 or later |
 | Interactive serial console through the Anchor Pod (`pods/exec`, one interactive writer) | Designed | [ADR 0014](adr/0014-guest-access.md) (Accepted) |
 | `baryonctl console` | Planned | Designed in [ADR 0014](adr/0014-guest-access.md) (Accepted), as a later part after the console through `kubectl exec`; also installable as the kubectl plugin `kubectl-baryon` |
 | Guest network throughput measurement in the E2E suites | Planned | Needs guest credentials, which the guest configuration item provides; until then `tests/e2e/guest-policy.sh` has an optional throughput floor (`MIN_MBPS`) for a guest image that has credentials |
@@ -63,8 +68,6 @@ same stabilized set. Before v0.1.0:
 | A seccomp filter in baryon-anchor after startup that denies `execve`, `execveat`, and new processes | Planned | [security.md](security.md) |
 | A per-pod limit on AnchorService connections and streams | Designed | Required before the console ships ([ADR 0014](adr/0014-guest-access.md), finding M11) |
 | Device plugin in a separate minimal process | Planned | Finding M2 of the 2026-10-05 release gate review in [security.md](security.md#review-findings) |
-| Separate build and publish jobs in the release workflow | Planned | Only the publish job would hold write tokens |
-| Release workflow check of CI results and `main` ancestry; protected release tags | Planned | Finding L1 of the 2026-10-05 release gate review, accepted for v0.1.0-rc1 ([security.md](security.md#review-findings)) |
 | Allowlist seccomp filter and Landlock rules for the DHCP responder | Designed | [security.md](security.md#baryon-seccomp-layer) |
 | Remove virtiofsd from the host image until Baryon uses it | Planned | |
 | Decide on `offload_ufo` for the guest NIC | Planned | Finding L3 of 2026-10-27 in [security.md](security.md#review-findings): checksum and TSO offloads accepted, UFO Open |

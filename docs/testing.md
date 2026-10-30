@@ -25,7 +25,7 @@ far. Other documents state a status label and link to
 | E2E guest policy | `tests/e2e/guest-policy.sh` | the Cloud Hypervisor options Baryon writes explicitly: with `NODE_SHELL`, the VMM version and `nested=off`, `offload_csum=on`, and `offload_tso=on` on its command line; with `GUEST_SHELL`, no `vmx` or `svm` flag in the guest and the negotiated virtio-net checksum and TSO features; with `GUEST_SHELL` and `MIN_MBPS`, a broad throughput floor from a pod on the VM's node, to catch a lost offload. Each part is skipped (logged, not counted) when its variable is unset. Status: Tested on the k0s cluster ([v0.1.0-rc2 release qualification](#v010-rc2-release-qualification)) | a cluster of Baryon nodes, `NODE_SHELL` for the host checks; for the guest checks, a guest image with a login (`IMAGE_URL`) and a `GUEST_SHELL` wrapper; for the floor, iperf3 in the guest and an iperf3 client image (`IPERF_IMAGE`, default `alpine:3.22`, which needs a package mirror) | no |
 | Failure-path procedures | manual, listed below | crashes and restarts of baryon-virtd, the anchor, the VMM, and the DHCP responder; deletion while baryon-virtd is down | a cluster of Baryon nodes and a root shell on the node | no |
 | Kairos lifecycle procedures | manual, listed below | node reboot, Kairos A/B upgrade, fresh provisioning, log retention | a cluster of Baryon nodes and a root shell on the node | no |
-| Identity conflict suite | Planned | the `IdentityConflict` replacement path across nodes | a multi-node cluster of Baryon nodes | no |
+| E2E identity conflict | `tests/e2e/identity-conflict.sh` | a host identity conflict between two VMs on one node, injected by an administrator (baryon-controller paused, the VM's Anchor Pod replaced, by impersonation of baryon-controller, with a copy that claims a VM UID whose identity equals a running VM's): with `OLD_ANCHOR_IMAGE` (an anchor that exits with code 1, such as v0.1.0-rc1's), the VM stays not ready on the node with reason `IdentityConflict`, no node is recorded, nothing is started on the host, and deleting the Anchor Pod recovers it; with the current anchor (exit code 3), the node is recorded in `status.identityConflictNodes`, an `IdentityConflict` Event is emitted, the Anchor Pod is replaced with node affinity away from the node, and nothing is left on the host; the running VM keeps its Anchor Pod; stopping the VM clears the list. Needs `python3` (or `COLLIDE`, a faster search command) and an administrator's permissions; `STORAGE_CLASS` attachable on other nodes for the move check | a multi-node cluster of Baryon nodes; `NODE_SHELL` for the host checks | no |
 | CSI failure-path suite | Planned | teardown ordering under SIGKILL, forced delete, and baryon-virtd down with a CSI driver that stages and attaches | a cluster with such a driver | no |
 
 The E2E tests and the manual procedures need hardware virtualization, which
@@ -101,7 +101,11 @@ to confirm that:
   `shareProcessNamespace: true`, `hostPID: true`, `hostUsers: false`, an
   init container, a second container, or a container that keeps a
   capability, adds one, is privileged, allows privilege escalation, or has
-  no security context is denied by `baryon-vm-resource` (ADR 0015)
+  no security context is denied by `baryon-vm-resource` (ADR 0015); so
+  is the same pod with `hostNetwork: true`, `hostIPC: true`, a host port,
+  a `hostPath` or `emptyDir` volume, or an automatically mounted service
+  account token, while one with a claim and a downward API volume is
+  admitted
 - `baryon-no-ephemeral-containers` denies `kubectl debug` on such a pod and
   admits it on a plain pod; `baryon-pod-immutable` denies `kubectl set
   image` on such a pod, admits a label change on it, and admits an image
@@ -126,6 +130,28 @@ and an unmanaged pod, confirms that:
 - `baryon-import-approval` denies another user changing, removing, or
   setting the approval, and admits another user changing other annotations
   of a pod that has one
+
+It then checks `baryon-system-pods` with the pod templates of the shipped
+baryon-controller Deployment and baryon-node-agent DaemonSet, each turned
+into a pod in `baryon-system`:
+
+- both templates are admitted
+- each with the host network, PID, or IPC namespace, a privileged
+  container, or a host port is denied
+- the node agent with another or an extra host path, with
+  `/run/baryon/node` mounted read-write, or under the controller's service
+  account is denied, and so is the controller with a host path
+
+And `baryon-vm-guest-config`, the refusing form of the ADR 0014 policy:
+
+- with the policy installed, a VirtualMachine create, a spec update, and a
+  metadata update are admitted, and the API server reports no type
+  checking warning for it
+- `spec.guestConfig` is rejected by this release's CRD (unknown field)
+- after the CRD is replaced with a copy that declares
+  `spec.guestConfig`, a create and an update that set it are denied by the
+  policy and a VirtualMachine without it is admitted; the original CRD is
+  then restored
 
 The script works against any cluster: set `KUBECTL` to the kubectl command
 to use, for example `KUBECTL=kubectl hack/ci/apiserver-checks.sh`. It
@@ -648,6 +674,19 @@ contract, `rootDisk` and VirtualMachineClass validation, `cpu.vcpus`,
 | Kairos Operator reboot (`nsenter -i -m -t 1 -- reboot`) with a VM running, no drain | working tree | manual | kubelet's logind delay inhibitor held; the guest powered off cleanly; the VM came back |
 | Kairos Operator v0.2.2 rolling `NodeOpUpgrade` of all three nodes (`nodeSelector` `virtualization.baryon.io/host=true`, concurrency 1, `force`, image preloaded on every node), one VM on ceph-rbd (node1) and one on lvm-local on each of node2 and node3 | working tree | manual | Completed; every node booted the new image (baryon-virtd hash equal to the image's). Concurrency 1 did not serialize the node outages: the drains of the three nodes started one after another without waiting for the previous node to return, because v0.2.2 counts a reboot as complete before the node is back, which frees the concurrency slot, so the node outages overlapped. Guests shut down cleanly at each drain. The lvm-local VMs came back on their own nodes once those returned. The ceph-rbd VM was down longest: no node was schedulable while all were cordoned or rebooting, and its restart was then delayed until the Ceph CSI attacher, whose controller had restarted with the control-plane node, regained its leader lease after the in-cluster API path returned; until then the volume stayed attached to the old node. Once the attacher led, detach and attach completed and the VM was Ready. All VMs recovered without intervention. VMs whose claims carried an older import record (no digest) got an import Pod after their drain; on filesystem claims the importer found the marker and left the disk unchanged |
 
+### v0.1.0-rc3 release qualification
+
+Release qualification of v0.1.0-rc3 runs on the tagged commit itself:
+images, the host image, and the release files are built from a clean
+checkout of that commit with `hack/release-build.sh`, the script of the
+release workflow, and nothing changes between qualification and the tag.
+Its results are recorded here on `main` after the tag. Planned scope: the
+upgrade from the published v0.1.0-rc2 artifacts with VMs running, the E2E
+suites with ceph-rbd and lvm-local including the identity conflict suite,
+`tests/e2e/guest-policy.sh`, `tests/e2e/repeat.sh`, an installation from
+public locations without credentials, and a smoke test of the published
+artifacts.
+
 ### v0.1.0-rc2 release qualification
 
 Run on 2026-10-29 on the k0s cluster, on df7de3b, the commit tagged
@@ -710,10 +749,10 @@ v0.1.0-rc2 from the tag, on the cluster of the qualification above:
 | Release files from `gh release download` | `sha256sum --check SHA256SUMS`: every file OK, and `SHA256SUMS` lists every file; the six SPDX SBOMs parse |
 | Images | every component tag v0.1.0-rc2 and the host tag v0.1.0-rc2-k0s resolve to the digests in `images.txt`; every component binary reports 0.1.0-rc2 and df7de3bd0f15 without `-dirty`; the Anchor image holds only `baryon-anchor`, with no import subcommand and no importer code path; the importer image holds only `baryon-importer`; `baryon.yaml` references all four component images by those digests |
 | Host image | `components.json` records v0.1.0-rc2 and df7de3bd0f15 without `-dirty` and Cloud Hypervisor v54.0; the image's `cloud-hypervisor` reports v54.0; the released `baryon-virtd` binary is identical (SHA-256) to the one in the host image |
-| Published component images loaded on the nodes by digest ([installation.md](installation.md#private-repository)), then the published `baryon-crds.yaml`, `baryon.yaml`, and `baryon-classes.yaml` applied | the controller and node agent pods, restarted, run the published images (image IDs equal to `images.txt`); the controller creates Anchor Pods and import Pods from the published digests |
+| Published component images loaded on the nodes by digest ([installation.md](installation.md#restricted-registries-and-mirrors)), then the published `baryon-crds.yaml`, `baryon.yaml`, and `baryon-classes.yaml` applied | the controller and node agent pods, restarted, run the published images (image IDs equal to `images.txt`); the controller creates Anchor Pods and import Pods from the published digests |
 | Host upgrades of node3, node2, node1 to the published host image (runbook with `kubectl drain`, the image preloaded under its tag) | each node booted the published image; its `/usr/bin/baryon-virtd` is identical to the released binary; every VirtualizationNode reports df7de3bd0f15 |
 | VMs on the published artifacts | an lvm-local Filesystem VM Ready and `NetworkReady` True, its Anchor Pod on the published Anchor image; E2E storage lvm-local Filesystem 36 of 36 and ceph-rbd Block 47 of 47; placement 65 of 65; Anchor authority lvm-local Filesystem with node reboot 41 of 41 and ceph-rbd Block 38 of 38; lifecycle 35 of 35; guest policy 16 of 16 |
-| The documented procedure for a private repository ([installation.md](installation.md#private-repository)), run as written for the importer image on node3 | containerd named the image by its registry name, with the tag and with the digest, and by no unqualified name; an import Pod on node3 started from it and the VM was Ready |
+| The documented procedure for a private repository ([installation.md](installation.md#restricted-registries-and-mirrors)), run as written for the importer image on node3 | containerd named the image by its registry name, with the tag and with the digest, and by no unqualified name; an import Pod on node3 started from it and the VM was Ready |
 
 Before these results, the smoke test's own image loading failed twice,
 in the test harness, not in Baryon. First, a copy step did not run, so
@@ -842,7 +881,7 @@ the tag (caff228), on the k0s cluster that ran release B:
 |---|---|
 | Release files from `gh release download` | `sha256sum --check SHA256SUMS`: every file OK |
 | Images | pulled from ghcr.io by the digests in `images.txt`; the host image's `components.json` records version v0.1.0-rc1 and commit caff22834c4b (no `-dirty`); the released `baryon-virtd` binary is identical (SHA-256) to the one in the host image; the component binaries report 0.1.0-rc1 |
-| First attempt: published `baryon-crds.yaml`, `baryon-classes.yaml`, `baryon.yaml` over release B, with the images loaded on the nodes under a tag name only | the new controller and node agent pods failed with `ImagePullBackOff`: kubelet asked for the digest reference, containerd did not find it, and the anonymous pull from the private registry was refused (`401 Unauthorized`). The old pods kept running until the rollout replaced them, so node agents of two nodes stopped reporting and new VMs got no pods until the images were found. Fixed by naming the loaded images by their digest reference ([installation.md](installation.md#private-repository)) |
+| First attempt: published `baryon-crds.yaml`, `baryon-classes.yaml`, `baryon.yaml` over release B, with the images loaded on the nodes under a tag name only | the new controller and node agent pods failed with `ImagePullBackOff`: kubelet asked for the digest reference, containerd did not find it, and the anonymous pull from the private registry was refused (`401 Unauthorized`). The old pods kept running until the rollout replaced them, so node agents of two nodes stopped reporting and new VMs got no pods until the images were found. Fixed by naming the loaded images by their digest reference ([installation.md](installation.md#restricted-registries-and-mirrors)) |
 | Published manifests with the images found by digest | controller, node agents, and Anchor Pods ran the published images (image IDs equal to `images.txt`); every VirtualizationNode Ready |
 | Host upgrade of node2 to the published host image (runbook with `kubectl drain`, the image preloaded under its tag) | the `NodeOpUpgrade` completed and node2 booted the published image (commit caff22834c4b). The step 5 wait timed out in the first attempt because the node agent image could not be pulled (row above); it reported once the images were found |
 | VMs on the published artifacts | a ceph-rbd Block VM on node2 (published host image) and an lvm-local Filesystem VM on node3 Ready; `NetworkReady` True for the lvm-local VM; the ceph-rbd VM showed `NotReported` when read right after Ready and was not read again before it was deleted |

@@ -7,8 +7,8 @@ integration with a Kairos-managed immutable virtualization host.
 Kubernetes manages the VM. Hadron provides the virtualization host. Cloud
 Hypervisor executes the VM. Kairos manages the machine lifecycle around them.
 
-Status: this tree is version 0.1.0-rc2, the second release candidate
-([release notes](docs/release-notes/v0.1.0-rc2.md)). The API is `v1alpha1`
+Status: this tree is version 0.1.0-rc3, the third release candidate
+([release notes](docs/release-notes/v0.1.0-rc3.md)). The API is `v1alpha1`
 and can change ([api-stability.md](docs/api-stability.md)). Baryon makes no
 claim of production readiness. Intended work and its status:
 [roadmap.md](docs/roadmap.md).
@@ -117,13 +117,13 @@ cluster of Baryon-enabled Hadron nodes and a CSI driver in place, the
 release install is:
 
 ```bash
-kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon.yaml
-kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc2/baryon-classes.yaml
+kubectl apply --server-side -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc3/baryon.yaml
+kubectl apply -f https://github.com/wrkode/baryon/releases/download/v0.1.0-rc3/baryon-classes.yaml
 ```
 
-While the repository is private, these URLs and the images need GitHub
-access
-([installation.md, Private repository](docs/installation.md#private-repository)).
+The release files and the images on `ghcr.io` are public; the nodes pull
+the images without credentials. To verify the release first, see
+[installation.md, Verify the release](docs/installation.md#verify-the-release).
 
 ## First VM
 
